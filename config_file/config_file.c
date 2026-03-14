@@ -29,6 +29,8 @@ const char *map_type_names[MAPTYPE_NUM] = {
   "register",
   "ram_noalloc",
   "wtcram",
+  "slowio",
+  "pacedio",
 };
 
 const char *config_item_names[CONFITEM_NUM] = {
@@ -290,6 +292,14 @@ skip_file_ops:
       displayRomInfo(cfg->map_data[index], cfg->rom_size[index]);
       if (cfg->map_size[index] == cfg->rom_size[index])
         m68k_add_rom_range(cfg->map_offset[index], cfg->map_high[index], cfg->map_data[index]);
+      break;
+    case MAPTYPE_SLOWIO:
+      printf("[CFG] Adding slow IO region %s at %.8X-%.8X (bus cycle delay)\n",
+             map_id ? map_id : "?", addr, addr + size - 1);
+      break;
+    case MAPTYPE_PACEDIO:
+      printf("[CFG] Adding paced IO region %s at %.8X-%.8X (stretched bus cycle)\n",
+             map_id ? map_id : "?", addr, addr + size - 1);
       break;
     case MAPTYPE_REGISTER:
     default:

@@ -29,6 +29,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -67,7 +68,7 @@ extern uint8_t realtime_graphics_debug, emulator_exiting;
 extern uint8_t rtg_on;
 uint8_t realtime_disassembly, int2_enabled = 0;
 uint32_t do_disasm = 0, old_level;
-uint32_t last_irq = 8, last_last_irq = 8;
+uint32_t last_irq = 0, last_last_irq = 0;
 
 uint8_t ipl_enabled[8];
 
@@ -80,16 +81,125 @@ char disasm_buf[4096];
 
 int mem_fd, mouse_fd = -1, keyboard_fd = -1;
 int mem_fd_gpclk;
-int irq;
+atomic_int irq = 0;
 int gayleirq;
+
+// Diagnostic counters for interrupt debugging
+static atomic_uint dbg_ipl_assert = 0;
+static unsigned int dbg_cpu_irq = 0;
+static unsigned int dbg_cpu_deassert = 0;
+static unsigned int dbg_irq_ack_count = 0;
+
+// PC/address watchpoints
+static unsigned int watch_jiodone = 0;  // writes to ioResult ($1FFC10)
+// static int trace_writes_left = 0;  // post-DskErr write trace counter (disabled)
+
+// VIA IFR bit counters — tracks which interrupt sources the ISR sees
+static unsigned int via_ifr_bits[8] = {0};  // count per bit
+static unsigned int via_ifr_reads = 0;
+// VIA IER snapshot — last value read from IER
+static unsigned int via_ier_last = 0;
+static unsigned int via_ier_reads = 0;
+// VIA IER write tracking — catch transient T1/T2 enable
+static unsigned int via_ier_writes = 0;
+static unsigned int via_ier_t1_enabled = 0;
+static unsigned int via_ier_t2_enabled = 0;
+static unsigned int via_t1cl_writes = 0;
+static unsigned int via_t1ch_writes = 0;
+// VIA register read ACK counters — track which IFR sources are actually cleared
+static unsigned int via_t2cl_reads = 0;   // T2C-L read at $EFF1FE (clears T2 IFR)
+static unsigned int via_ira_reads = 0;    // IRA read at $EFE3FE (clears CA1 IFR)
+static unsigned int via_orb_reads = 0;    // ORB read at $EFE1FE (clears CB1/CB2 IFR)
+static unsigned int via_sr_reads = 0;     // SR read at $EFEBFE (clears SR IFR)
+// VIA IFR write tracking — handlers clear IFR by writing (not reading IRA)
+static unsigned int via_ifr_writes = 0;   // total writes to IFR ($EFFBFE)
+static unsigned int via_ifr_w_ca2 = 0;    // writes with bit 0 set (clear CA2)
+static unsigned int via_ifr_w_ca1 = 0;    // writes with bit 1 set (clear CA1)
+// m68k_read_memory_8 address counters
+static unsigned int rd8_total = 0;
+static unsigned int rd8_via = 0;
+static unsigned int rd8_scsi = 0;
+static unsigned int wr8_scsi = 0;
+static unsigned int rd8_iwm = 0;
+static unsigned int rd8_hi = 0;
+
+// SCSI read/write log — ring buffer captures most recent N accesses
+#define SCSI_LOG_SIZE 256
+static struct { uint32_t addr; uint8_t val; uint32_t pc; uint8_t is_write; } scsi_log_buf[SCSI_LOG_SIZE];
+static unsigned int scsi_log_head = 0;   // next write position (wraps)
+static unsigned int scsi_log_total = 0;  // total SCSI accesses logged
+// Suppress repetitive CSBS polling — only log when value changes
+static uint8_t scsi_csbs_last = 0xFF;    // last CSBS value (init to impossible)
+static unsigned int scsi_csbs_repeat = 0; // count of suppressed repeats
+
+// IWM read log — ring buffer captures most recent N reads
+#define IWM_LOG_SIZE 128
+static struct { uint32_t addr; uint8_t val; uint32_t pc; } iwm_log_buf[IWM_LOG_SIZE];
+static unsigned int iwm_log_head = 0;   // next write position (wraps)
+static unsigned int iwm_log_total = 0;  // total IWM reads logged
+
+// IWM mode tracking — persistent Q6/Q7 state + per-mode counters
+// IWM register mapping: reg12=Q6off, reg13=Q6on, reg14=Q7off, reg15=Q7on
+// Modes: Q6=0,Q7=0 → data; Q6=1,Q7=0 → status; Q6=0,Q7=1 → handshake; Q6=1,Q7=1 → write
+static int iwm_q6 = 0, iwm_q7 = 0;
+static unsigned int iwm_mode_rd[4] = {0};  // [q7*2+q6] read counts
+static unsigned int iwm_hshk_ready = 0;    // handshake reads with bit7=1 (byte ready)
+static unsigned int iwm_hshk_notready = 0; // handshake reads with bit7=0
+static unsigned int iwm_data_zero = 0;     // data reg reads returning $00
+static unsigned int iwm_data_nonzero = 0;  // data reg reads returning non-$00
+static unsigned int iwm_data_ff = 0;       // data reg reads returning $FF (no data)
+static unsigned int iwm_data_hi = 0;       // data reg reads with bit7=1 (valid GCR byte)
+static unsigned int iwm_data_lo = 0;       // data reg reads with bit7=0 (no valid byte yet)
+
+// Slow IO regions — addresses that need bus cycle delays to match real 68000 timing.
+// Populated from MAPTYPE_SLOWIO entries in the config file.
+#define MAX_SLOWIO_REGIONS 8
+static struct { uint32_t lo; uint32_t hi; } slowio[MAX_SLOWIO_REGIONS];
+static int slowio_count = 0;
+
+static inline int is_slowio(uint32_t addr) {
+  for (int i = 0; i < slowio_count; i++) {
+    if (addr >= slowio[i].lo && addr < slowio[i].hi)
+      return 1;
+  }
+  return 0;
+}
+
+// Populated from MAPTYPE_PACEDIO entries in the config file.
+// Paced IO stretches the bus cycle itself (not inter-cycle delay like slowio).
+#define MAX_PACEDIO_REGIONS 8
+static struct { uint32_t lo; uint32_t hi; } pacedio[MAX_PACEDIO_REGIONS];
+static int pacedio_count = 0;
+
+static inline int is_pacedio(uint32_t addr) {
+  for (int i = 0; i < pacedio_count; i++) {
+    if (addr >= pacedio[i].lo && addr < pacedio[i].hi)
+      return 1;
+  }
+  return 0;
+}
+
+static unsigned int pacedio_hit_count = 0;
+
+// Busy-wait to match real 68000 bus cycle timing.
+// A real 68000 at 7.83MHz: tst.b d(An) = 8 cycles = ~1μs.
+// But between sense line selection and status read, the ROM executes
+// several instructions (~3-4μs total). Use a generous delay to ensure
+// the IWM has fully settled before each bus access.
+// PiStorm GPIO cycles are ~200ns — 5-20x too fast for slow peripherals.
+static unsigned int slowio_hit_count = 0;
+static inline void slowio_delay(void) {
+  slowio_hit_count++;
+  for (volatile int dly = 0; dly < 150; dly++) ;
+}
 
 #define MUSASHI_HAX
 
 #ifdef MUSASHI_HAX
 #include "m68kcpu.h"
 extern m68ki_cpu_core m68ki_cpu;
-extern int m68ki_initial_cycles;
-extern int m68ki_remaining_cycles;
+extern volatile int m68ki_initial_cycles;
+extern volatile int m68ki_remaining_cycles;
 
 #define M68K_SET_IRQ(i) old_level = CPU_INT_LEVEL; \
 	CPU_INT_LEVEL = (i << 8); \
@@ -117,42 +227,23 @@ unsigned int loop_cycles = 300, irq_status = 0;
 struct emulator_config *cfg = NULL;
 char keyboard_file[256] = "/dev/input/event1";
 
-uint64_t trig_irq = 0, serv_irq = 0;
 uint16_t irq_delay = 0;
 unsigned int amiga_reset=0, amiga_reset_last=0;
 unsigned int do_reset=0;
 
 void *ipl_task(void *args) {
   printf("IPL thread running\n");
-  uint16_t old_irq = 0;
   uint32_t value;
-
   while (1) {
     value = *(gpio + 13);
     if (value & (1 << PIN_TXN_IN_PROGRESS))
       goto noppers;
 
     if (!(value & (1 << PIN_IPL_ZERO)) || ipl_enabled[amiga_emulated_ipl()]) {
-      old_irq = irq_delay;
-      //NOP
-      if (!irq) {
+      if (!atomic_load(&irq)) {
         M68K_END_TIMESLICE;
-        NOP
-        irq = 1;
-      }
-      //usleep(0);
-    }
-    else {
-      if (irq) {
-        if (old_irq) {
-          old_irq--;
-        }
-        else {
-          irq = 0;
-        }
-        M68K_END_TIMESLICE;
-        NOP
-        //usleep(0);
+        atomic_store(&irq, 1);
+        atomic_fetch_add(&dbg_ipl_assert, 1);
       }
     }
     if(do_reset==0)
@@ -236,6 +327,27 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			/* Call external hook to peek at CPU */
 			m68ki_instr_hook(REG_PC); /* auto-disable (see m68kcpu.h) */
 
+			/* Mac SE ROM SCSI delay loop at $41A816: moveq #$30,d0; dbra d0,*
+			 * On real 68000 @ 8MHz this burns ~60us. On PiStorm it's instant.
+			 * Without this delay, SCSI phase match checks run before the
+			 * target has time to transition phases. */
+			if (REG_PC == 0x0041A816 || REG_PC == 0x0041A8BC) {
+				usleep(60);
+			}
+
+			/* Mac SE ROM SCSI byte-by-byte pseudo-DMA loops.
+			 * These use move.b from $5FF260 (pseudo-DMA address) with btst/dbra.
+			 * On a real 68000, each iteration takes ~5us. On PiStorm the loop
+			 * runs so fast that the BBU can't complete its /DTACK+/DACK
+			 * handshake for the pseudo-DMA read/write between iterations.
+			 *   $41A5A6: byte-by-byte READ  (btst d3,$0050(a3))
+			 *   $41A582: byte-by-byte VERIFY (btst d3,$0050(a3))
+			 *   $41A5C4: byte-by-byte WRITE  (btst d3,$0050(a3))
+			 */
+			if (REG_PC == 0x0041A5A6 || REG_PC == 0x0041A582 || REG_PC == 0x0041A5C4) {
+				usleep(5);
+			}
+
 			/* Record previous program counter */
 			REG_PPC = REG_PC;
 
@@ -290,27 +402,262 @@ cpu_loop:
   }
   else {
     if (cpu_emulation_running) {
-		if (irq)
+		if (atomic_load(&irq))
 			m68k_execute_bef(state, 5);
 		else
 			m68k_execute_bef(state, loop_cycles);
     }
   }
 
-  if (irq) {
-    last_irq = ((ps_read_status_reg() & 0xe000) >> 13);
-    uint8_t amiga_irq = amiga_emulated_ipl();
-    if (amiga_irq >= last_irq) {
-        last_irq = amiga_irq;
+  {
+    // Diagnostic: dump Sound Driver state when stuck at $4031BE/$4031C2
+    static int sound_diag_done = 0;
+    if (!sound_diag_done) {
+      uint32_t skip_pc = m68k_get_reg(NULL, M68K_REG_PC);
+      if ((skip_pc == 0x4031BE || skip_pc == 0x4031C2) &&
+          m68k_read_memory_32(0x16A) > 60) {
+        uint32_t a0 = m68k_get_reg(NULL, M68K_REG_A0);
+        printf("[SND-DIAG] Stuck at %08X, A0=%08X (ioResult=%d)\n",
+               skip_pc, a0, (int16_t)m68k_read_memory_16(a0 + 0x10));
+        // Dump the parameter block (first 0x32 bytes)
+        printf("[SND-DIAG] PB: ");
+        for (int i = 0; i < 0x32; i += 2)
+          printf("%04X ", m68k_read_memory_16(a0 + i));
+        printf("\n");
+        // Find Sound Driver DCE: unit table at $11C, refNum=-5 => unit 4
+        uint32_t utab = m68k_read_memory_32(0x11C);
+        // Dump units 0-7 for reference
+        printf("[SND-DIAG] UnitTable=%08X\n", utab);
+        for (int u = 0; u < 8; u++) {
+          uint32_t dce_u = m68k_read_memory_32(utab + u * 4);
+          if (dce_u) {
+            uint32_t drv_u = m68k_read_memory_32(dce_u);
+            uint32_t drv_real = drv_u;
+            if (drv_u & 0x80000000)
+              drv_real = m68k_read_memory_32(drv_u & 0x00FFFFFF);
+            // Read driver name (pascal string at header+18)
+            char name[32] = {0};
+            if (drv_real && !(drv_real & 0xFF000000)) {
+              uint8_t nlen = m68k_read_memory_8(drv_real + 18);
+              if (nlen > 0 && nlen < 30)
+                for (int c = 0; c < nlen; c++)
+                  name[c] = m68k_read_memory_8(drv_real + 19 + c);
+            }
+            printf("[SND-DIAG]   unit%d: DCE=%08X drv=%08X name='%s'\n",
+                   u, dce_u, drv_real, name);
+          }
+        }
+        // Dereference unit table handle to get real DCE
+        for (int u = 1; u <= 4; u++) {
+          uint32_t handle = m68k_read_memory_32(utab + u * 4);
+          if (!handle) continue;
+          uint32_t master = m68k_read_memory_32(handle);
+          uint32_t dce_real = master & 0x00FFFFFF;
+          if (!dce_real) continue;
+          uint16_t flags = m68k_read_memory_16(dce_real + 4);
+          uint8_t busy_byte = m68k_read_memory_8(dce_real + 5);
+          uint32_t qhead = m68k_read_memory_32(dce_real + 8);
+          uint32_t qtail = m68k_read_memory_32(dce_real + 12);
+          printf("[DCE] unit%d: handle=%08X real=%08X flags=%04X busy_b=%02X qH=%08X qT=%08X\n",
+                 u, handle, dce_real, flags, busy_byte, qhead, qtail);
+        }
+        // Key low-memory vectors
+        printf("[DIAG] SonyVec($226)=%08X\n", m68k_read_memory_32(0x226));
+        printf("[DIAG] jSonyPatch($B40)=%08X\n", m68k_read_memory_32(0xB40));
+        printf("[DIAG] IWMBase($1E0)=%08X\n", m68k_read_memory_32(0x1E0));
+        printf("[DIAG] VIABase($1D4)=%08X\n", m68k_read_memory_32(0x1D4));
+        printf("[DIAG] SonyVars($134)=%08X\n", m68k_read_memory_32(0x134));
+        printf("[DIAG] JIODone($8FC)=%08X\n", m68k_read_memory_32(0x8FC));
+        printf("[DIAG] DskErr($142)=%04X\n", m68k_read_memory_16(0x142));
+        // Dump stack
+        uint32_t sp = m68k_get_reg(NULL, M68K_REG_A7);
+        printf("[DIAG] SP=%08X stack:", sp);
+        for (int i = 0; i < 12; i++)
+          printf(" %04X", m68k_read_memory_16(sp + i * 2));
+        printf("\n");
+        // SonyVars structure (first 32 bytes)
+        uint32_t sv = m68k_read_memory_32(0x134);
+        if (sv) {
+          printf("[DIAG] SonyVars:");
+          for (int i = 0; i < 32; i += 2)
+            printf(" %04X", m68k_read_memory_16(sv + i));
+          printf("\n");
+        }
+        // Dump captured IWM reads (ring buffer — most recent IWM_LOG_SIZE entries)
+        {
+          unsigned int n = (iwm_log_head < IWM_LOG_SIZE) ? iwm_log_head : IWM_LOG_SIZE;
+          unsigned int start = (iwm_log_head < IWM_LOG_SIZE) ? 0 : (iwm_log_head - IWM_LOG_SIZE);
+          printf("[DIAG] IWM total=%u showing last %u\n", iwm_log_total, n);
+          for (unsigned int i = 0; i < n; i++) {
+            unsigned int idx = (start + i) % IWM_LOG_SIZE;
+            uint32_t reg = (iwm_log_buf[idx].addr - 0xDFE1FF) >> 9;
+            printf("[IWM] #%u reg%u addr=%06X val=%02X pc=%08X\n",
+                   start + i, reg, iwm_log_buf[idx].addr, iwm_log_buf[idx].val,
+                   iwm_log_buf[idx].pc);
+          }
+        }
+        sound_diag_done = 1;
+      }
     }
-    if (last_irq != 0 && last_irq != last_last_irq) {
-      last_last_irq = last_irq;
-      M68K_SET_IRQ(last_irq);
+
+    static unsigned long hb_cnt = 0;
+    if ((hb_cnt++ & 0xFFFFF) == 0) {
+      uint32_t hb_pc = m68k_get_reg(NULL, M68K_REG_PC);
+      uint32_t ticks = m68k_read_memory_32(0x16A);
+      static uint32_t prev_ticks = 0;
+      static struct timespec prev_ts = {0, 0};
+      struct timespec now_ts;
+      clock_gettime(CLOCK_MONOTONIC, &now_ts);
+      double elapsed = (now_ts.tv_sec - prev_ts.tv_sec) + (now_ts.tv_nsec - prev_ts.tv_nsec) / 1e9;
+      uint32_t delta_ticks = ticks - prev_ticks;
+      double vbl_hz = (elapsed > 0.01 && prev_ts.tv_sec > 0) ? delta_ticks / elapsed : 0.0;
+      printf("[HB] pc=%08X ticks=%08X (+%u in %.2fs = %.1f Hz) ack=%u ifrR=%u\n",
+             hb_pc, ticks, delta_ticks, elapsed, vbl_hz, dbg_irq_ack_count, via_ifr_reads);
+      prev_ticks = ticks;
+      prev_ts = now_ts;
+      static unsigned int prev_ca1 = 0;
+      static unsigned int prev_slowio = 0;
+      double ca1_hz = (elapsed > 0.01 && vbl_hz > 0) ? (via_ifr_bits[1] - prev_ca1) / elapsed : 0.0;
+      printf("[IFR] CA2=%u CA1=%u(%.1fHz) SR=%u CB2=%u CB1=%u T2=%u T1=%u slowio=%u(+%u)\n",
+             via_ifr_bits[0], via_ifr_bits[1], ca1_hz, via_ifr_bits[2],
+             via_ifr_bits[3], via_ifr_bits[4], via_ifr_bits[5],
+             via_ifr_bits[6], slowio_hit_count, slowio_hit_count - prev_slowio);
+      prev_ca1 = via_ifr_bits[1];
+      prev_slowio = slowio_hit_count;
+      printf("[IER] last=%02X reads=%u writes=%u T1en=%u T2en=%u\n",
+             via_ier_last, via_ier_reads, via_ier_writes,
+             via_ier_t1_enabled, via_ier_t2_enabled);
+      printf("[VIA-T1] CL_w=%u CH_w=%u\n", via_t1cl_writes, via_t1ch_writes);
+      static unsigned int prev_pacedio = 0;
+      printf("[RD8] total=%u hi=%u via=%u iwm=%u scsiR=%u scsiW=%u pacedio=%u(+%u)\n",
+             rd8_total, rd8_hi, rd8_via, rd8_iwm, rd8_scsi, wr8_scsi,
+             pacedio_hit_count, pacedio_hit_count - prev_pacedio);
+      prev_pacedio = pacedio_hit_count;
+      printf("[IWM-MODE] data=%u status=%u hshk=%u write=%u Q6=%d Q7=%d\n",
+             iwm_mode_rd[0], iwm_mode_rd[1], iwm_mode_rd[2], iwm_mode_rd[3],
+             iwm_q6, iwm_q7);
+      printf("[IWM-HSHK] ready=%u notready=%u\n", iwm_hshk_ready, iwm_hshk_notready);
+      printf("[IWM-DATA] hi=%u lo=%u (zero=%u ff=%u other=%u)\n",
+             iwm_data_hi, iwm_data_lo, iwm_data_zero, iwm_data_ff, iwm_data_nonzero);
+      printf("[VIA-ACK] IRA(CA1)=%u ORB(CB)=%u T2CL=%u SR=%u\n",
+             via_ira_reads, via_orb_reads, via_t2cl_reads, via_sr_reads);
+      printf("[IFR-W] total=%u CA2clr=%u CA1clr=%u\n",
+             via_ifr_writes, via_ifr_w_ca2, via_ifr_w_ca1);
+      // Key system globals for VBL task processing
+      {
+        uint32_t vbl_proc = m68k_read_memory_32(0x08EE); // VBL task processor fn ptr
+        uint32_t vbl_flag = m68k_read_memory_8(0x0160);   // VBL processing flag (bit 6)
+        uint16_t ier_hw = ps_read_8(0xEFFDFE);            // direct IER read from hardware
+        uint16_t ifr_hw = ps_read_8(0xEFFBFE);            // direct IFR read from hardware
+        uint32_t vbl_qhead = m68k_read_memory_32(0x0162);  // VBLQueue.qHead
+        uint32_t dtask_qhead = m68k_read_memory_32(0x0D92); // DeferredTaskQueue.qHead (DTaskQHdr+2)
+        uint16_t ioResult_val = m68k_read_memory_16(0x001FFC10); // actual ioResult word
+        printf("[SYS] VBLproc=$%08X VBLflag=$%02X IER_hw=$%02X IFR_hw=$%02X\n",
+               vbl_proc, vbl_flag, ier_hw, ifr_hw);
+        printf("[SYS] VBLqHead=$%08X DTqHead=$%08X ioResult=$%04X\n",
+               vbl_qhead, dtask_qhead, ioResult_val);
+        // Sony driver vectors and DCE state
+        uint32_t jfetch = m68k_read_memory_32(0x0226);    // JFetch - disk read
+        uint32_t jiodone = m68k_read_memory_32(0x022E);   // JIODone vector
+        uint32_t sony_exit = m68k_read_memory_32(0x08FC);  // Sony completion jump target
+        uint32_t dskerr = m68k_read_memory_16(0x0142);     // DskErr
+        uint32_t sonyvar_ptr = m68k_read_memory_32(0x0134); // SonyVars pointer
+        uint32_t sony_busy = (sonyvar_ptr && sonyvar_ptr < 0x400000) ?
+                     m68k_read_memory_8(sonyvar_ptr + 0x19) : 0xFF;
+        uint32_t dce_ptr = (sonyvar_ptr && sonyvar_ptr < 0x400000) ?
+                     m68k_read_memory_32(sonyvar_ptr) : 0;  // *(SonyVars) = DCE?
+        uint32_t dce_qhead = (dce_ptr && dce_ptr < 0x400000) ?
+                     m68k_read_memory_32(dce_ptr + 8) : 0;  // DCE+8 = qHead
+        uint32_t dce_qtail = (dce_ptr && dce_ptr < 0x400000) ?
+                     m68k_read_memory_32(dce_ptr + 12) : 0; // DCE+12 = qTail
+        uint32_t dce_flags = (dce_ptr && dce_ptr < 0x400000) ?
+                     m68k_read_memory_16(dce_ptr + 4) : 0;  // DCE+4 = dCtlFlags
+        printf("[SONY] JFetch=$%08X JIODone=$%08X exit=$%08X DskErr=$%04X busy=%u\n",
+               jfetch, jiodone, sony_exit, dskerr, sony_busy);
+        printf("[DCE] SonyVars=$%08X DCE=$%08X flags=$%04X qHead=$%08X qTail=$%08X\n",
+               sonyvar_ptr, dce_ptr, dce_flags, dce_qhead, dce_qtail);
+        // Dump first 32 bytes of ioParam block (if qHead is valid)
+        if (dce_qhead && dce_qhead < 0x400000) {
+          printf("[IOPB] ");
+          for (int i = 0; i < 32; i += 2) {
+            printf("%04X ", m68k_read_memory_16(dce_qhead + i));
+          }
+          printf("\n");
+        }
+        // Dump VBL task record if queue is non-empty
+        if (vbl_qhead != 0) {
+          uint32_t vbl_qlink = m68k_read_memory_32(vbl_qhead + 0);
+          uint16_t vbl_qtype = m68k_read_memory_16(vbl_qhead + 4);
+          uint32_t vbl_addr = m68k_read_memory_32(vbl_qhead + 6);
+          uint16_t vbl_count = m68k_read_memory_16(vbl_qhead + 10);
+          uint16_t vbl_phase = m68k_read_memory_16(vbl_qhead + 12);
+          printf("[VBL-TASK] @$%08X: qLink=$%08X qType=$%04X vblAddr=$%08X vblCount=%d vblPhase=%d\n",
+                 vbl_qhead, vbl_qlink, vbl_qtype, vbl_addr, (int16_t)vbl_count, (int16_t)vbl_phase);
+        }
+      }
+      printf("[WATCH] ioResult_writes=%u\n", watch_jiodone);
+      // Dump Lvl1DT entries (VIA ISR dispatch table) from RAM
+      // Mac OS Lvl1DT at $0192, 4-byte entries (handler address only)
+      // Slot order: [0]=CA2, [1]=CA1/VBL, [2]=SR, [3]=CB2, [4]=CB1, [5]=T2, [6]=T1
+      {
+        static int lvl1dt_dumped = 0;
+        if (!lvl1dt_dumped && dbg_irq_ack_count > 10) {
+          lvl1dt_dumped = 1;
+          printf("[Lvl1DT] VIA interrupt dispatch table (base=$0192, 4-byte entries):\n");
+          for (int slot = 0; slot < 7; slot++) {
+            uint32_t entry_addr = 0x0192 + slot * 4;
+            uint32_t handler = m68k_read_memory_32(entry_addr);
+            const char *names[] = {"CA2","CA1/VBL","SR","CB2","CB1","T2","T1"};
+            printf("  [%d] %s ($%04X): handler=%08X\n", slot, names[slot], entry_addr, handler);
+          }
+          // Level 1 autovector at $64
+          uint32_t vec1 = m68k_read_memory_32(0x64);
+          printf("  Autovector 1 ($64): %08X\n", vec1);
+          // Also dump VIA PCR register value (at $EFFDFE-ish, RS=12 = $EFF9FE)
+          // PCR is at RS=12, base + 12*512 = $EFE1FE + $1800 = $EFF9FE
+          // Actually PCR is at RS=12 on 6522: base + RS*512
+          // VIA base = $EFE1FE, RS spacing = $200
+          // RS=12: $EFE1FE + 12*$200 = $EFE1FE + $1800 = $EFF9FE
+          unsigned int pcr = ps_read_8(0xEFF9FE);
+          printf("  VIA PCR: $%02X (CA1=%s-edge, CA2=%s)\n", pcr,
+                 (pcr & 0x01) ? "pos" : "neg",
+                 (pcr & 0x0E) == 0x00 ? "neg-edge-clr-on-read" :
+                 (pcr & 0x0E) == 0x02 ? "neg-edge-independent" :
+                 (pcr & 0x0E) == 0x04 ? "pos-edge-clr-on-read" :
+                 (pcr & 0x0E) == 0x06 ? "pos-edge-independent" :
+                 (pcr & 0x0E) == 0x08 ? "handshake-out" :
+                 (pcr & 0x0E) == 0x0A ? "pulse-out" :
+                 (pcr & 0x0E) == 0x0C ? "low-out" :
+                 "high-out");
+        }
+      }
     }
   }
-  if (!irq && last_last_irq != 0) {
-    M68K_SET_IRQ(0);
-    last_last_irq = 0;
+
+  if (atomic_load(&irq)) {
+    atomic_store(&irq, 0);
+    // Read the actual IPL level from the CPLD status register.
+    // Previously hardcoded to level 1, but Mac SE has multiple
+    // interrupt sources at different levels (VIA=1, SCC=2/4).
+    // Routing non-VIA interrupts to the VIA ISR causes the
+    // dispatcher to fall off the Lvl1DT table into garbage.
+    unsigned int status = ps_read_status_reg();
+    unsigned int ipl = (status & 0xe000) >> 13;
+    if (ipl > 0) {
+      M68K_SET_IRQ(ipl);
+      last_last_irq = ipl;
+      dbg_cpu_irq++;
+    }
+  } else if (last_last_irq != 0) {
+    // Deassertion: check GPIO pin directly (no bus operation)
+    uint32_t gpio_val = *(gpio + 13);
+    if (!(gpio_val & (1 << PIN_TXN_IN_PROGRESS)) &&
+        (gpio_val & (1 << PIN_IPL_ZERO))) {
+      // IPL pin is high (no interrupt) — clear CPU level
+      M68K_SET_IRQ(0);
+      last_last_irq = 0;
+      dbg_cpu_deassert++;
+    }
   }
 
   if (do_reset) {
@@ -514,9 +861,15 @@ void sigint_handler(int sig_num) {
     usleep(0);
   }
 
-  printf("IRQs triggered: %lld\n", trig_irq);
-  printf("IRQs serviced: %lld\n", serv_irq);
-  printf("Last serviced IRQ: %d\n", last_last_irq);
+  printf("IPL assertions: %u\n", atomic_load(&dbg_ipl_assert));
+  printf("CPU IRQ set: %u\n", dbg_cpu_irq);
+  printf("CPU IRQ ack: %u\n", dbg_irq_ack_count);
+  printf("CPU IRQ deassert: %u\n", dbg_cpu_deassert);
+  printf("VIA IFR reads: %u\n", via_ifr_reads);
+  printf("VIA IFR bits: CA2=%u CA1=%u SR=%u CB2=%u CB1=%u T2=%u T1=%u\n",
+         via_ifr_bits[0], via_ifr_bits[1], via_ifr_bits[2],
+         via_ifr_bits[3], via_ifr_bits[4], via_ifr_bits[5],
+         via_ifr_bits[6]);
 
   exit(0);
 }
@@ -611,6 +964,34 @@ switch_config:
     if (!cfg->platform)
       cfg->platform = make_platform_config("none", "generic");
     cfg->platform->platform_initial_setup(cfg);
+
+    // Scan config for slow IO regions
+    slowio_count = 0;
+    for (int i = 0; i < MAX_NUM_MAPPED_ITEMS && slowio_count < MAX_SLOWIO_REGIONS; i++) {
+      if (cfg->map_type[i] == MAPTYPE_SLOWIO) {
+        slowio[slowio_count].lo = cfg->map_offset[i];
+        slowio[slowio_count].hi = cfg->map_high[i];
+        printf("[SLOWIO] Region %d: %08X-%08X\n", slowio_count,
+               slowio[slowio_count].lo, slowio[slowio_count].hi);
+        slowio_count++;
+      }
+    }
+    if (slowio_count)
+      printf("[SLOWIO] %d slow IO region(s) active — bus cycle delay enabled\n", slowio_count);
+
+    // Scan config for paced IO regions
+    pacedio_count = 0;
+    for (int i = 0; i < MAX_NUM_MAPPED_ITEMS && pacedio_count < MAX_PACEDIO_REGIONS; i++) {
+      if (cfg->map_type[i] == MAPTYPE_PACEDIO) {
+        pacedio[pacedio_count].lo = cfg->map_offset[i];
+        pacedio[pacedio_count].hi = cfg->map_high[i];
+        printf("[PACEDIO] Region %d: %08X-%08X\n", pacedio_count,
+               pacedio[pacedio_count].lo, pacedio[pacedio_count].hi);
+        pacedio_count++;
+      }
+    }
+    if (pacedio_count)
+      printf("[PACEDIO] %d paced IO region(s) active — stretched bus cycles\n", pacedio_count);
   }
 
   if (cfg->mouse_enabled) {
@@ -738,7 +1119,20 @@ void cpu_pulse_reset(void) {
 }
 
 unsigned int cpu_irq_ack(int level) {
-  //printf("cpu irq ack\n");
+  dbg_irq_ack_count++;
+  if (dbg_irq_ack_count <= 3)
+    printf("[IRQ-ACK] level=%d count=%u\n", level, dbg_irq_ack_count);
+
+  // Clear the pending interrupt level after acknowledgment.
+  // Without this, CPU_INT_LEVEL stays at 0x100 during the entire
+  // m68k_execute() call. After RTE restores the SR (mask=0),
+  // m68ki_check_interrupts() sees 0x100 > 0x000 and immediately
+  // re-enters the ISR — trapping the CPU in an interrupt loop.
+  // The IPL polling thread will re-assert if the VIA still has
+  // active interrupt sources (level-triggered).
+  CPU_INT_LEVEL = 0;
+  last_last_irq = 0;
+
   return 24 + level;
 }
 
@@ -928,6 +1322,15 @@ static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t 
       }
 
       break;
+    case PLATFORM_MAC:
+      /* Mac SE BBU clears OVL on first access to ROM/SCSI range */
+      if (ovl && addr >= 0x400000 && addr < 0x600000) {
+        ovl = 0;
+        m68ki_cpu.ovl = 0;
+        printf("[MAC] OVL off (read from ROM/SCSI range %08X).\n", addr);
+        handle_ovl_mappings_mac68k(cfg);
+      }
+      break;
     default:
       break;
   }
@@ -943,68 +1346,185 @@ static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t 
 }
 
 unsigned int m68k_read_memory_8(unsigned int address) {
+  rd8_total++;
+
+  // 68000 has 24-bit address bus — mask upper 8 bits
+  address &= 0x00FFFFFF;
+
   if (platform_read_check(OP_TYPE_BYTE, address, &platform_res)) {
     return platform_res;
   }
 
-  if (address & 0xFF000000)
-    return 0;
+  if (address >= 0x800000) rd8_hi++;
+  if (address >= 0xDFE1FF && address <= 0xDFFFFF) rd8_iwm++;
+  if (address >= 0xEFE1FE && address <= 0xEFFFFF) rd8_via++;
+  if (address >= 0x580000 && address <= 0x5FFFFF)
+    rd8_scsi++;
 
-  return (unsigned int)ps_read_8((uint32_t)address);
+  if (is_slowio(address))
+    slowio_delay();
+
+  unsigned int val;
+  if (is_pacedio(address)) {
+    pacedio_hit_count++;
+    val = (unsigned int)ps_read_8_paced((uint32_t)address);
+  } else {
+    val = (unsigned int)ps_read_8((uint32_t)address);
+  }
+
+  if (address >= 0x580000 && address <= 0x5FFFFF) {
+    // Ring buffer: suppress repetitive CSBS polling (only log transitions)
+    int do_log = 1;
+    if (address == 0x5FF040) {
+      if ((val & 0xFF) == scsi_csbs_last) {
+        scsi_csbs_repeat++;
+        do_log = 0;
+      } else {
+        scsi_csbs_last = val & 0xFF;
+        scsi_csbs_repeat = 0;
+      }
+    }
+    if (do_log) {
+      unsigned int idx = scsi_log_head % SCSI_LOG_SIZE;
+      scsi_log_buf[idx].addr = address;
+      scsi_log_buf[idx].val = val & 0xFF;
+      scsi_log_buf[idx].pc = m68k_get_reg(NULL, M68K_REG_PC);
+      scsi_log_buf[idx].is_write = 0;
+      scsi_log_head++;
+      scsi_log_total++;
+    }
+  }
+
+  // IWM access capture: $DFE1FF-$DFFFFF (ring buffer + mode tracking)
+  if (address >= 0xDFE1FF && address <= 0xDFFFFF) {
+    unsigned int idx = iwm_log_head % IWM_LOG_SIZE;
+    iwm_log_buf[idx].addr = address;
+    iwm_log_buf[idx].val = val;
+    iwm_log_buf[idx].pc = m68k_get_reg(NULL, M68K_REG_PC);
+    iwm_log_head++;
+    iwm_log_total++;
+
+    // Track Q6/Q7 state changes (reg12=Q6off, reg13=Q6on, reg14=Q7off, reg15=Q7on)
+    unsigned int reg = (address - 0xDFE1FF) >> 9;
+    if (reg == 12) iwm_q6 = 0;
+    else if (reg == 13) iwm_q6 = 1;
+    else if (reg == 14) iwm_q7 = 0;
+    else if (reg == 15) iwm_q7 = 1;
+
+    // Count reads by current mode and track key values
+    int mode = iwm_q7 * 2 + iwm_q6;
+    iwm_mode_rd[mode]++;
+    if (mode == 0) { // data register (Q6=0, Q7=0)
+      if (val & 0x80) iwm_data_hi++;
+      else iwm_data_lo++;
+      if (val == 0x00) iwm_data_zero++;
+      else if (val == 0xFF) iwm_data_ff++;
+      else iwm_data_nonzero++;
+    } else if (mode == 2) { // handshake register (Q6=0, Q7=1)
+      if (val & 0x80) iwm_hshk_ready++;
+      else iwm_hshk_notready++;
+    }
+  }
+
+  // VIA IFR tracing: count which interrupt sources the ISR sees
+  // VIA IFR is at base ($EFE1FE) + RS13*512 = $EFFBFE
+  if (address == 0xEFFBFE) {
+    via_ifr_reads++;
+    for (int i = 0; i < 7; i++) {
+      if (val & (1 << i))
+        via_ifr_bits[i]++;
+    }
+  }
+  // VIA IER tracing: capture which interrupts are enabled
+  // VIA IER is at base + RS14*512 = $EFFDFE
+  if (address == 0xEFFDFE) {
+    via_ier_last = val;
+    via_ier_reads++;
+  }
+  // VIA register reads that clear IFR sources (ACK tracking)
+  // Reading IRA ($EFE3FE, RS=1) clears CA1 in IFR
+  // Reading ORB ($EFE1FE, RS=0) clears CB1/CB2 in IFR
+  // Reading T2C-L ($EFF1FE, RS=8) clears T2 in IFR
+  // Reading SR ($EFEBFE, RS=10) clears SR in IFR
+  if (address == 0xEFE3FE) via_ira_reads++;   // CA1 ACK
+  if (address == 0xEFE1FE) via_orb_reads++;   // CB1/CB2 ACK
+  if (address == 0xEFF1FE) via_t2cl_reads++;  // T2 ACK
+  if (address == 0xEFEBFE) via_sr_reads++;    // SR ACK
+
+  return val;
 }
 
 unsigned int m68k_read_memory_16(unsigned int address) {
+  // 68000 has 24-bit address bus — mask upper 8 bits
+  address &= 0x00FFFFFF;
+
   if (platform_read_check(OP_TYPE_WORD, address, &platform_res)) {
     return platform_res;
   }
 
-  if (address & 0xFF000000)
-    return 0;
+  if (is_slowio(address))
+    slowio_delay();
 
+  uint32_t result16;
   if (address & 0x01) {
-    return ((ps_read_8(address) << 8) | ps_read_8(address + 1));
+    result16 = ((ps_read_8(address) << 8) | ps_read_8(address + 1));
+  } else {
+    result16 = (unsigned int)ps_read_16((uint32_t)address);
   }
-  return (unsigned int)ps_read_16((uint32_t)address);
+
+  return result16;
 }
 
 unsigned int m68k_read_memory_32(unsigned int address) {
+  // 68000 has 24-bit address bus — mask upper 8 bits
+  address &= 0x00FFFFFF;
+
   if (platform_read_check(OP_TYPE_LONGWORD, address, &platform_res)) {
     return platform_res;
   }
 
-  if (address & 0xFF000000)
-    return 0;
+  if (is_slowio(address))
+    slowio_delay();
 
+  uint32_t result32;
   if (address & 0x01) {
     uint32_t c = ps_read_8(address);
     c |= (be16toh(ps_read_16(address+1)) << 8);
     c |= (ps_read_8(address + 3) << 24);
-    return htobe32(c);
+    result32 = htobe32(c);
+  } else {
+    uint16_t a = ps_read_16(address);
+    uint16_t b = ps_read_16(address + 2);
+    result32 = (a << 16) | b;
   }
-  uint16_t a = ps_read_16(address);
-  uint16_t b = ps_read_16(address + 2);
-  return (a << 16) | b;
+
+  return result32;
 }
 
 static inline int32_t platform_write_check(uint8_t type, uint32_t addr, uint32_t val) {
   switch (cfg->platform->id) {
-    case PLATFORM_MAC:
-      switch (addr) {
-        case 0xEFFFFE: // VIA1?
-          if (val & 0x10 && !ovl) {
-              ovl = 1;
-              m68ki_cpu.ovl = 1;
-              printf("[MAC] OVL on.\n");
-              handle_ovl_mappings_mac68k(cfg);
-          } else if (ovl) {
-            ovl = 0;
-            m68ki_cpu.ovl = 0;
-            printf("[MAC] OVL off.\n");
-            handle_ovl_mappings_mac68k(cfg);
-          }
-          break;
+    case PLATFORM_MAC: {
+      /* Debug: log first writes to VIA range */
+      static int via_dbg = 0;
+      if (addr >= 0xE00000 && addr <= 0xEFFFFF && via_dbg < 20) {
+        printf("[MAC-VIA] write addr=%08X val=%02X type=%d\n", addr, val, type);
+        via_dbg++;
+      }
+      /* Mac SE BBU clears OVL on the first access to the ROM/SCSI
+       * address range ($400000-$5FFFFF).  "Designing Cards and Drivers
+       * for Macintosh II and Macintosh SE" (1987), p12-6:
+       * "Following the first normal ROM access or SCSI access
+       *  ($40 0000 through $5F FFFF), RAM appears at $00 0000."
+       * OVL is only re-asserted by a hardware reset.
+       */
+      if (ovl && addr >= 0x400000 && addr < 0x600000) {
+        ovl = 0;
+        m68ki_cpu.ovl = 0;
+        printf("[MAC] OVL off (write to ROM/SCSI range %08X).\n", addr);
+        handle_ovl_mappings_mac68k(cfg);
       }
       break;
+    }
     case PLATFORM_AMIGA:
       switch (addr) {
         case INTREQ:
@@ -1127,22 +1647,251 @@ static inline int32_t platform_write_check(uint8_t type, uint32_t addr, uint32_t
 }
 
 void m68k_write_memory_8(unsigned int address, unsigned int value) {
+  // 68000 has 24-bit address bus — mask upper 8 bits
+  address &= 0x00FFFFFF;
+
+  if (address >= 0x580000 && address <= 0x5FFFFF) {
+    wr8_scsi++;
+    unsigned int idx = scsi_log_head % SCSI_LOG_SIZE;
+    scsi_log_buf[idx].addr = address;
+    scsi_log_buf[idx].val = value & 0xFF;
+    scsi_log_buf[idx].pc = m68k_get_reg(NULL, M68K_REG_PC);
+    scsi_log_buf[idx].is_write = 1;
+    scsi_log_head++;
+    scsi_log_total++;
+    // Dump registers on first ODR write during command phase (pc=$0041A924)
+    {
+      static int odr_cmd_dumped = 0;
+      if (!odr_cmd_dumped && (address == 0x5FF001 || address == 0x5FF000) &&
+          m68k_get_reg(NULL, M68K_REG_PC) == 0x0041A924) {
+        odr_cmd_dumped = 1;
+        printf("[SCSI-CMD] ODR write val=%02X — register dump:\n", value & 0xFF);
+        printf("  D0=%08X D1=%08X D2=%08X D3=%08X\n",
+               m68k_get_reg(NULL, M68K_REG_D0), m68k_get_reg(NULL, M68K_REG_D1),
+               m68k_get_reg(NULL, M68K_REG_D2), m68k_get_reg(NULL, M68K_REG_D3));
+        printf("  D4=%08X D5=%08X D6=%08X D7=%08X\n",
+               m68k_get_reg(NULL, M68K_REG_D4), m68k_get_reg(NULL, M68K_REG_D5),
+               m68k_get_reg(NULL, M68K_REG_D6), m68k_get_reg(NULL, M68K_REG_D7));
+        printf("  A0=%08X A1=%08X A2=%08X A3=%08X\n",
+               m68k_get_reg(NULL, M68K_REG_A0), m68k_get_reg(NULL, M68K_REG_A1),
+               m68k_get_reg(NULL, M68K_REG_A2), m68k_get_reg(NULL, M68K_REG_A3));
+        printf("  A4=%08X A5=%08X A6=%08X SP=%08X\n",
+               m68k_get_reg(NULL, M68K_REG_A4), m68k_get_reg(NULL, M68K_REG_A5),
+               m68k_get_reg(NULL, M68K_REG_A6), m68k_get_reg(NULL, M68K_REG_A7));
+        // Dump memory around likely CDB source pointers
+        for (int r = 0; r < 8; r++) {
+          uint32_t aval = m68k_get_reg(NULL, M68K_REG_A0 + r);
+          if (aval > 0 && aval < 0x400000) {
+            printf("  [A%d -> %08X]: ", r, aval);
+            for (int b = 0; b < 16; b++)
+              printf("%02X ", m68k_read_memory_8(aval + b));
+            printf("\n");
+          }
+        }
+        // Dump 32 bytes BEFORE and AFTER A2 (likely CDB buffer pointer)
+        {
+          uint32_t a2 = m68k_get_reg(NULL, M68K_REG_A2);
+          if (a2 >= 32 && a2 < 0x400000) {
+            printf("  [A2-32 -> %08X]: ", a2 - 32);
+            for (int b = -32; b < 32; b++)
+              printf("%02X%s", m68k_read_memory_8(a2 + b), (b == -1) ? " | " : " ");
+            printf("\n");
+            // Compare fast-path vs GPIO for 16 bytes around A2
+            printf("  [A2 GPIO check]: ");
+            for (int b = -8; b < 8; b++) {
+              uint8_t fast = m68k_read_memory_8(a2 + b);
+              uint8_t gpio = ps_read_8(a2 + b);
+              printf("%02X/%02X%s", fast, gpio, (fast != gpio) ? "! " : " ");
+            }
+            printf("\n");
+          }
+        }
+        fflush(stdout);
+      }
+    }
+  }
+
   if (platform_write_check(OP_TYPE_BYTE, address, value))
     return;
 
-  if (address & 0xFF000000)
-    return;
+  if (is_slowio(address))
+    slowio_delay();
 
-  ps_write_8((uint32_t)address, value);
+  // Mac SE 5380 is on D8-D15 (upper byte lane). ROM writes to odd addresses,
+  // which puts data on D0-D7 only. The BBU should steer D0-D7→D8-D15 but
+  // doesn't with PiStorm timing. Fix: write to even address instead, which
+  // duplicates data to both byte lanes and asserts /UDS. Same A[23:1] = same register.
+  //
+  // EXCEPTION: ODR writes with value $EE are BBU pseudo-DMA triggers.
+  // The ROM writes a dummy $EE; the BBU intercepts the LDS bus cycle and
+  // substitutes the real data byte from its DMA buffer onto D8-D15.
+  // We must keep these as odd writes (LDS) so the BBU recognizes the pseudo-DMA.
+  if (address >= 0x580000 && address <= 0x5FFFFF && (address & 1) == 1) {
+    int paced = is_pacedio(address);
+    if (paced) pacedio_hit_count++;
+    if ((address & 0x70) == 0 && (value & 0xFF) == 0xEE) {
+      // ODR pseudo-DMA: keep odd address so BBU handles it
+      if (paced)
+        ps_write_8_paced((uint32_t)address, value);
+      else
+        ps_write_8((uint32_t)address, value);
+    } else {
+      // Normal register write: use even address for direct D8-D15
+      if (paced)
+        ps_write_8_paced((uint32_t)(address & ~1), value);
+      else
+        ps_write_8((uint32_t)(address & ~1), value);
+    }
+    return;
+  }
+
+  // Watch for byte writes to DskErr ($142-$143) — Sony driver stores error code
+  if (address >= 0x142 && address <= 0x143) {
+    printf("[DSKERR] W8 addr=%03X val=%02X pc=%08X a1=%08X sp=%08X\n",
+           address, value, m68k_get_reg(NULL, M68K_REG_PC),
+           m68k_get_reg(NULL, M68K_REG_A1), m68k_get_reg(NULL, M68K_REG_A7));
+    fflush(stdout);
+  }
+  // Watch for byte writes to DCE busy byte at $1DB9 (DCE $1DB4 + 5)
+  if (address == 0x1DB9) {
+    printf("[DCE-BUSY] W8 val=%02X pc=%08X a1=%08X\n",
+           value, m68k_get_reg(NULL, M68K_REG_PC),
+           m68k_get_reg(NULL, M68K_REG_A1));
+    fflush(stdout);
+  }
+
+  // Watch for byte writes to JFetch ($226-$229) and JIODone ($22E-$231)
+  if (address >= 0x226 && address <= 0x229) {
+    printf("[JFETCH] W8 addr=%03X val=%02X pc=%08X\n",
+           address, value, m68k_get_reg(NULL, M68K_REG_PC));
+    fflush(stdout);
+  }
+  if (address >= 0x22E && address <= 0x231) {
+    printf("[JIODONE-VEC] W8 addr=%03X val=%02X pc=%08X\n",
+           address, value, m68k_get_reg(NULL, M68K_REG_PC));
+    fflush(stdout);
+  }
+
+  // Watch for byte writes to ioResult area ($001FFC10-$001FFC11)
+  if (address >= 0x001FFC10 && address <= 0x001FFC11) {
+    watch_jiodone++;
+    printf("[IORESULT] W8 addr=%08X val=%02X pc=%08X count=%u\n",
+           address, value, m68k_get_reg(NULL, M68K_REG_PC), watch_jiodone);
+    fflush(stdout);
+  }
+
+  // Track VIA IFR writes ($EFFBFE, RS=13) — handlers clear IFR by writing 1s
+  if (address == 0xEFFBFE) {
+    via_ifr_writes++;
+    if (value & 0x01) via_ifr_w_ca2++;
+    if (value & 0x02) via_ifr_w_ca1++;
+  }
+
+  // Track VIA IER writes ($EFFDFE, RS=14) — bit 7 is set/clear control
+  if (address == 0xEFFDFE) {
+    via_ier_writes++;
+    if (value & 0x80) {
+      // Setting bits: check T1 (bit 6) and T2 (bit 5)
+      if (value & 0x40) via_ier_t1_enabled++;
+      if (value & 0x20) via_ier_t2_enabled++;
+    }
+    printf("[VIA-IER] W %02X (set=%d) pc=%08X [T1en=%u T2en=%u]\n",
+           value, (value >> 7) & 1, m68k_get_reg(NULL, M68K_REG_PC),
+           via_ier_t1_enabled, via_ier_t2_enabled);
+  }
+  // Track VIA T1 counter/latch writes:
+  // T1C-L=RS4=$EFE9FE, T1C-H=RS5=$EFEBFE (writing T1C-H starts timer)
+  // T1L-L=RS6=$EFEDFE, T1L-H=RS7=$EFEFFE
+  if (address == 0xEFE9FE || address == 0xEFEBFE) {
+    if (address == 0xEFE9FE) via_t1cl_writes++;
+    if (address == 0xEFEBFE) via_t1ch_writes++;
+    printf("[VIA-T1] W %s=%02X pc=%08X\n",
+           address == 0xEFE9FE ? "T1CL" : "T1CH", value,
+           m68k_get_reg(NULL, M68K_REG_PC));
+  }
+
+  if (is_pacedio(address)) {
+    pacedio_hit_count++;
+    ps_write_8_paced((uint32_t)address, value);
+  } else {
+    ps_write_8((uint32_t)address, value);
+  }
   return;
 }
 
 void m68k_write_memory_16(unsigned int address, unsigned int value) {
+  // 68000 has 24-bit address bus — mask upper 8 bits
+  address &= 0x00FFFFFF;
+
   if (platform_write_check(OP_TYPE_WORD, address, value))
     return;
 
-  if (address & 0xFF000000)
-    return;
+  // Watch for word writes to DskErr ($142) — trigger post-DskErr trace
+  if (address == 0x142) {
+    printf("[DSKERR] W16 val=%04X pc=%08X d0=%08X a1=%08X sp=%08X\n",
+           value, m68k_get_reg(NULL, M68K_REG_PC),
+           m68k_get_reg(NULL, M68K_REG_D0),
+           m68k_get_reg(NULL, M68K_REG_A1),
+           m68k_get_reg(NULL, M68K_REG_A7));
+    // Dump top 8 words of stack to see return addresses
+    uint32_t sp = m68k_get_reg(NULL, M68K_REG_A7);
+    printf("[STACK] ");
+    for (int i = 0; i < 8; i++)
+      printf("%08X ", m68k_read_memory_32(sp + i*4));
+    printf("\n");
+    fflush(stdout);
+    // trace_writes_left = 50;  // disabled
+  }
+
+  // Watch for writes to JFetch ($226) and JIODone ($22E)
+  if (address >= 0x226 && address <= 0x228) {
+    printf("[JFETCH] W16 addr=%03X val=%04X pc=%08X\n",
+           address, value, m68k_get_reg(NULL, M68K_REG_PC));
+    fflush(stdout);
+  }
+  if (address >= 0x22E && address <= 0x230) {
+    printf("[JIODONE-VEC] W16 addr=%03X val=%04X pc=%08X\n",
+           address, value, m68k_get_reg(NULL, M68K_REG_PC));
+    fflush(stdout);
+  }
+
+  // Watch for writes to ioResult at $001FFC10 (Sony driver I/O completion)
+  if (address == 0x001FFC10) {
+    watch_jiodone++;
+    printf("[IORESULT] write val=%04X pc=%08X count=%u\n",
+           value, m68k_get_reg(NULL, M68K_REG_PC), watch_jiodone);
+    // Dump SCSI ring buffer once — only if there was SCSI activity
+    {
+      static int scsi_dumped = 0;
+      if (!scsi_dumped && scsi_log_total > 0) {
+        scsi_dumped = 1;
+        unsigned int n = (scsi_log_head < SCSI_LOG_SIZE) ? scsi_log_head : SCSI_LOG_SIZE;
+        unsigned int start = (scsi_log_head < SCSI_LOG_SIZE) ? 0 : (scsi_log_head - SCSI_LOG_SIZE);
+        printf("[SCSI-LOG] total=%u showing last %u (csbs_repeats=%u)\n",
+               scsi_log_total, n, scsi_csbs_repeat);
+        for (unsigned int i = 0; i < n; i++) {
+          unsigned int si = (start + i) % SCSI_LOG_SIZE;
+          printf("[SCSI] %c8 addr=%08X val=%02X pc=%08X #%u\n",
+                 scsi_log_buf[si].is_write ? 'W' : 'R',
+                 scsi_log_buf[si].addr, scsi_log_buf[si].val,
+                 scsi_log_buf[si].pc, start + i);
+        }
+      }
+    }
+    fflush(stdout);
+  }
+
+  if (is_slowio(address))
+    slowio_delay();
+
+  {
+    static int lo_w16 = 0;
+    if (address < 0x80000 && lo_w16 < 40) {
+      printf("[LO-W16] #%d addr=%08X val=%04X pc=%08X\n", lo_w16, address, value,
+             m68k_get_reg(NULL, M68K_REG_PC));
+      lo_w16++;
+    }
+  }
 
   if (address & 0x01) {
     ps_write_8((uint32_t)address, value & 0xFF);
@@ -1155,11 +1904,34 @@ void m68k_write_memory_16(unsigned int address, unsigned int value) {
 }
 
 void m68k_write_memory_32(unsigned int address, unsigned int value) {
+  // 68000 has 24-bit address bus — mask upper 8 bits
+  address &= 0x00FFFFFF;
+
   if (platform_write_check(OP_TYPE_LONGWORD, address, value))
     return;
 
-  if (address & 0xFF000000)
-    return;
+  // Watch for longword writes to JFetch ($226) and JIODone ($22E)
+  if (address >= 0x224 && address <= 0x226) {
+    printf("[JFETCH] W32 addr=%03X val=%08X pc=%08X\n",
+           address, value, m68k_get_reg(NULL, M68K_REG_PC));
+    fflush(stdout);
+  }
+  if (address >= 0x22C && address <= 0x22E) {
+    printf("[JIODONE-VEC] W32 addr=%03X val=%08X pc=%08X\n",
+           address, value, m68k_get_reg(NULL, M68K_REG_PC));
+    fflush(stdout);
+  }
+
+  // Watch for longword writes covering ioResult ($001FFC10)
+  if (address >= 0x001FFC0E && address <= 0x001FFC10) {
+    watch_jiodone++;
+    printf("[IORESULT] W32 addr=%08X val=%08X pc=%08X count=%u\n",
+           address, value, m68k_get_reg(NULL, M68K_REG_PC), watch_jiodone);
+    fflush(stdout);
+  }
+
+  if (is_slowio(address))
+    slowio_delay();
 
   if (address & 0x01) {
     ps_write_8((uint32_t)address, value & 0xFF);

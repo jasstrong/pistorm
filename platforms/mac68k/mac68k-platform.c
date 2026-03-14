@@ -27,6 +27,7 @@ extern int mouse_hook_enabled;
 extern unsigned int ovl;
 
 uint32_t ovl_sysrom_pos = 0x400000;
+uint32_t ovl_decode_size = 0x20000; /* 128KB OVL overlay on Mac SE */
 
 void adjust_ranges_mac68k(struct emulator_config *cfg) {
     cfg->mapped_high = 0;
@@ -87,26 +88,68 @@ void setvar_mac68k(struct emulator_config *cfg, char *var, char *val) {
 
 void handle_ovl_mappings_mac68k(struct emulator_config *cfg) {
     int32_t index = -1;
+    static unsigned char *ram_range_ptr = NULL;
 
-    index = get_named_mapped_item(cfg, "sysrom");
-    if (index != -1) {
-        cfg->map_offset[index] = (ovl) ? 0x0 : ovl_sysrom_pos;
-        cfg->map_high[index] = cfg->map_size[index];
-        m68k_remove_range(cfg->map_data[index]);
-        m68k_add_rom_range((uint32_t)cfg->map_offset[index], (uint32_t)cfg->map_high[index], cfg->map_data[index]);
-        printf("[MAC68K] Added memory mapping for Mac68k System ROM.\n");
-    } else {
-        printf ("[MAC68K] No sysrom mapping found. If you intended to memory map a system ROM, make sure it has the correct ID.\n");
+    /*
+     * Mac SE memory map:
+     *   ROM is ALWAYS at 0x400000 (decoded by BBU).
+     *   OVL adds a mirror of ROM at 0x000000 (covers ROM size).
+     *   RAM is at 0x000000 when OVL is off.
+     *   During OVL, RAM above the ROM overlay is still accessible.
+     *
+     * Musashi fast-path: ROM always at 0x400000.
+     * Config map_offset: follows OVL state for handle_mapped_read
+     * (so reads from 0x0 during OVL go through slow path to ROM).
+     */
+
+    /* Get ROM size for overlay calculation */
+    int32_t rom_index = get_named_mapped_item(cfg, "sysrom");
+    uint32_t rom_size = (rom_index != -1) ? cfg->map_size[rom_index] : 0x80000;
+
+    if (rom_index != -1) {
+        /* Config offset tracks OVL for the slow-path mapped read handler */
+        cfg->map_offset[rom_index] = (ovl) ? 0x0 : ovl_sysrom_pos;
+        cfg->map_high[rom_index] = cfg->map_offset[rom_index] + cfg->map_size[rom_index];
+        /* Fast-path: ROM always at 0x400000 */
+        m68k_remove_range(cfg->map_data[rom_index]);
+        m68k_add_rom_range(ovl_sysrom_pos, ovl_sysrom_pos + cfg->map_size[rom_index], cfg->map_data[rom_index]);
+        printf("[MAC68K] ROM at %08X (fast-path at %08X-%08X)\n",
+               cfg->map_offset[rom_index], ovl_sysrom_pos, ovl_sysrom_pos + cfg->map_size[rom_index]);
     }
+
     index = get_named_mapped_item(cfg, "sysram");
     if (index != -1) {
-        cfg->map_offset[index] = (ovl) ? ovl_sysrom_pos : 0x0;
-        cfg->map_high[index] = cfg->map_size[index];
+        /* Remove all RAM ranges: base pointer (from config parser)
+         * and tracked pointer (from previous OVL remap) */
         m68k_remove_range(cfg->map_data[index]);
-        m68k_add_ram_range((uint32_t)cfg->map_offset[index], (uint32_t)cfg->map_high[index], cfg->map_data[index]);
-        printf("[MAC68K] Added memory mapping for Mac68k System RAM.\n");
-    } else {
-        printf ("[MAC68K] No sysram mapping found. If you intended to memory map a system RAM, make sure it has the correct ID.\n");
+        if (ram_range_ptr && ram_range_ptr != cfg->map_data[index]) {
+            m68k_remove_range(ram_range_ptr);
+        }
+        ram_range_ptr = NULL;
+
+        if (ovl) {
+            /* OVL on: ROM overlays $0 to ovl_decode_size (128KB on Mac SE).
+             * RAM above the overlay is still accessible.
+             * Keep config range zeroed so handle_mapped_write doesn't
+             * suppress write-through GPIO writes. */
+            uint32_t ram_start = ovl_decode_size;
+            uint32_t ram_end = cfg->map_size[index];
+            if (ram_start < ram_end) {
+                ram_range_ptr = cfg->map_data[index] + ram_start;
+                m68k_add_ram_range_wtc(ram_start, ram_end, ram_range_ptr);
+                printf("[MAC68K] RAM at %08X-%08X (OVL covers 0-%08X)\n",
+                       ram_start, ram_end, ovl_decode_size);
+            }
+            cfg->map_offset[index] = 0;
+            cfg->map_high[index] = 0;
+        } else {
+            /* OVL off: RAM at 0x000000 */
+            ram_range_ptr = cfg->map_data[index];
+            cfg->map_offset[index] = 0x0;
+            cfg->map_high[index] = cfg->map_size[index];
+            m68k_add_ram_range_wtc(0x0, cfg->map_size[index], cfg->map_data[index]);
+            printf("[MAC68K] RAM at 00000000-%08X\n", cfg->map_size[index]);
+        }
     }
 
     adjust_ranges_mac68k(cfg);

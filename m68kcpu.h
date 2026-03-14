@@ -1064,6 +1064,7 @@ typedef struct m68ki_cpu_core
 	unsigned int write_addr[8];
 	unsigned int write_upper[8];
 	unsigned char *write_data[8];
+	unsigned char write_through[8];
 	address_translation_cache code_translation_cache;
 	address_translation_cache fc_read_translation_cache;
 	address_translation_cache fc_write_translation_cache;
@@ -1073,7 +1074,7 @@ typedef struct m68ki_cpu_core
 
 
 extern m68ki_cpu_core m68ki_cpu;
-extern sint           m68ki_remaining_cycles;
+extern volatile sint  m68ki_remaining_cycles;
 extern uint           m68ki_tracing;
 extern const uint8    m68ki_shift_8_table[];
 extern const uint16   m68ki_shift_16_table[];
@@ -1273,6 +1274,9 @@ static inline uint m68ki_read_8_fc(m68ki_cpu_core *state, uint address, uint fc)
 	    address = pmmu_translate_addr(state,address,1);
 #endif
 
+	/* 68000/010/EC020: mask to 24-bit before fast-path range checks */
+	address = ADDRESS_68K(address);
+
 	address_translation_cache *cache = &state->fc_read_translation_cache;
 	if(cache->offset && address >= cache->lower && address < cache->upper)
 	{
@@ -1308,6 +1312,9 @@ static inline uint m68ki_read_16_fc(m68ki_cpu_core *state, uint address, uint fc
 	if (PMMU_ENABLED)
 	    address = pmmu_translate_addr(state,address,1);
 #endif
+
+	/* 68000/010/EC020: mask to 24-bit before fast-path range checks */
+	address = ADDRESS_68K(address);
 
 	address_translation_cache *cache = &state->fc_read_translation_cache;
 	if(cache->offset && address >= cache->lower && address < cache->upper)
@@ -1347,6 +1354,9 @@ static inline uint m68ki_read_32_fc(m68ki_cpu_core *state, uint address, uint fc
 	if (PMMU_ENABLED)
 	    address = pmmu_translate_addr(state,address,1);
 #endif
+
+	/* 68000/010/EC020: mask to 24-bit before fast-path range checks */
+	address = ADDRESS_68K(address);
 
 	address_translation_cache *cache = &state->fc_read_translation_cache;
 	if(cache->offset && address >= cache->lower && address < cache->upper)
@@ -1389,6 +1399,9 @@ static inline void m68ki_write_8_fc(m68ki_cpu_core *state, uint address, uint fc
 	    address = pmmu_translate_addr(state,address,0);
 #endif
 
+	/* 68000/010/EC020: mask to 24-bit before fast-path range checks */
+	address = ADDRESS_68K(address);
+
 	address_translation_cache *cache = &state->fc_write_translation_cache;
 	if(cache->offset && address >= cache->lower && address < cache->upper)
 	{
@@ -1398,8 +1411,10 @@ static inline void m68ki_write_8_fc(m68ki_cpu_core *state, uint address, uint fc
 
 	for (int i = 0; i < state->write_ranges; i++) {
 		if(address >= state->write_addr[i] && address < state->write_upper[i]) {
-			SET_FC_WRITE_TRANSLATION_CACHE_VALUES
 			state->write_data[i][address - state->write_addr[i]] = (unsigned char)value;
+			if (state->write_through[i])
+				break;
+			SET_FC_WRITE_TRANSLATION_CACHE_VALUES
 			return;
 		}
 	}
@@ -1428,6 +1443,9 @@ static inline void m68ki_write_16_fc(m68ki_cpu_core *state, uint address, uint f
 	    address = pmmu_translate_addr(state,address,0);
 #endif
 
+	/* 68000/010/EC020: mask to 24-bit before fast-path range checks */
+	address = ADDRESS_68K(address);
+
 	address_translation_cache *cache = &state->fc_write_translation_cache;
 	if(cache->offset && address >= cache->lower && address < cache->upper)
 	{
@@ -1437,8 +1455,10 @@ static inline void m68ki_write_16_fc(m68ki_cpu_core *state, uint address, uint f
 
 	for (int i = 0; i < state->write_ranges; i++) {
 		if(address >= state->write_addr[i] && address < state->write_upper[i]) {
-			SET_FC_WRITE_TRANSLATION_CACHE_VALUES
 			((short *)(state->write_data[i] + (address - state->write_addr[i])))[0] = htobe16(value);
+			if (state->write_through[i])
+				break;
+			SET_FC_WRITE_TRANSLATION_CACHE_VALUES
 			return;
 		}
 	}
@@ -1472,6 +1492,9 @@ static inline void m68ki_write_32_fc(m68ki_cpu_core *state, uint address, uint f
 	    address = pmmu_translate_addr(state,address,0);
 #endif
 
+	/* 68000/010/EC020: mask to 24-bit before fast-path range checks */
+	address = ADDRESS_68K(address);
+
 	address_translation_cache *cache = &state->fc_write_translation_cache;
 	if(cache->offset && address >= cache->lower && address < cache->upper)
 	{
@@ -1481,8 +1504,10 @@ static inline void m68ki_write_32_fc(m68ki_cpu_core *state, uint address, uint f
 
 	for (int i = 0; i < state->write_ranges; i++) {
 		if(address >= state->write_addr[i] && address < state->write_upper[i]) {
-			SET_FC_WRITE_TRANSLATION_CACHE_VALUES
 			((int *)(state->write_data[i] + (address - state->write_addr[i])))[0] = htobe32(value);
+			if (state->write_through[i])
+				break;
+			SET_FC_WRITE_TRANSLATION_CACHE_VALUES
 			return;
 		}
 	}
@@ -2325,6 +2350,28 @@ static inline void m68ki_exception_1010(m68ki_cpu_core *state)
 static inline void m68ki_exception_1111(m68ki_cpu_core *state)
 {
 	uint sr;
+
+	printf("[LINE-F] PC=%08X opcode=%04X SR=%04X\n", ADDRESS_68K(REG_PPC), REG_IR, m68ki_get_sr(state));
+	printf("  D: %08X %08X %08X %08X %08X %08X %08X %08X\n",
+		REG_DA[0], REG_DA[1], REG_DA[2], REG_DA[3],
+		REG_DA[4], REG_DA[5], REG_DA[6], REG_DA[7]);
+	printf("  A: %08X %08X %08X %08X %08X %08X %08X %08X\n",
+		REG_DA[8], REG_DA[9], REG_DA[10], REG_DA[11],
+		REG_DA[12], REG_DA[13], REG_DA[14], REG_DA[15]);
+	{
+		uint32_t sp = REG_DA[15];
+		printf("  Stack @%08X: ", sp);
+		for (int i = 0; i < 32; i += 2)
+			printf("%04X ", m68ki_read_16(state, sp + i));
+		printf("\n");
+		/* Check what's at the faulting PC — is it ROM or RAM? */
+		uint32_t fpc = ADDRESS_68K(REG_PPC);
+		printf("  Code @%08X: ", fpc);
+		for (int i = 0; i < 16; i += 2)
+			printf("%04X ", m68ki_read_16(state, fpc + i));
+		printf("\n");
+		printf("  PC in %s\n", fpc >= 0x400000 ? "ROM" : "RAM");
+	}
 
 #if M68K_LOG_1010_1111 == OPT_ON
 	M68K_DO_LOG_EMU((M68K_LOG_FILEHANDLE "%s at %08x: called 1111 instruction %04x (%s)\n",

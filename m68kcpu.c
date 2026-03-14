@@ -54,8 +54,8 @@ extern void m68ki_build_opcode_table(void);
 /* ================================= DATA ================================= */
 /* ======================================================================== */
 
-int  m68ki_initial_cycles;
-int  m68ki_remaining_cycles = 0;                     /* Number of clocks remaining */
+volatile int  m68ki_initial_cycles;
+volatile int  m68ki_remaining_cycles = 0;                     /* Number of clocks remaining */
 uint m68ki_tracing = 0;
 uint m68ki_address_space;
 
@@ -1397,6 +1397,20 @@ void m68k_add_rom_range(uint32_t addr, uint32_t upper, unsigned char *ptr)
 	}
 }
 
+void m68k_add_ram_range_wtc(uint32_t addr, uint32_t upper, unsigned char *ptr)
+{
+	m68k_add_ram_range(addr, upper, ptr);
+	m68ki_cpu.fc_write_translation_cache.lower = 0;
+	m68ki_cpu.fc_write_translation_cache.upper = 0;
+	for (int i = 0; i < m68ki_cpu.write_ranges; i++) {
+		if (m68ki_cpu.write_data[i] == ptr) {
+			m68ki_cpu.write_through[i] = 1;
+			printf("[MUSASHI] Write range %d marked write-through\n", i);
+			break;
+		}
+	}
+}
+
 void m68k_remove_range(unsigned char *ptr) {
 	if (!ptr) {
 		return;
@@ -1431,10 +1445,12 @@ void m68k_remove_range(unsigned char *ptr) {
 				m68ki_cpu.write_data[j] = m68ki_cpu.write_data[j + 1];
 				m68ki_cpu.write_addr[j] = m68ki_cpu.write_addr[j + 1];
 				m68ki_cpu.write_upper[j] = m68ki_cpu.write_upper[j + 1];
+				m68ki_cpu.write_through[j] = m68ki_cpu.write_through[j + 1];
 			}
 			m68ki_cpu.write_data[8 - 1] = NULL;
 			m68ki_cpu.write_addr[8 - 1] = 0;
 			m68ki_cpu.write_upper[8 - 1] = 0;
+			m68ki_cpu.write_through[8 - 1] = 0;
 			m68ki_cpu.write_ranges--;
 		}
 	}
@@ -1450,6 +1466,7 @@ void m68k_clear_ranges()
 		m68ki_cpu.write_upper[i] = 0;
 		m68ki_cpu.write_addr[i] = 0;
 		m68ki_cpu.write_data[i] = NULL;
+		m68ki_cpu.write_through[i] = 0;
 	}
 	m68ki_cpu.write_ranges = 0;
 	m68ki_cpu.read_ranges = 0;
