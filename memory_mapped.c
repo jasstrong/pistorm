@@ -81,6 +81,10 @@ read_value:;
 }
 
 inline int handle_mapped_write(struct emulator_config *cfg, unsigned int addr, unsigned int value, unsigned char type) {
+  /* Slow-path watchpoint — catch writes that bypass the Musashi fast-path */
+  if (addr >= 0x003A3838 && addr < 0x003A383C) {
+    printf("[WATCH-SLOW] write.%d @%08X = %08X\n", type, addr, value);
+  }
   int res = -1;
   unsigned char *write_addr = NULL;
 

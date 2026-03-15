@@ -166,6 +166,7 @@ void ps_write_32(unsigned int address, unsigned int data);
 
 unsigned int ps_read_8_paced(unsigned int address);
 void ps_write_8_paced(unsigned int address, unsigned int data);
+void paced_dummy_cycles(void);
 
 unsigned int ps_read_status_reg();
 void ps_write_status_reg(unsigned int value);

@@ -29,6 +29,17 @@ extern unsigned int ovl;
 uint32_t ovl_sysrom_pos = 0x400000;
 uint32_t ovl_decode_size = 0x20000; /* 128KB OVL overlay on Mac SE */
 
+/*
+ * SCSI driver ROM exclusion zone: addresses in this range bypass the
+ * Musashi fast-path cache and go through real GPIO bus cycles, so the
+ * BBU sees ROM reads (instruction fetches) between SCSI driver instructions.
+ */
+uint32_t scsi_rom_low  = 0x41A000;
+uint32_t scsi_rom_high = 0x41C000;
+
+/* Top of RAM that must be write-through for BBU video/sound DMA */
+#define WTC_REGION_SIZE 0x10000  /* 64KB */
+
 void adjust_ranges_mac68k(struct emulator_config *cfg) {
     cfg->mapped_high = 0;
     cfg->mapped_low = 0;
@@ -86,9 +97,11 @@ void setvar_mac68k(struct emulator_config *cfg, char *var, char *val) {
     }
 }
 
+
 void handle_ovl_mappings_mac68k(struct emulator_config *cfg) {
     int32_t index = -1;
     static unsigned char *ram_range_ptr = NULL;
+    static unsigned char *ram_wtc_ptr = NULL;
 
     /*
      * Mac SE memory map:
@@ -110,22 +123,36 @@ void handle_ovl_mappings_mac68k(struct emulator_config *cfg) {
         /* Config offset tracks OVL for the slow-path mapped read handler */
         cfg->map_offset[rom_index] = (ovl) ? 0x0 : ovl_sysrom_pos;
         cfg->map_high[rom_index] = cfg->map_offset[rom_index] + cfg->map_size[rom_index];
-        /* Fast-path: ROM always at 0x400000 */
+        /* Fast-path: ROM always at 0x400000, with exclusion zone for SCSI driver */
         m68k_remove_range(cfg->map_data[rom_index]);
-        m68k_add_rom_range(ovl_sysrom_pos, ovl_sysrom_pos + cfg->map_size[rom_index], cfg->map_data[rom_index]);
-        printf("[MAC68K] ROM at %08X (fast-path at %08X-%08X)\n",
-               cfg->map_offset[rom_index], ovl_sysrom_pos, ovl_sysrom_pos + cfg->map_size[rom_index]);
+        if (scsi_rom_low > ovl_sysrom_pos && scsi_rom_high < ovl_sysrom_pos + cfg->map_size[rom_index]) {
+            /* Split ROM into two fast-path ranges around the exclusion zone */
+            m68k_add_rom_range(ovl_sysrom_pos, scsi_rom_low, cfg->map_data[rom_index]);
+            m68k_add_rom_range(scsi_rom_high, ovl_sysrom_pos + cfg->map_size[rom_index],
+                               cfg->map_data[rom_index] + (scsi_rom_high - ovl_sysrom_pos));
+            printf("[MAC68K] ROM at %08X (fast-path split: %08X-%08X, %08X-%08X)\n",
+                   cfg->map_offset[rom_index], ovl_sysrom_pos, scsi_rom_low,
+                   scsi_rom_high, ovl_sysrom_pos + cfg->map_size[rom_index]);
+        } else {
+            m68k_add_rom_range(ovl_sysrom_pos, ovl_sysrom_pos + cfg->map_size[rom_index], cfg->map_data[rom_index]);
+            printf("[MAC68K] ROM at %08X (fast-path at %08X-%08X)\n",
+                   cfg->map_offset[rom_index], ovl_sysrom_pos, ovl_sysrom_pos + cfg->map_size[rom_index]);
+        }
     }
 
     index = get_named_mapped_item(cfg, "sysram");
     if (index != -1) {
         /* Remove all RAM ranges: base pointer (from config parser)
-         * and tracked pointer (from previous OVL remap) */
+         * and tracked pointers (from previous OVL remap) */
         m68k_remove_range(cfg->map_data[index]);
         if (ram_range_ptr && ram_range_ptr != cfg->map_data[index]) {
             m68k_remove_range(ram_range_ptr);
         }
+        if (ram_wtc_ptr && ram_wtc_ptr != cfg->map_data[index] && ram_wtc_ptr != ram_range_ptr) {
+            m68k_remove_range(ram_wtc_ptr);
+        }
         ram_range_ptr = NULL;
+        ram_wtc_ptr = NULL;
 
         if (ovl) {
             /* OVL on: ROM overlays $0 to ovl_decode_size (128KB on Mac SE).
@@ -135,20 +162,35 @@ void handle_ovl_mappings_mac68k(struct emulator_config *cfg) {
             uint32_t ram_start = ovl_decode_size;
             uint32_t ram_end = cfg->map_size[index];
             if (ram_start < ram_end) {
-                ram_range_ptr = cfg->map_data[index] + ram_start;
-                m68k_add_ram_range_wtc(ram_start, ram_end, ram_range_ptr);
-                printf("[MAC68K] RAM at %08X-%08X (OVL covers 0-%08X)\n",
-                       ram_start, ram_end, ovl_decode_size);
+                uint32_t wtc_start = ram_end - WTC_REGION_SIZE;
+                if (wtc_start > ram_start) {
+                    ram_range_ptr = cfg->map_data[index] + ram_start;
+                    m68k_add_ram_range(ram_start, wtc_start, ram_range_ptr);
+                    ram_wtc_ptr = cfg->map_data[index] + wtc_start;
+                    m68k_add_ram_range_wtc(wtc_start, ram_end, ram_wtc_ptr);
+                    printf("[MAC68K] RAM at %08X-%08X fast, %08X-%08X wtc (OVL covers 0-%08X)\n",
+                           ram_start, wtc_start, wtc_start, ram_end, ovl_decode_size);
+                } else {
+                    ram_range_ptr = cfg->map_data[index] + ram_start;
+                    m68k_add_ram_range_wtc(ram_start, ram_end, ram_range_ptr);
+                    printf("[MAC68K] RAM at %08X-%08X wtc (OVL covers 0-%08X)\n",
+                           ram_start, ram_end, ovl_decode_size);
+                }
             }
             cfg->map_offset[index] = 0;
             cfg->map_high[index] = 0;
         } else {
             /* OVL off: RAM at 0x000000 */
+            uint32_t ram_end = cfg->map_size[index];
+            uint32_t wtc_start = ram_end - WTC_REGION_SIZE;
             ram_range_ptr = cfg->map_data[index];
             cfg->map_offset[index] = 0x0;
             cfg->map_high[index] = cfg->map_size[index];
-            m68k_add_ram_range_wtc(0x0, cfg->map_size[index], cfg->map_data[index]);
-            printf("[MAC68K] RAM at 00000000-%08X\n", cfg->map_size[index]);
+            m68k_add_ram_range(0x0, wtc_start, cfg->map_data[index]);
+            ram_wtc_ptr = cfg->map_data[index] + wtc_start;
+            m68k_add_ram_range_wtc(wtc_start, ram_end, ram_wtc_ptr);
+            printf("[MAC68K] RAM at 00000000-%08X fast, %08X-%08X wtc\n",
+                   wtc_start, wtc_start, ram_end);
         }
     }
 

@@ -1005,6 +1005,10 @@ int m68k_execute(m68ki_cpu_core *state, int num_cycles)
 			/* Record previous program counter */
 			REG_PPC = REG_PC;
 
+			/* PC trace ring buffer for crash diagnostics */
+			state->pc_trace[state->pc_trace_idx & 31] = REG_PC;
+			state->pc_trace_idx = (state->pc_trace_idx + 1) & 31;
+
 			/* Record previous D/A register state (in case of bus error) */
 //#define M68K_BUSERR_THING
 #ifdef M68K_BUSERR_THING

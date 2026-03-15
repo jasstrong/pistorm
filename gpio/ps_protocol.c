@@ -118,10 +118,8 @@ void ps_write_16(unsigned int address, unsigned int data) {
 }
 
 void ps_write_8(unsigned int address, unsigned int data) {
-  if ((address & 1) == 0)
-    data = data + (data << 8);  // EVEN, A0=0,UDS
-  else
-    data = data & 0xff;  // ODD , A0=1,LDS
+  data &= 0xff;
+  data |= (data << 8);  // 68000 replicates byte on both halves of data bus
 
   *(gpio + 0) = GPFSEL0_OUTPUT;
   *(gpio + 1) = GPFSEL1_OUTPUT;
@@ -225,37 +223,59 @@ unsigned int ps_read_32(unsigned int address) {
   return (ps_read_16(address) << 16) | ps_read_16(address + 2);
 }
 
-// Paced IO: slow PICLK for peripherals whose BBU samples /AS on C16M edges.
-// At 200MHz PICLK, /AS is 4 CPLD cycles = 20ns — shorter than one C16M cycle
-// (64ns), so the BBU can miss it entirely. Divider 24 → ~50MHz → /AS = 80ns,
-// guaranteeing at least one C16M edge during /AS assertion.
-// We just slam the divider register without stopping the clock — any glitch
-// occurs before the CPLD starts its bus cycle, so it doesn't matter.
-// Proper GPCLK stop/change/restart — shadow register requires it.
-// ~2-3µs per switch, fine for SCSI pseudo-DMA speeds.
-#define PICLK_DIV_FAST  (6 << 12)    // 200MHz
-#define PICLK_DIV_SLOW  (24 << 12)   // 50MHz
-#define PICLK_SRC       (5 | (1 << 4))  // PLLC + ENAB
+// Paced IO: after each pseudo-DMA bus cycle, generate 3 dummy read cycles
+// to a harmless RAM address. On a real 68000, the btst/dbra loop between
+// pseudo-DMA reads generates ~3 instruction fetch bus cycles. The BBU expects
+// to see this bus activity — it uses those cycles for DMA slots, state machine
+// advancement, and /DACK deassertion to the NCR 5380. Without them, the BBU
+// never lets DRQ cycle and pseudo-DMA reads return stale data (0x00).
+// Use the raw GPIO bus cycle functions directly — ps_read_16() would hit
+// the WTC RAM fast path in emulator.c and never generate a real bus cycle.
+// Reading from ROM ($400000-$400004) matches what a real 68000 does —
+// instruction fetches between SCSI accesses come from ROM, and the BBU
+// decodes that region differently (immediate DTACK, no DMA contention).
+void paced_dummy_cycles(void) {
+  // Three word reads, simulating instruction fetches
+  *(gpio + 0) = GPFSEL0_OUTPUT;
+  *(gpio + 1) = GPFSEL1_OUTPUT;
+  *(gpio + 2) = GPFSEL2_OUTPUT;
 
-static inline void piclk_set_div(unsigned int div) {
-  // Kill the clock
-  *(gpclk + (CLK_GP0_CTL / 4)) = CLK_PASSWD | (1 << 5);  // KILL bit
-  // Wait for not BUSY
-  while ((*(gpclk + (CLK_GP0_CTL / 4))) & (1 << 7)) {}
-  // Set new divider
-  *(gpclk + (CLK_GP0_DIV / 4)) = CLK_PASSWD | div;
-  // Restart with same source
-  *(gpclk + (CLK_GP0_CTL / 4)) = CLK_PASSWD | PICLK_SRC;
-  // Wait for BUSY (clock running)
-  while (((*(gpclk + (CLK_GP0_CTL / 4))) & (1 << 7)) == 0) {}
+  for (int i = 0; i < 3; i++) {
+    uint32_t addr = 0x400000 + (i * 2);  // ROM range — BBU responds immediately
+
+    *(gpio + 7) = ((addr & 0xffff) << 8) | (REG_ADDR_LO << PIN_A0);
+    *(gpio + 7) = 1 << PIN_WR;
+    *(gpio + 10) = 1 << PIN_WR;
+    *(gpio + 10) = 0xffffec;
+
+    *(gpio + 7) = ((0x0200 | (addr >> 16)) << 8) | (REG_ADDR_HI << PIN_A0);
+    *(gpio + 7) = 1 << PIN_WR;
+    *(gpio + 10) = 1 << PIN_WR;
+    *(gpio + 10) = 0xffffec;
+
+    *(gpio + 0) = GPFSEL0_INPUT;
+    *(gpio + 1) = GPFSEL1_INPUT;
+    *(gpio + 2) = GPFSEL2_INPUT;
+
+    *(gpio + 7) = (REG_DATA << PIN_A0);
+    *(gpio + 7) = 1 << PIN_RD;
+
+    while (*(gpio + 13) & (1 << PIN_TXN_IN_PROGRESS)) {}
+    *(gpio + 10) = 0xffffec;
+
+    *(gpio + 0) = GPFSEL0_OUTPUT;
+    *(gpio + 1) = GPFSEL1_OUTPUT;
+    *(gpio + 2) = GPFSEL2_OUTPUT;
+  }
+
+  *(gpio + 0) = GPFSEL0_INPUT;
+  *(gpio + 1) = GPFSEL1_INPUT;
+  *(gpio + 2) = GPFSEL2_INPUT;
 }
 
-#define PICLK_SLOW()  piclk_set_div(PICLK_DIV_SLOW)
-#define PICLK_FAST()  piclk_set_div(PICLK_DIV_FAST)
+#define PACED_DUMMY_CYCLES() paced_dummy_cycles()
 
 unsigned int ps_read_8_paced(unsigned int address) {
-  // PICLK globally at 50MHz now — no per-cycle switching needed
-
   *(gpio + 0) = GPFSEL0_OUTPUT;
   *(gpio + 1) = GPFSEL1_OUTPUT;
   *(gpio + 2) = GPFSEL2_OUTPUT;
@@ -291,10 +311,8 @@ unsigned int ps_read_8_paced(unsigned int address) {
 }
 
 void ps_write_8_paced(unsigned int address, unsigned int data) {
-  if ((address & 1) == 0)
-    data = data + (data << 8);  // EVEN, A0=0,UDS
-  else
-    data = data & 0xff;  // ODD , A0=1,LDS
+  data &= 0xff;
+  data |= (data << 8);  // 68000 replicates byte on both halves of data bus
 
   *(gpio + 0) = GPFSEL0_OUTPUT;
   *(gpio + 1) = GPFSEL1_OUTPUT;

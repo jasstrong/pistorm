@@ -1070,6 +1070,10 @@ typedef struct m68ki_cpu_core
 	address_translation_cache fc_write_translation_cache;
 
 	volatile unsigned int *gpio;
+
+	/* PC trace ring buffer for crash diagnostics */
+	uint32 pc_trace[32];
+	int pc_trace_idx;
 } m68ki_cpu_core;
 
 
@@ -1385,6 +1389,8 @@ static inline uint m68ki_read_32_fc(m68ki_cpu_core *state, uint address, uint fc
 
 	return m68k_read_memory_32(ADDRESS_68K(address));
 }
+
+/* Buffer snoop — detect when watched address becomes non-zero */
 
 // M68KI_WRITE_8_FC
 static inline void m68ki_write_8_fc(m68ki_cpu_core *state, uint address, uint fc, uint value)
@@ -2372,6 +2378,7 @@ static inline void m68ki_exception_1111(m68ki_cpu_core *state)
 		printf("\n");
 		printf("  PC in %s\n", fpc >= 0x400000 ? "ROM" : "RAM");
 	}
+	{ extern void dump_scsi_log(const char *); dump_scsi_log("LINE-F"); }
 
 #if M68K_LOG_1010_1111 == OPT_ON
 	M68K_DO_LOG_EMU((M68K_LOG_FILEHANDLE "%s at %08x: called 1111 instruction %04x (%s)\n",
@@ -2399,6 +2406,81 @@ static inline void m68ki_exception_illegal(m68ki_cpu_core *state)
 	M68K_DO_LOG((M68K_LOG_FILEHANDLE "%s at %08x: illegal instruction %04x (%s)\n",
 				 m68ki_cpu_names[CPU_TYPE], ADDRESS_68K(REG_PPC), REG_IR,
 				 m68ki_disassemble_quick(ADDRESS_68K(REG_PPC),CPU_TYPE)));
+	printf("[ILLEGAL] PC=%08X opcode=%04X SR=%04X\n", ADDRESS_68K(REG_PPC), REG_IR, m68ki_get_sr(state));
+	printf("  D: %08X %08X %08X %08X %08X %08X %08X %08X\n",
+		REG_DA[0], REG_DA[1], REG_DA[2], REG_DA[3],
+		REG_DA[4], REG_DA[5], REG_DA[6], REG_DA[7]);
+	printf("  A: %08X %08X %08X %08X %08X %08X %08X %08X\n",
+		REG_DA[8], REG_DA[9], REG_DA[10], REG_DA[11],
+		REG_DA[12], REG_DA[13], REG_DA[14], REG_DA[15]);
+	{
+		uint32_t fpc = ADDRESS_68K(REG_PPC);
+		printf("  Code @%08X: ", fpc);
+		for (int i = 0; i < 16; i += 2)
+			printf("%04X ", m68ki_read_16(state, fpc + i));
+		printf("\n  PC in %s\n", fpc >= 0x400000 ? "ROM" : "RAM");
+		/* Stack dump — show return address chain */
+		{
+			uint32_t sp = REG_DA[15]; /* A7 */
+			printf("  Stack @%08X:", sp);
+			for (int i = 0; i < 24; i += 2)
+				printf(" %04X", m68ki_read_16(state, sp + i));
+			printf("\n  Stack (longs):");
+			for (int i = 0; i < 12; i++)
+				printf(" %08X", m68ki_read_32(state, sp + i * 4));
+			printf("\n");
+		}
+		/* PC history — last 32 PCs from Musashi's trace buffer */
+		printf("  PC history (oldest first):\n   ");
+		for (int i = 0; i < 32; i++) {
+			int idx = (state->pc_trace_idx + i) % 32;
+			printf(" %08X", ADDRESS_68K(state->pc_trace[idx]));
+			if ((i & 7) == 7 && i < 31) printf("\n   ");
+		}
+		printf("\n");
+		/* Dump code at each jump transition in the PC trace */
+		{
+			uint32_t prev = 0;
+			for (int i = 0; i < 32; i++) {
+				int idx = (state->pc_trace_idx + i) % 32;
+				uint32_t pc_i = ADDRESS_68K(state->pc_trace[idx]);
+				if (prev && pc_i && (pc_i < prev || pc_i > prev + 8)) {
+					/* Non-sequential transition: dump code at source */
+					printf("  Jump: %08X -> %08X\n", prev, pc_i);
+					printf("    @%08X:", prev);
+					for (int j = 0; j < 8; j++)
+						printf(" %04X", m68ki_read_16(state, prev + j * 2));
+					printf("\n    @%08X:", pc_i);
+					for (int j = 0; j < 8; j++)
+						printf(" %04X", m68ki_read_16(state, pc_i + j * 2));
+					printf("\n");
+				}
+				prev = pc_i;
+			}
+		}
+		/* Dump memory at key addresses for JMP target analysis */
+		printf("  JMP @003A3838:");
+		for (int i = 0; i < 8; i++)
+			printf(" %04X", m68ki_read_16(state, 0x3A3838 + i * 2));
+		printf("\n  JMP target @003A5EC0:");
+		for (int i = 0; i < 16; i++)
+			printf(" %04X", m68ki_read_16(state, 0x3A5EC0 + i * 2));
+		printf("\n  @003A5EE0:");
+		for (int i = 0; i < 16; i++)
+			printf(" %04X", m68ki_read_16(state, 0x3A5EE0 + i * 2));
+		printf("\n  @003A5F00:");
+		for (int i = 0; i < 16; i++)
+			printf(" %04X", m68ki_read_16(state, 0x3A5F00 + i * 2));
+		printf("\n  @003A5F20:");
+		for (int i = 0; i < 16; i++)
+			printf(" %04X", m68ki_read_16(state, 0x3A5F20 + i * 2));
+		printf("\n  @003A5F40:");
+		for (int i = 0; i < 16; i++)
+			printf(" %04X", m68ki_read_16(state, 0x3A5F40 + i * 2));
+		printf("\n");
+		{ extern void dump_scsi_log(const char *); dump_scsi_log("ILLEGAL"); }
+	}
+
 	if (m68ki_illg_callback(REG_IR))
 	    return;
 

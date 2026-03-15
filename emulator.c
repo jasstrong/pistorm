@@ -42,6 +42,7 @@
 
 #include "m68kops.h"
 
+// #define DEBUG_MAC_IO  /* Uncomment for per-access SCSI/VIA/IO debug spam */
 #define KEY_POLL_INTERVAL_MSEC 5000
 
 unsigned int ovl;
@@ -66,6 +67,7 @@ extern volatile unsigned int *gpio;
 extern volatile uint16_t srdata;
 extern uint8_t realtime_graphics_debug, emulator_exiting;
 extern uint8_t rtg_on;
+extern uint32_t scsi_rom_low, scsi_rom_high;
 uint8_t realtime_disassembly, int2_enabled = 0;
 uint32_t do_disasm = 0, old_level;
 uint32_t last_irq = 0, last_last_irq = 0;
@@ -124,13 +126,34 @@ static unsigned int rd8_iwm = 0;
 static unsigned int rd8_hi = 0;
 
 // SCSI read/write log — ring buffer captures most recent N accesses
-#define SCSI_LOG_SIZE 256
-static struct { uint32_t addr; uint8_t val; uint32_t pc; uint8_t is_write; } scsi_log_buf[SCSI_LOG_SIZE];
-static unsigned int scsi_log_head = 0;   // next write position (wraps)
-static unsigned int scsi_log_total = 0;  // total SCSI accesses logged
+#define SCSI_LOG_SIZE 65536
+struct scsi_log_entry { uint32_t addr; uint8_t val; uint32_t pc; uint8_t is_write; };
+struct scsi_log_entry scsi_log_buf[SCSI_LOG_SIZE];
+unsigned int scsi_log_head = 0;   // next write position (wraps)
+unsigned int scsi_log_total = 0;  // total SCSI accesses logged
 // Suppress repetitive CSBS polling — only log when value changes
-static uint8_t scsi_csbs_last = 0xFF;    // last CSBS value (init to impossible)
-static unsigned int scsi_csbs_repeat = 0; // count of suppressed repeats
+static uint8_t scsi_csbs_last = 0xFF;    // last CSCS value (init to impossible)
+unsigned int scsi_csbs_repeat = 0; // count of suppressed repeats
+
+void dump_scsi_log(const char *label) {
+  if (scsi_log_total == 0) return;
+  unsigned int n = (scsi_log_head < SCSI_LOG_SIZE) ? scsi_log_head : SCSI_LOG_SIZE;
+  unsigned int start = (scsi_log_head < SCSI_LOG_SIZE) ? 0 : (scsi_log_head - SCSI_LOG_SIZE);
+  FILE *f = fopen("/tmp/scsi_crash.log", "w");
+  if (f) {
+    fprintf(f, "[SCSI-LOG@%s] total=%u showing last %u\n", label, scsi_log_total, n);
+    for (unsigned int i = 0; i < n; i++) {
+      unsigned int si = (start + i) % SCSI_LOG_SIZE;
+      fprintf(f, "%c8 %08X %02X %08X %u\n",
+             scsi_log_buf[si].is_write ? 'W' : 'R',
+             scsi_log_buf[si].addr, scsi_log_buf[si].val,
+             scsi_log_buf[si].pc, start + i);
+    }
+    fclose(f);
+    printf("[SCSI-LOG@%s] total=%u, %u entries written to /tmp/scsi_crash.log\n",
+           label, scsi_log_total, n);
+  }
+}
 
 // IWM read log — ring buffer captures most recent N reads
 #define IWM_LOG_SIZE 128
@@ -351,6 +374,10 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			/* Record previous program counter */
 			REG_PPC = REG_PC;
 
+			/* PC trace ring buffer for crash diagnostics */
+			state->pc_trace[state->pc_trace_idx & 31] = REG_PC;
+			state->pc_trace_idx = (state->pc_trace_idx + 1) & 31;
+
 			/* Record previous D/A register state (in case of bus error) */
 //#define M68K_BUSERR_THING
 #ifdef M68K_BUSERR_THING
@@ -358,6 +385,26 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 				REG_DA_SAVE[i] = REG_DA[i];
 			}
 #endif
+
+			/* Buffer snoop: log every change to $003A5EC0 (JMP target) */
+			{
+				static uint32_t *snoop_ptr = NULL;
+				static uint32_t snoop_prev = 0;
+				static int snoop_count = 0;
+				if (!snoop_ptr) {
+					for (int i = 0; i < state->write_ranges; i++) {
+						if (0x3A5EC0 >= state->write_addr[i] && 0x3A5EC4 <= state->write_upper[i]) {
+							snoop_ptr = (uint32_t *)(state->write_data[i] + (0x3A5EC0 - state->write_addr[i]));
+							break;
+						}
+					}
+				}
+				if (snoop_ptr && *snoop_ptr != snoop_prev) {
+					printf("[SNOOP] #%d buffer@3A5EC0: %08X -> %08X at PC=%08X\n",
+						snoop_count++, be32toh(snoop_prev), be32toh(*snoop_ptr), ADDRESS_68K(REG_PC));
+					snoop_prev = *snoop_ptr;
+				}
+			}
 
 			/* Read an instruction and call its handler */
 			REG_IR = m68ki_read_imm_16(state);
@@ -524,113 +571,28 @@ cpu_loop:
              via_ifr_bits[6], slowio_hit_count, slowio_hit_count - prev_slowio);
       prev_ca1 = via_ifr_bits[1];
       prev_slowio = slowio_hit_count;
+#ifdef DEBUG_MAC_IO
       printf("[IER] last=%02X reads=%u writes=%u T1en=%u T2en=%u\n",
              via_ier_last, via_ier_reads, via_ier_writes,
              via_ier_t1_enabled, via_ier_t2_enabled);
       printf("[VIA-T1] CL_w=%u CH_w=%u\n", via_t1cl_writes, via_t1ch_writes);
-      static unsigned int prev_pacedio = 0;
-      printf("[RD8] total=%u hi=%u via=%u iwm=%u scsiR=%u scsiW=%u pacedio=%u(+%u)\n",
-             rd8_total, rd8_hi, rd8_via, rd8_iwm, rd8_scsi, wr8_scsi,
-             pacedio_hit_count, pacedio_hit_count - prev_pacedio);
-      prev_pacedio = pacedio_hit_count;
+      {
+        static unsigned int prev_pacedio = 0;
+        printf("[RD8] total=%u hi=%u via=%u iwm=%u scsiR=%u scsiW=%u pacedio=%u(+%u)\n",
+               rd8_total, rd8_hi, rd8_via, rd8_iwm, rd8_scsi, wr8_scsi,
+               pacedio_hit_count, pacedio_hit_count - prev_pacedio);
+        prev_pacedio = pacedio_hit_count;
+      }
       printf("[IWM-MODE] data=%u status=%u hshk=%u write=%u Q6=%d Q7=%d\n",
              iwm_mode_rd[0], iwm_mode_rd[1], iwm_mode_rd[2], iwm_mode_rd[3],
              iwm_q6, iwm_q7);
-      printf("[IWM-HSHK] ready=%u notready=%u\n", iwm_hshk_ready, iwm_hshk_notready);
-      printf("[IWM-DATA] hi=%u lo=%u (zero=%u ff=%u other=%u)\n",
-             iwm_data_hi, iwm_data_lo, iwm_data_zero, iwm_data_ff, iwm_data_nonzero);
-      printf("[VIA-ACK] IRA(CA1)=%u ORB(CB)=%u T2CL=%u SR=%u\n",
-             via_ira_reads, via_orb_reads, via_t2cl_reads, via_sr_reads);
-      printf("[IFR-W] total=%u CA2clr=%u CA1clr=%u\n",
-             via_ifr_writes, via_ifr_w_ca2, via_ifr_w_ca1);
-      // Key system globals for VBL task processing
       {
-        uint32_t vbl_proc = m68k_read_memory_32(0x08EE); // VBL task processor fn ptr
-        uint32_t vbl_flag = m68k_read_memory_8(0x0160);   // VBL processing flag (bit 6)
-        uint16_t ier_hw = ps_read_8(0xEFFDFE);            // direct IER read from hardware
-        uint16_t ifr_hw = ps_read_8(0xEFFBFE);            // direct IFR read from hardware
-        uint32_t vbl_qhead = m68k_read_memory_32(0x0162);  // VBLQueue.qHead
-        uint32_t dtask_qhead = m68k_read_memory_32(0x0D92); // DeferredTaskQueue.qHead (DTaskQHdr+2)
-        uint16_t ioResult_val = m68k_read_memory_16(0x001FFC10); // actual ioResult word
-        printf("[SYS] VBLproc=$%08X VBLflag=$%02X IER_hw=$%02X IFR_hw=$%02X\n",
-               vbl_proc, vbl_flag, ier_hw, ifr_hw);
-        printf("[SYS] VBLqHead=$%08X DTqHead=$%08X ioResult=$%04X\n",
-               vbl_qhead, dtask_qhead, ioResult_val);
-        // Sony driver vectors and DCE state
-        uint32_t jfetch = m68k_read_memory_32(0x0226);    // JFetch - disk read
-        uint32_t jiodone = m68k_read_memory_32(0x022E);   // JIODone vector
-        uint32_t sony_exit = m68k_read_memory_32(0x08FC);  // Sony completion jump target
-        uint32_t dskerr = m68k_read_memory_16(0x0142);     // DskErr
-        uint32_t sonyvar_ptr = m68k_read_memory_32(0x0134); // SonyVars pointer
-        uint32_t sony_busy = (sonyvar_ptr && sonyvar_ptr < 0x400000) ?
-                     m68k_read_memory_8(sonyvar_ptr + 0x19) : 0xFF;
-        uint32_t dce_ptr = (sonyvar_ptr && sonyvar_ptr < 0x400000) ?
-                     m68k_read_memory_32(sonyvar_ptr) : 0;  // *(SonyVars) = DCE?
-        uint32_t dce_qhead = (dce_ptr && dce_ptr < 0x400000) ?
-                     m68k_read_memory_32(dce_ptr + 8) : 0;  // DCE+8 = qHead
-        uint32_t dce_qtail = (dce_ptr && dce_ptr < 0x400000) ?
-                     m68k_read_memory_32(dce_ptr + 12) : 0; // DCE+12 = qTail
-        uint32_t dce_flags = (dce_ptr && dce_ptr < 0x400000) ?
-                     m68k_read_memory_16(dce_ptr + 4) : 0;  // DCE+4 = dCtlFlags
-        printf("[SONY] JFetch=$%08X JIODone=$%08X exit=$%08X DskErr=$%04X busy=%u\n",
-               jfetch, jiodone, sony_exit, dskerr, sony_busy);
-        printf("[DCE] SonyVars=$%08X DCE=$%08X flags=$%04X qHead=$%08X qTail=$%08X\n",
-               sonyvar_ptr, dce_ptr, dce_flags, dce_qhead, dce_qtail);
-        // Dump first 32 bytes of ioParam block (if qHead is valid)
-        if (dce_qhead && dce_qhead < 0x400000) {
-          printf("[IOPB] ");
-          for (int i = 0; i < 32; i += 2) {
-            printf("%04X ", m68k_read_memory_16(dce_qhead + i));
-          }
-          printf("\n");
-        }
-        // Dump VBL task record if queue is non-empty
-        if (vbl_qhead != 0) {
-          uint32_t vbl_qlink = m68k_read_memory_32(vbl_qhead + 0);
-          uint16_t vbl_qtype = m68k_read_memory_16(vbl_qhead + 4);
-          uint32_t vbl_addr = m68k_read_memory_32(vbl_qhead + 6);
-          uint16_t vbl_count = m68k_read_memory_16(vbl_qhead + 10);
-          uint16_t vbl_phase = m68k_read_memory_16(vbl_qhead + 12);
-          printf("[VBL-TASK] @$%08X: qLink=$%08X qType=$%04X vblAddr=$%08X vblCount=%d vblPhase=%d\n",
-                 vbl_qhead, vbl_qlink, vbl_qtype, vbl_addr, (int16_t)vbl_count, (int16_t)vbl_phase);
-        }
+        uint32_t vbl_proc = m68k_read_memory_32(0x08EE);
+        uint16_t ier_hw = ps_read_8(0xEFFDFE);
+        uint16_t ifr_hw = ps_read_8(0xEFFBFE);
+        printf("[SYS] VBLproc=$%08X IER_hw=$%02X IFR_hw=$%02X\n", vbl_proc, ier_hw, ifr_hw);
       }
-      printf("[WATCH] ioResult_writes=%u\n", watch_jiodone);
-      // Dump Lvl1DT entries (VIA ISR dispatch table) from RAM
-      // Mac OS Lvl1DT at $0192, 4-byte entries (handler address only)
-      // Slot order: [0]=CA2, [1]=CA1/VBL, [2]=SR, [3]=CB2, [4]=CB1, [5]=T2, [6]=T1
-      {
-        static int lvl1dt_dumped = 0;
-        if (!lvl1dt_dumped && dbg_irq_ack_count > 10) {
-          lvl1dt_dumped = 1;
-          printf("[Lvl1DT] VIA interrupt dispatch table (base=$0192, 4-byte entries):\n");
-          for (int slot = 0; slot < 7; slot++) {
-            uint32_t entry_addr = 0x0192 + slot * 4;
-            uint32_t handler = m68k_read_memory_32(entry_addr);
-            const char *names[] = {"CA2","CA1/VBL","SR","CB2","CB1","T2","T1"};
-            printf("  [%d] %s ($%04X): handler=%08X\n", slot, names[slot], entry_addr, handler);
-          }
-          // Level 1 autovector at $64
-          uint32_t vec1 = m68k_read_memory_32(0x64);
-          printf("  Autovector 1 ($64): %08X\n", vec1);
-          // Also dump VIA PCR register value (at $EFFDFE-ish, RS=12 = $EFF9FE)
-          // PCR is at RS=12, base + 12*512 = $EFE1FE + $1800 = $EFF9FE
-          // Actually PCR is at RS=12 on 6522: base + RS*512
-          // VIA base = $EFE1FE, RS spacing = $200
-          // RS=12: $EFE1FE + 12*$200 = $EFE1FE + $1800 = $EFF9FE
-          unsigned int pcr = ps_read_8(0xEFF9FE);
-          printf("  VIA PCR: $%02X (CA1=%s-edge, CA2=%s)\n", pcr,
-                 (pcr & 0x01) ? "pos" : "neg",
-                 (pcr & 0x0E) == 0x00 ? "neg-edge-clr-on-read" :
-                 (pcr & 0x0E) == 0x02 ? "neg-edge-independent" :
-                 (pcr & 0x0E) == 0x04 ? "pos-edge-clr-on-read" :
-                 (pcr & 0x0E) == 0x06 ? "pos-edge-independent" :
-                 (pcr & 0x0E) == 0x08 ? "handshake-out" :
-                 (pcr & 0x0E) == 0x0A ? "pulse-out" :
-                 (pcr & 0x0E) == 0x0C ? "low-out" :
-                 "high-out");
-        }
-      }
+#endif
     }
   }
 
@@ -1330,6 +1292,9 @@ static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t 
         printf("[MAC] OVL off (read from ROM/SCSI range %08X).\n", addr);
         handle_ovl_mappings_mac68k(cfg);
       }
+      /* SCSI driver ROM: force through real hardware so BBU sees bus cycles */
+      if (addr >= scsi_rom_low && addr < scsi_rom_high)
+        return 0;
       break;
     default:
       break;
@@ -1659,56 +1624,17 @@ void m68k_write_memory_8(unsigned int address, unsigned int value) {
     scsi_log_buf[idx].is_write = 1;
     scsi_log_head++;
     scsi_log_total++;
-    // Dump registers on first ODR write during command phase (pc=$0041A924)
+#ifdef DEBUG_MAC_IO
+    // Dump registers on first ODR write during command phase
     {
       static int odr_cmd_dumped = 0;
       if (!odr_cmd_dumped && (address == 0x5FF001 || address == 0x5FF000) &&
           m68k_get_reg(NULL, M68K_REG_PC) == 0x0041A924) {
         odr_cmd_dumped = 1;
-        printf("[SCSI-CMD] ODR write val=%02X — register dump:\n", value & 0xFF);
-        printf("  D0=%08X D1=%08X D2=%08X D3=%08X\n",
-               m68k_get_reg(NULL, M68K_REG_D0), m68k_get_reg(NULL, M68K_REG_D1),
-               m68k_get_reg(NULL, M68K_REG_D2), m68k_get_reg(NULL, M68K_REG_D3));
-        printf("  D4=%08X D5=%08X D6=%08X D7=%08X\n",
-               m68k_get_reg(NULL, M68K_REG_D4), m68k_get_reg(NULL, M68K_REG_D5),
-               m68k_get_reg(NULL, M68K_REG_D6), m68k_get_reg(NULL, M68K_REG_D7));
-        printf("  A0=%08X A1=%08X A2=%08X A3=%08X\n",
-               m68k_get_reg(NULL, M68K_REG_A0), m68k_get_reg(NULL, M68K_REG_A1),
-               m68k_get_reg(NULL, M68K_REG_A2), m68k_get_reg(NULL, M68K_REG_A3));
-        printf("  A4=%08X A5=%08X A6=%08X SP=%08X\n",
-               m68k_get_reg(NULL, M68K_REG_A4), m68k_get_reg(NULL, M68K_REG_A5),
-               m68k_get_reg(NULL, M68K_REG_A6), m68k_get_reg(NULL, M68K_REG_A7));
-        // Dump memory around likely CDB source pointers
-        for (int r = 0; r < 8; r++) {
-          uint32_t aval = m68k_get_reg(NULL, M68K_REG_A0 + r);
-          if (aval > 0 && aval < 0x400000) {
-            printf("  [A%d -> %08X]: ", r, aval);
-            for (int b = 0; b < 16; b++)
-              printf("%02X ", m68k_read_memory_8(aval + b));
-            printf("\n");
-          }
-        }
-        // Dump 32 bytes BEFORE and AFTER A2 (likely CDB buffer pointer)
-        {
-          uint32_t a2 = m68k_get_reg(NULL, M68K_REG_A2);
-          if (a2 >= 32 && a2 < 0x400000) {
-            printf("  [A2-32 -> %08X]: ", a2 - 32);
-            for (int b = -32; b < 32; b++)
-              printf("%02X%s", m68k_read_memory_8(a2 + b), (b == -1) ? " | " : " ");
-            printf("\n");
-            // Compare fast-path vs GPIO for 16 bytes around A2
-            printf("  [A2 GPIO check]: ");
-            for (int b = -8; b < 8; b++) {
-              uint8_t fast = m68k_read_memory_8(a2 + b);
-              uint8_t gpio = ps_read_8(a2 + b);
-              printf("%02X/%02X%s", fast, gpio, (fast != gpio) ? "! " : " ");
-            }
-            printf("\n");
-          }
-        }
-        fflush(stdout);
+        printf("[SCSI-CMD] ODR write val=%02X\n", value & 0xFF);
       }
     }
+#endif
   }
 
   if (platform_write_check(OP_TYPE_BYTE, address, value))
@@ -1717,98 +1643,69 @@ void m68k_write_memory_8(unsigned int address, unsigned int value) {
   if (is_slowio(address))
     slowio_delay();
 
-  // Mac SE 5380 is on D8-D15 (upper byte lane). ROM writes to odd addresses,
-  // which puts data on D0-D7 only. The BBU should steer D0-D7→D8-D15 but
-  // doesn't with PiStorm timing. Fix: write to even address instead, which
-  // duplicates data to both byte lanes and asserts /UDS. Same A[23:1] = same register.
-  //
-  // EXCEPTION: ODR writes with value $EE are BBU pseudo-DMA triggers.
-  // The ROM writes a dummy $EE; the BBU intercepts the LDS bus cycle and
-  // substitutes the real data byte from its DMA buffer onto D8-D15.
-  // We must keep these as odd writes (LDS) so the BBU recognizes the pseudo-DMA.
-  if (address >= 0x580000 && address <= 0x5FFFFF && (address & 1) == 1) {
+  // SCSI byte lane: the NCR 5380 is on D8-D15 (upper byte lane). ROM writes
+  // to odd addresses, putting data on D0-D7. The BBU steers D0-D7→D8-D15
+  // when the CPLD generates properly timed bus cycles (write /DS at CLK rising
+  // edge = 68000 S4). No software byte lane fix needed — trust the BBU.
+  if (address >= 0x580000 && address <= 0x5FFFFF) {
     int paced = is_pacedio(address);
     if (paced) pacedio_hit_count++;
-    if ((address & 0x70) == 0 && (value & 0xFF) == 0xEE) {
-      // ODR pseudo-DMA: keep odd address so BBU handles it
-      if (paced)
-        ps_write_8_paced((uint32_t)address, value);
-      else
-        ps_write_8((uint32_t)address, value);
-    } else {
-      // Normal register write: use even address for direct D8-D15
-      if (paced)
-        ps_write_8_paced((uint32_t)(address & ~1), value);
-      else
-        ps_write_8((uint32_t)(address & ~1), value);
-    }
+    if (paced)
+      ps_write_8_paced((uint32_t)address, value);
+    else
+      ps_write_8((uint32_t)address, value);
     return;
   }
 
-  // Watch for byte writes to DskErr ($142-$143) — Sony driver stores error code
+#ifdef DEBUG_MAC_IO
   if (address >= 0x142 && address <= 0x143) {
     printf("[DSKERR] W8 addr=%03X val=%02X pc=%08X a1=%08X sp=%08X\n",
            address, value, m68k_get_reg(NULL, M68K_REG_PC),
            m68k_get_reg(NULL, M68K_REG_A1), m68k_get_reg(NULL, M68K_REG_A7));
-    fflush(stdout);
   }
-  // Watch for byte writes to DCE busy byte at $1DB9 (DCE $1DB4 + 5)
   if (address == 0x1DB9) {
     printf("[DCE-BUSY] W8 val=%02X pc=%08X a1=%08X\n",
            value, m68k_get_reg(NULL, M68K_REG_PC),
            m68k_get_reg(NULL, M68K_REG_A1));
-    fflush(stdout);
   }
-
-  // Watch for byte writes to JFetch ($226-$229) and JIODone ($22E-$231)
   if (address >= 0x226 && address <= 0x229) {
     printf("[JFETCH] W8 addr=%03X val=%02X pc=%08X\n",
            address, value, m68k_get_reg(NULL, M68K_REG_PC));
-    fflush(stdout);
   }
   if (address >= 0x22E && address <= 0x231) {
     printf("[JIODONE-VEC] W8 addr=%03X val=%02X pc=%08X\n",
            address, value, m68k_get_reg(NULL, M68K_REG_PC));
-    fflush(stdout);
   }
-
-  // Watch for byte writes to ioResult area ($001FFC10-$001FFC11)
   if (address >= 0x001FFC10 && address <= 0x001FFC11) {
     watch_jiodone++;
     printf("[IORESULT] W8 addr=%08X val=%02X pc=%08X count=%u\n",
            address, value, m68k_get_reg(NULL, M68K_REG_PC), watch_jiodone);
-    fflush(stdout);
   }
-
-  // Track VIA IFR writes ($EFFBFE, RS=13) — handlers clear IFR by writing 1s
+  if (address == 0xEFFDFE) {
+    printf("[VIA-IER] W %02X (set=%d) pc=%08X\n",
+           value, (value >> 7) & 1, m68k_get_reg(NULL, M68K_REG_PC));
+  }
+  if (address == 0xEFE9FE || address == 0xEFEBFE) {
+    printf("[VIA-T1] W %s=%02X pc=%08X\n",
+           address == 0xEFE9FE ? "T1CL" : "T1CH", value,
+           m68k_get_reg(NULL, M68K_REG_PC));
+  }
+#endif
+  // Track VIA stats silently (needed for heartbeat summary)
   if (address == 0xEFFBFE) {
     via_ifr_writes++;
     if (value & 0x01) via_ifr_w_ca2++;
     if (value & 0x02) via_ifr_w_ca1++;
   }
-
-  // Track VIA IER writes ($EFFDFE, RS=14) — bit 7 is set/clear control
   if (address == 0xEFFDFE) {
     via_ier_writes++;
     if (value & 0x80) {
-      // Setting bits: check T1 (bit 6) and T2 (bit 5)
       if (value & 0x40) via_ier_t1_enabled++;
       if (value & 0x20) via_ier_t2_enabled++;
     }
-    printf("[VIA-IER] W %02X (set=%d) pc=%08X [T1en=%u T2en=%u]\n",
-           value, (value >> 7) & 1, m68k_get_reg(NULL, M68K_REG_PC),
-           via_ier_t1_enabled, via_ier_t2_enabled);
   }
-  // Track VIA T1 counter/latch writes:
-  // T1C-L=RS4=$EFE9FE, T1C-H=RS5=$EFEBFE (writing T1C-H starts timer)
-  // T1L-L=RS6=$EFEDFE, T1L-H=RS7=$EFEFFE
-  if (address == 0xEFE9FE || address == 0xEFEBFE) {
-    if (address == 0xEFE9FE) via_t1cl_writes++;
-    if (address == 0xEFEBFE) via_t1ch_writes++;
-    printf("[VIA-T1] W %s=%02X pc=%08X\n",
-           address == 0xEFE9FE ? "T1CL" : "T1CH", value,
-           m68k_get_reg(NULL, M68K_REG_PC));
-  }
+  if (address == 0xEFE9FE) via_t1cl_writes++;
+  if (address == 0xEFEBFE) via_t1ch_writes++;
 
   if (is_pacedio(address)) {
     pacedio_hit_count++;
@@ -1826,64 +1723,27 @@ void m68k_write_memory_16(unsigned int address, unsigned int value) {
   if (platform_write_check(OP_TYPE_WORD, address, value))
     return;
 
-  // Watch for word writes to DskErr ($142) — trigger post-DskErr trace
+#ifdef DEBUG_MAC_IO
   if (address == 0x142) {
     printf("[DSKERR] W16 val=%04X pc=%08X d0=%08X a1=%08X sp=%08X\n",
            value, m68k_get_reg(NULL, M68K_REG_PC),
            m68k_get_reg(NULL, M68K_REG_D0),
            m68k_get_reg(NULL, M68K_REG_A1),
            m68k_get_reg(NULL, M68K_REG_A7));
-    // Dump top 8 words of stack to see return addresses
-    uint32_t sp = m68k_get_reg(NULL, M68K_REG_A7);
-    printf("[STACK] ");
-    for (int i = 0; i < 8; i++)
-      printf("%08X ", m68k_read_memory_32(sp + i*4));
-    printf("\n");
-    fflush(stdout);
-    // trace_writes_left = 50;  // disabled
   }
-
-  // Watch for writes to JFetch ($226) and JIODone ($22E)
   if (address >= 0x226 && address <= 0x228) {
     printf("[JFETCH] W16 addr=%03X val=%04X pc=%08X\n",
            address, value, m68k_get_reg(NULL, M68K_REG_PC));
-    fflush(stdout);
   }
   if (address >= 0x22E && address <= 0x230) {
     printf("[JIODONE-VEC] W16 addr=%03X val=%04X pc=%08X\n",
            address, value, m68k_get_reg(NULL, M68K_REG_PC));
-    fflush(stdout);
   }
-
-  // Watch for writes to ioResult at $001FFC10 (Sony driver I/O completion)
   if (address == 0x001FFC10) {
     watch_jiodone++;
     printf("[IORESULT] write val=%04X pc=%08X count=%u\n",
            value, m68k_get_reg(NULL, M68K_REG_PC), watch_jiodone);
-    // Dump SCSI ring buffer once — only if there was SCSI activity
-    {
-      static int scsi_dumped = 0;
-      if (!scsi_dumped && scsi_log_total > 0) {
-        scsi_dumped = 1;
-        unsigned int n = (scsi_log_head < SCSI_LOG_SIZE) ? scsi_log_head : SCSI_LOG_SIZE;
-        unsigned int start = (scsi_log_head < SCSI_LOG_SIZE) ? 0 : (scsi_log_head - SCSI_LOG_SIZE);
-        printf("[SCSI-LOG] total=%u showing last %u (csbs_repeats=%u)\n",
-               scsi_log_total, n, scsi_csbs_repeat);
-        for (unsigned int i = 0; i < n; i++) {
-          unsigned int si = (start + i) % SCSI_LOG_SIZE;
-          printf("[SCSI] %c8 addr=%08X val=%02X pc=%08X #%u\n",
-                 scsi_log_buf[si].is_write ? 'W' : 'R',
-                 scsi_log_buf[si].addr, scsi_log_buf[si].val,
-                 scsi_log_buf[si].pc, start + i);
-        }
-      }
-    }
-    fflush(stdout);
   }
-
-  if (is_slowio(address))
-    slowio_delay();
-
   {
     static int lo_w16 = 0;
     if (address < 0x80000 && lo_w16 < 40) {
@@ -1892,6 +1752,10 @@ void m68k_write_memory_16(unsigned int address, unsigned int value) {
       lo_w16++;
     }
   }
+#endif
+
+  if (is_slowio(address))
+    slowio_delay();
 
   if (address & 0x01) {
     ps_write_8((uint32_t)address, value & 0xFF);
@@ -1910,25 +1774,21 @@ void m68k_write_memory_32(unsigned int address, unsigned int value) {
   if (platform_write_check(OP_TYPE_LONGWORD, address, value))
     return;
 
-  // Watch for longword writes to JFetch ($226) and JIODone ($22E)
+#ifdef DEBUG_MAC_IO
   if (address >= 0x224 && address <= 0x226) {
     printf("[JFETCH] W32 addr=%03X val=%08X pc=%08X\n",
            address, value, m68k_get_reg(NULL, M68K_REG_PC));
-    fflush(stdout);
   }
   if (address >= 0x22C && address <= 0x22E) {
     printf("[JIODONE-VEC] W32 addr=%03X val=%08X pc=%08X\n",
            address, value, m68k_get_reg(NULL, M68K_REG_PC));
-    fflush(stdout);
   }
-
-  // Watch for longword writes covering ioResult ($001FFC10)
   if (address >= 0x001FFC0E && address <= 0x001FFC10) {
     watch_jiodone++;
     printf("[IORESULT] W32 addr=%08X val=%08X pc=%08X count=%u\n",
            address, value, m68k_get_reg(NULL, M68K_REG_PC), watch_jiodone);
-    fflush(stdout);
   }
+#endif
 
   if (is_slowio(address))
     slowio_delay();
