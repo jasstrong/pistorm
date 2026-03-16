@@ -7,7 +7,7 @@
 
 #include "rominfo.h"
 
-#define M68K_CPU_TYPES M68K_CPU_TYPE_SCC68070
+#define M68K_CPU_TYPES M68K_CPU_TYPE_68040_24
 
 const char *cpu_types[M68K_CPU_TYPES] = {
   "68000",
@@ -20,6 +20,8 @@ const char *cpu_types[M68K_CPU_TYPES] = {
   "68LC040",
   "68040",
   "SCC68070",
+  "68030_24",
+  "68040_24",
 };
 
 const char *map_type_names[MAPTYPE_NUM] = {

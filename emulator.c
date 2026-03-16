@@ -1133,7 +1133,7 @@ switch_config:
   m68k_init();
   printf("Setting CPU type to %d.\n", cpu_type);
 	m68k_set_cpu_type(&m68ki_cpu, cpu_type);
-  printf("[DEBUG] address_mask = %08X (expect 00FFFFFF for 68000)\n", m68ki_cpu.address_mask);
+  printf("[CPU] address_mask = %08X\n", m68ki_cpu.address_mask);
   cpu_pulse_reset();
 
   pthread_t ipl_tid = 0, cpu_tid, kbd_tid;
