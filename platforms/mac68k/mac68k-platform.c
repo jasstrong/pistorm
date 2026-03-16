@@ -21,6 +21,7 @@
 extern void stop_cpu_emulation(uint8_t disasm_cur);
 
 uint8_t iscsi_enabled;
+uint8_t noscsi_enabled;
 
 extern int kb_hook_enabled;
 extern int mouse_hook_enabled;
@@ -95,6 +96,11 @@ void setvar_mac68k(struct emulator_config *cfg, char *var, char *val) {
         //iscsi_init();
         //adjust_ranges_mac68k(cfg);
     }
+
+    if (CHKVAR("noscsi")) {
+        printf("[MAC68K] SCSI bypass enabled — 5380 accesses will be swallowed.\n");
+        noscsi_enabled = 1;
+    }
 }
 
 
@@ -123,21 +129,11 @@ void handle_ovl_mappings_mac68k(struct emulator_config *cfg) {
         /* Config offset tracks OVL for the slow-path mapped read handler */
         cfg->map_offset[rom_index] = (ovl) ? 0x0 : ovl_sysrom_pos;
         cfg->map_high[rom_index] = cfg->map_offset[rom_index] + cfg->map_size[rom_index];
-        /* Fast-path: ROM always at 0x400000, with exclusion zone for SCSI driver */
+        /* Fast-path: ROM always at 0x400000 */
         m68k_remove_range(cfg->map_data[rom_index]);
-        if (scsi_rom_low > ovl_sysrom_pos && scsi_rom_high < ovl_sysrom_pos + cfg->map_size[rom_index]) {
-            /* Split ROM into two fast-path ranges around the exclusion zone */
-            m68k_add_rom_range(ovl_sysrom_pos, scsi_rom_low, cfg->map_data[rom_index]);
-            m68k_add_rom_range(scsi_rom_high, ovl_sysrom_pos + cfg->map_size[rom_index],
-                               cfg->map_data[rom_index] + (scsi_rom_high - ovl_sysrom_pos));
-            printf("[MAC68K] ROM at %08X (fast-path split: %08X-%08X, %08X-%08X)\n",
-                   cfg->map_offset[rom_index], ovl_sysrom_pos, scsi_rom_low,
-                   scsi_rom_high, ovl_sysrom_pos + cfg->map_size[rom_index]);
-        } else {
-            m68k_add_rom_range(ovl_sysrom_pos, ovl_sysrom_pos + cfg->map_size[rom_index], cfg->map_data[rom_index]);
-            printf("[MAC68K] ROM at %08X (fast-path at %08X-%08X)\n",
-                   cfg->map_offset[rom_index], ovl_sysrom_pos, ovl_sysrom_pos + cfg->map_size[rom_index]);
-        }
+        m68k_add_rom_range(ovl_sysrom_pos, ovl_sysrom_pos + cfg->map_size[rom_index], cfg->map_data[rom_index]);
+        printf("[MAC68K] ROM at %08X (fast-path at %08X-%08X)\n",
+               cfg->map_offset[rom_index], ovl_sysrom_pos, ovl_sysrom_pos + cfg->map_size[rom_index]);
     }
 
     index = get_named_mapped_item(cfg, "sysram");

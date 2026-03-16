@@ -42,7 +42,7 @@
 
 #include "m68kops.h"
 
-// #define DEBUG_MAC_IO  /* Uncomment for per-access SCSI/VIA/IO debug spam */
+#define DEBUG_MAC_IO  /* Uncomment for per-access SCSI/VIA/IO debug spam */
 #define KEY_POLL_INTERVAL_MSEC 5000
 
 unsigned int ovl;
@@ -68,6 +68,7 @@ extern volatile uint16_t srdata;
 extern uint8_t realtime_graphics_debug, emulator_exiting;
 extern uint8_t rtg_on;
 extern uint32_t scsi_rom_low, scsi_rom_high;
+extern uint8_t noscsi_enabled;
 uint8_t realtime_disassembly, int2_enabled = 0;
 uint32_t do_disasm = 0, old_level;
 uint32_t last_irq = 0, last_last_irq = 0;
@@ -134,6 +135,19 @@ unsigned int scsi_log_total = 0;  // total SCSI accesses logged
 // Suppress repetitive CSBS polling — only log when value changes
 static uint8_t scsi_csbs_last = 0xFF;    // last CSCS value (init to impossible)
 unsigned int scsi_csbs_repeat = 0; // count of suppressed repeats
+
+// CSBS transition tracker — captures phase transitions after DMA setup
+#define CSBS_TRANS_MAX 64
+struct csbs_transition {
+  uint8_t csbs;       // new CSBS value
+  uint8_t bsr;        // BSR at transition time
+  uint8_t mr;         // MR at transition time
+  uint32_t poll_count; // polls since last transition
+};
+static struct csbs_transition csbs_trans[CSBS_TRANS_MAX];
+static unsigned int csbs_trans_count = 0;
+static unsigned int csbs_trans_polls = 0;  // polls since last transition
+static int csbs_tracking_active = 0;       // armed by DMA start write
 
 void dump_scsi_log(const char *label) {
   if (scsi_log_total == 0) return;
@@ -550,7 +564,18 @@ cpu_loop:
     static unsigned long hb_cnt = 0;
     if ((hb_cnt++ & 0xFFFFF) == 0) {
       uint32_t hb_pc = m68k_get_reg(NULL, M68K_REG_PC);
-      uint32_t ticks = m68k_read_memory_32(0x16A);
+      // Read Ticks from fast-path buffer (not GPIO slow path!)
+      uint32_t ticks = 0;
+      {
+        uint32_t ta = 0x16A;
+        for (int r = 0; r < m68ki_cpu.read_ranges; r++) {
+          if (ta >= m68ki_cpu.read_addr[r] && ta + 4 <= m68ki_cpu.read_upper[r]) {
+            unsigned char *p = m68ki_cpu.read_data[r] + (ta - m68ki_cpu.read_addr[r]);
+            ticks = (p[0]<<24)|(p[1]<<16)|(p[2]<<8)|p[3];
+            break;
+          }
+        }
+      }
       static uint32_t prev_ticks = 0;
       static struct timespec prev_ts = {0, 0};
       struct timespec now_ts;
@@ -591,8 +616,110 @@ cpu_loop:
         uint16_t ier_hw = ps_read_8(0xEFFDFE);
         uint16_t ifr_hw = ps_read_8(0xEFFBFE);
         printf("[SYS] VBLproc=$%08X IER_hw=$%02X IFR_hw=$%02X\n", vbl_proc, ier_hw, ifr_hw);
+        // Read SCSI 5380 registers directly to see bus state
+        uint8_t scsi_csbs = ps_read_8(0x5FF040);  // Current SCSI Bus Status
+        uint8_t scsi_bsr  = ps_read_8(0x5FF050);  // Bus and Status Register
+        uint8_t scsi_icr  = ps_read_8(0x5FF010);  // Initiator Command Register (reg 1)
+        uint8_t scsi_mr   = ps_read_8(0x5FF020);  // Mode Register (reg 2)
+        uint8_t scsi_tcr  = ps_read_8(0x5FF030);  // Target Command Register (reg 3)
+        uint8_t scsi_csd  = ps_read_8(0x5FF000);  // Current SCSI Data
+        printf("[SCSI-HW] CSBS=%02X BSR=%02X ICR=%02X MR=%02X TCR=%02X CSD=%02X last_csbs=%02X(x%u) trans=%u\n",
+               scsi_csbs, scsi_bsr, scsi_icr, scsi_mr, scsi_tcr, scsi_csd,
+               scsi_csbs_last, scsi_csbs_repeat, csbs_trans_count);
       }
 #endif
+      // Dump key low-memory globals after system has booted (wait for IRQ activity)
+      {
+        static int globals_dumped = 0;
+        if (!globals_dumped && dbg_irq_ack_count > 500) {
+          globals_dumped = 1;
+          // Read from fast-path buffer (what CPU sees) AND GPIO (what hardware has)
+          printf("[LOWMEM] Exception vectors — buffer vs GPIO:\n");
+          for (int i = 0; i < 16; i++) {
+            uint32_t buf_val = 0, gpio_val = 0;
+            uint32_t addr = i * 4;
+            // Buffer: scan read ranges for this address
+            for (int r = 0; r < m68ki_cpu.read_ranges; r++) {
+              if (addr >= m68ki_cpu.read_addr[r] && addr + 4 <= m68ki_cpu.read_upper[r]) {
+                unsigned char *p = m68ki_cpu.read_data[r] + (addr - m68ki_cpu.read_addr[r]);
+                buf_val = (p[0]<<24)|(p[1]<<16)|(p[2]<<8)|p[3];
+                break;
+              }
+            }
+            // GPIO
+            gpio_val = (ps_read_8(addr)<<24)|(ps_read_8(addr+1)<<16)|(ps_read_8(addr+2)<<8)|ps_read_8(addr+3);
+            printf("  $%02X: buf=%08X gpio=%08X%s\n", addr, buf_val, gpio_val,
+                   (buf_val != gpio_val) ? " MISMATCH" : "");
+          }
+          // Helper: read 32-bit big-endian from fast-path buffer
+          #define BUF_READ32(a) ({ \
+            uint32_t _v = 0; \
+            for (int _r = 0; _r < m68ki_cpu.read_ranges; _r++) { \
+              if ((a) >= m68ki_cpu.read_addr[_r] && (a) + 4 <= m68ki_cpu.read_upper[_r]) { \
+                unsigned char *_p = m68ki_cpu.read_data[_r] + ((a) - m68ki_cpu.read_addr[_r]); \
+                _v = (_p[0]<<24)|(_p[1]<<16)|(_p[2]<<8)|_p[3]; \
+                break; \
+              } \
+            } _v; })
+          #define BUF_READ16(a) ({ \
+            uint16_t _v = 0; \
+            for (int _r = 0; _r < m68ki_cpu.read_ranges; _r++) { \
+              if ((a) >= m68ki_cpu.read_addr[_r] && (a) + 2 <= m68ki_cpu.read_upper[_r]) { \
+                unsigned char *_p = m68ki_cpu.read_data[_r] + ((a) - m68ki_cpu.read_addr[_r]); \
+                _v = (_p[0]<<8)|_p[1]; \
+                break; \
+              } \
+            } _v; })
+
+          // Key system globals (buf only)
+          printf("[LOWMEM] Lvl1vec ($064): buf=%08X\n", BUF_READ32(0x64));
+          printf("[LOWMEM] Lvl2vec ($068): buf=%08X\n", BUF_READ32(0x68));
+          printf("[LOWMEM] Ticks   ($16A): buf=%08X\n", BUF_READ32(0x16A));
+          printf("[LOWMEM] VBLQueue($160): buf=%08X\n", BUF_READ32(0x160));
+
+          // Sony/IWM-related globals
+          printf("[LOWMEM] SonyVars ($134): buf=%08X\n", BUF_READ32(0x134));
+          printf("[LOWMEM] DskErr   ($142): buf=%04X\n", BUF_READ16(0x142));
+          printf("[LOWMEM] IWM      ($1E0): buf=%08X\n", BUF_READ32(0x1E0));
+          printf("[LOWMEM] JFetch   ($226): buf=%08X\n", BUF_READ32(0x226));
+          printf("[LOWMEM] JIODone  ($22E): buf=%08X\n", BUF_READ32(0x22E));
+          printf("[LOWMEM] DrvQHdr  ($308): buf=%04X %08X %08X\n",
+                 BUF_READ16(0x308), BUF_READ32(0x30A), BUF_READ32(0x30E));
+          printf("[LOWMEM] SdVolume ($260): buf=%02X\n", (uint8_t)(BUF_READ16(0x260) >> 8));
+          printf("[LOWMEM] MemTop   ($108): buf=%08X\n", BUF_READ32(0x108));
+          printf("[LOWMEM] BufPtr   ($10C): buf=%08X\n", BUF_READ32(0x10C));
+          printf("[LOWMEM] SysZone  ($2A6): buf=%08X\n", BUF_READ32(0x2A6));
+          printf("[LOWMEM] ApplZone ($2AA): buf=%08X\n", BUF_READ32(0x2AA));
+          printf("[LOWMEM] HeapEnd  ($114): buf=%08X\n", BUF_READ32(0x114));
+          printf("[LOWMEM] ScrnBase ($824): buf=%08X\n", BUF_READ32(0x824));
+          printf("[LOWMEM] SCSIBase ($0C00):buf=%08X\n", BUF_READ32(0xC00));
+
+          // Lvl1DT dispatch table
+          printf("[LOWMEM] Lvl1DT ($192): buf=");
+          for (int i = 0; i < 7; i++) {
+            printf(" %08X", BUF_READ32(0x192 + i*4));
+          }
+          printf("\n");
+
+          // Dump active fast-path ranges for sanity
+          printf("[RANGES] read=%d write=%d\n", m68ki_cpu.read_ranges, m68ki_cpu.write_ranges);
+          for (int i = 0; i < m68ki_cpu.read_ranges; i++) {
+            printf("[RANGE-R%d] %08X-%08X data=%p\n", i,
+                   m68ki_cpu.read_addr[i], m68ki_cpu.read_upper[i],
+                   (void*)m68ki_cpu.read_data[i]);
+          }
+          for (int i = 0; i < m68ki_cpu.write_ranges; i++) {
+            printf("[RANGE-W%d] %08X-%08X data=%p wtc=%d\n", i,
+                   m68ki_cpu.write_addr[i], m68ki_cpu.write_upper[i],
+                   (void*)m68ki_cpu.write_data[i],
+                   m68ki_cpu.write_through[i]);
+          }
+          fflush(stdout);
+
+          #undef BUF_READ32
+          #undef BUF_READ16
+        }
+      }
     }
   }
 
@@ -1006,6 +1133,7 @@ switch_config:
   m68k_init();
   printf("Setting CPU type to %d.\n", cpu_type);
 	m68k_set_cpu_type(&m68ki_cpu, cpu_type);
+  printf("[DEBUG] address_mask = %08X (expect 00FFFFFF for 68000)\n", m68ki_cpu.address_mask);
   cpu_pulse_reset();
 
   pthread_t ipl_tid = 0, cpu_tid, kbd_tid;
@@ -1292,9 +1420,6 @@ static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t 
         printf("[MAC] OVL off (read from ROM/SCSI range %08X).\n", addr);
         handle_ovl_mappings_mac68k(cfg);
       }
-      /* SCSI driver ROM: force through real hardware so BBU sees bus cycles */
-      if (addr >= scsi_rom_low && addr < scsi_rom_high)
-        return 0;
       break;
     default:
       break;
@@ -1326,6 +1451,11 @@ unsigned int m68k_read_memory_8(unsigned int address) {
   if (address >= 0x580000 && address <= 0x5FFFFF)
     rd8_scsi++;
 
+  // noscsi bypass: return 0 for all SCSI reads without hitting GPIO
+  if (noscsi_enabled && address >= 0x580000 && address <= 0x5FFFFF) {
+    return 0;
+  }
+
   if (is_slowio(address))
     slowio_delay();
 
@@ -1338,9 +1468,39 @@ unsigned int m68k_read_memory_8(unsigned int address) {
   }
 
   if (address >= 0x580000 && address <= 0x5FFFFF) {
+    // Print first 64 SCSI reads in detail
+    if (scsi_log_total < 64) {
+      printf("[SCSI-RD] #%u addr=%06X val=%02X pc=%08X\n",
+             scsi_log_total, address, val & 0xFF, m68k_get_reg(NULL, M68K_REG_PC));
+    }
     // Ring buffer: suppress repetitive CSBS polling (only log transitions)
     int do_log = 1;
     if (address == 0x5FF040) {
+      if (csbs_tracking_active) {
+        csbs_trans_polls++;
+        if ((val & 0xFF) != scsi_csbs_last && csbs_trans_count < CSBS_TRANS_MAX) {
+          // Read BSR and MR at transition time (single extra read each)
+          uint8_t bsr_snap = ps_read_8(0x5FF050);
+          uint8_t mr_snap = ps_read_8(0x5FF020);
+          csbs_trans[csbs_trans_count].csbs = val & 0xFF;
+          csbs_trans[csbs_trans_count].bsr = bsr_snap;
+          csbs_trans[csbs_trans_count].mr = mr_snap;
+          csbs_trans[csbs_trans_count].poll_count = csbs_trans_polls;
+          csbs_trans_count++;
+          csbs_trans_polls = 0;
+          printf("[CSBS-TRANS] #%u csbs=%02X bsr=%02X mr=%02X after %u polls\n",
+                 csbs_trans_count, val & 0xFF, bsr_snap, mr_snap,
+                 csbs_trans[csbs_trans_count-1].poll_count);
+          if ((val & 0xFF) == 0x00) {
+            printf("[CSBS-TRANS] BUS FREE detected! Dumping all %u transitions:\n", csbs_trans_count);
+            for (unsigned int t = 0; t < csbs_trans_count; t++) {
+              printf("  T%u: csbs=%02X bsr=%02X mr=%02X after %u polls\n",
+                     t, csbs_trans[t].csbs, csbs_trans[t].bsr, csbs_trans[t].mr, csbs_trans[t].poll_count);
+            }
+            csbs_tracking_active = 0;
+          }
+        }
+      }
       if ((val & 0xFF) == scsi_csbs_last) {
         scsi_csbs_repeat++;
         do_log = 0;
@@ -1362,10 +1522,23 @@ unsigned int m68k_read_memory_8(unsigned int address) {
 
   // IWM access capture: $DFE1FF-$DFFFFF (ring buffer + mode tracking)
   if (address >= 0xDFE1FF && address <= 0xDFFFFF) {
+    uint32_t iwm_pc = m68k_get_reg(NULL, M68K_REG_PC);
+    unsigned int iwm_reg = (address - 0xDFE1FF) >> 9;
+    static const char *iwm_reg_names[] = {
+      "ph0L","ph0H","ph1L","ph1H","ph2L","ph2H","ph3L","ph3H",
+      "mtrOff","mtrOn","intDrv","extDrv","Q6L","Q6H","Q7L","Q7H"
+    };
+    // Print first 64 IWM accesses in detail
+    if (iwm_log_total < 64) {
+      printf("[IWM-RD] #%u reg%u(%s) addr=%06X val=%02X pc=%08X Q6=%d Q7=%d\n",
+             iwm_log_total, iwm_reg,
+             iwm_reg < 16 ? iwm_reg_names[iwm_reg] : "?",
+             address, val & 0xFF, iwm_pc, iwm_q6, iwm_q7);
+    }
     unsigned int idx = iwm_log_head % IWM_LOG_SIZE;
     iwm_log_buf[idx].addr = address;
     iwm_log_buf[idx].val = val;
-    iwm_log_buf[idx].pc = m68k_get_reg(NULL, M68K_REG_PC);
+    iwm_log_buf[idx].pc = iwm_pc;
     iwm_log_head++;
     iwm_log_total++;
 
@@ -1617,6 +1790,11 @@ void m68k_write_memory_8(unsigned int address, unsigned int value) {
 
   if (address >= 0x580000 && address <= 0x5FFFFF) {
     wr8_scsi++;
+    // Print first 64 SCSI writes in detail
+    if (wr8_scsi <= 64) {
+      printf("[SCSI-WR] #%u addr=%06X val=%02X pc=%08X\n",
+             wr8_scsi, address, value & 0xFF, m68k_get_reg(NULL, M68K_REG_PC));
+    }
     unsigned int idx = scsi_log_head % SCSI_LOG_SIZE;
     scsi_log_buf[idx].addr = address;
     scsi_log_buf[idx].val = value & 0xFF;
@@ -1634,6 +1812,24 @@ void m68k_write_memory_8(unsigned int address, unsigned int value) {
         printf("[SCSI-CMD] ODR write val=%02X\n", value & 0xFF);
       }
     }
+    // Verify command bytes: when ICR=$11 (ACK+DATA asserted), read CSD to see
+    // what the 5380 is putting on the SCSI bus (= what the target latches)
+    {
+      static int csd_verify_count = 0;
+      if (csd_verify_count < 8 && (address & 0xFFFFF0) == 0x5FF010 && (value & 0xFF) == 0x11) {
+        uint8_t csd = ps_read_8(0x5FF000);
+        printf("[SCSI-CSD-VERIFY] #%d ACK+DATA asserted, CSD=%02X (bus data at target latch)\n",
+               csd_verify_count, csd);
+        csd_verify_count++;
+      }
+    }
+    // Arm CSBS transition tracker when Start DMA Init Recv is written (reg 7)
+    if ((address & 0xFFFFF0) == 0x5FF070 && !csbs_tracking_active) {
+      csbs_tracking_active = 1;
+      csbs_trans_count = 0;
+      csbs_trans_polls = 0;
+      printf("[SCSI-DMA-START] DMA armed, tracking CSBS transitions\n");
+    }
 #endif
   }
 
@@ -1643,10 +1839,15 @@ void m68k_write_memory_8(unsigned int address, unsigned int value) {
   if (is_slowio(address))
     slowio_delay();
 
+  // noscsi bypass: swallow all SCSI writes without hitting GPIO
+  if (noscsi_enabled && address >= 0x580000 && address <= 0x5FFFFF) {
+    return;
+  }
+
   // SCSI byte lane: the NCR 5380 is on D8-D15 (upper byte lane). ROM writes
   // to odd addresses, putting data on D0-D7. The BBU steers D0-D7→D8-D15
-  // when the CPLD generates properly timed bus cycles (write /DS at CLK rising
-  // edge = 68000 S4). No software byte lane fix needed — trust the BBU.
+  // when the CPLD generates properly timed bus cycles. Byte replication in
+  // ps_write_8 ensures D8-D15 also has the correct value.
   if (address >= 0x580000 && address <= 0x5FFFFF) {
     int paced = is_pacedio(address);
     if (paced) pacedio_hit_count++;
