@@ -6,6 +6,7 @@
 #include <ctype.h>
 #include "platforms/platforms.h"
 #include "platforms/shared/rtc.h"
+#include "vnc/vnc.h"
 
 //#define DEBUG_MAC_PLATFORM
 
@@ -22,6 +23,8 @@ extern void stop_cpu_emulation(uint8_t disasm_cur);
 
 uint8_t iscsi_enabled;
 uint8_t noscsi_enabled;
+
+struct vnc_config vnc_cfg;
 
 extern int kb_hook_enabled;
 extern int mouse_hook_enabled;
@@ -100,6 +103,12 @@ void setvar_mac68k(struct emulator_config *cfg, char *var, char *val) {
     if (CHKVAR("noscsi")) {
         printf("[MAC68K] SCSI bypass enabled — 5380 accesses will be swallowed.\n");
         noscsi_enabled = 1;
+    }
+
+    if (CHKVAR("vnc")) {
+        vnc_cfg.enabled = 1;
+        vnc_cfg.port = (val && strlen(val)) ? (int)get_int(val) : 5900;
+        printf("[MAC68K] VNC server enabled on port %d\n", vnc_cfg.port);
     }
 }
 

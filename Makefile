@@ -25,7 +25,8 @@ MAINFILES        = emulator.c \
 	platforms/amiga/pistorm-dev/pistorm-dev.c \
 	platforms/amiga/net/pi-net.c \
 	platforms/shared/rtc.c \
-	platforms/shared/common.c
+	platforms/shared/common.c \
+	vnc/vnc.c
 
 MUSASHIFILES     = m68kcpu.c m68kdasm.c softfloat/softfloat.c softfloat/softfloat_fpsp.c
 MUSASHIGENCFILES = m68kops.c
@@ -45,7 +46,7 @@ CXX       = g++
 WARNINGS  = -Wall -Wextra -pedantic
 
 ifeq ($(PLATFORM),PI3_BULLSEYE)
-	LFLAGS    = $(WARNINGS) -L/usr/local/lib -L/opt/vc/lib -L./raylib_drm -lraylib -lGLESv2 -lEGL -lgbm -ldrm -ldl -lstdc++ -lvcos -lvchiq_arm -lvchostif -lasound
+	LFLAGS    = $(WARNINGS) -L/usr/local/lib -L/opt/vc/lib -L./raylib_drm -lraylib -lGLESv2 -lEGL -lgbm -ldrm -ldl -lstdc++ -lvcos -lvchiq_arm -lvchostif -lasound -lvncserver
 	CFLAGS    = $(WARNINGS) -I. -I./raylib -I/opt/vc/include/ -march=armv8-a -mfloat-abi=hard -mfpu=neon-fp-armv8 -O3 -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE -D_LARGEFILE64_SOURCE -lstdc++ $(ACFLAGS)
 else ifeq ($(PLATFORM),PI4)
 	LFLAGS    = $(WARNINGS) -L/usr/local/lib -L/opt/vc/lib -L./raylib_pi4_test -lraylib -lGLESv2 -lEGL -lgbm -ldrm -ldl -lstdc++ -lvcos -lvchiq_arm -lvchostif -lasound

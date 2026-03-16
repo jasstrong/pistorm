@@ -20,6 +20,7 @@
 #include "platforms/amiga/pistorm-dev/pistorm-dev.h"
 #include "platforms/amiga/pistorm-dev/pistorm-dev-enums.h"
 #include "gpio/ps_protocol.h"
+#include "vnc/vnc.h"
 
 #include <assert.h>
 #include <dirent.h>
@@ -69,6 +70,7 @@ extern uint8_t realtime_graphics_debug, emulator_exiting;
 extern uint8_t rtg_on;
 extern uint32_t scsi_rom_low, scsi_rom_high;
 extern uint8_t noscsi_enabled;
+extern struct vnc_config vnc_cfg;
 uint8_t realtime_disassembly, int2_enabled = 0;
 uint32_t do_disasm = 0, old_level;
 uint32_t last_irq = 0, last_last_irq = 0;
@@ -113,7 +115,7 @@ static unsigned int via_t1ch_writes = 0;
 static unsigned int via_t2cl_reads = 0;   // T2C-L read at $EFF1FE (clears T2 IFR)
 static unsigned int via_ira_reads = 0;    // IRA read at $EFE3FE (clears CA1 IFR)
 static unsigned int via_orb_reads = 0;    // ORB read at $EFE1FE (clears CB1/CB2 IFR)
-static unsigned int via_sr_reads = 0;     // SR read at $EFEBFE (clears SR IFR)
+static unsigned int via_sr_reads = 0;     // SR read at $EFF5FE (clears SR IFR)
 // VIA IFR write tracking — handlers clear IFR by writing (not reading IRA)
 static unsigned int via_ifr_writes = 0;   // total writes to IFR ($EFFBFE)
 static unsigned int via_ifr_w_ca2 = 0;    // writes with bit 0 set (clear CA2)
@@ -324,6 +326,111 @@ noppers:
   return args;
 }
 
+/*
+ * Inject a mouse event into the Mac OS event queue (EvQHdr at $014A).
+ *
+ * MUST be called from the CPU thread only — between emulated instructions
+ * so the queue is in a consistent state.
+ *
+ * The SE ROM's PostEvent uses SysEvtBuf ($0146) as a CONSTANT pointer to
+ * a circular buffer of 22-byte EvQEl entries.  Free slots have evtQWhat
+ * ($FFFF) at offset 6.  We scan for a free slot, fill it in, and link it
+ * into EventQueue ($014A) — exactly what the ROM's PostEvent does.
+ *
+ * EvQEl layout (standard, confirmed from ROM):
+ *   +0  qLink        long   — queue linkage
+ *   +4  qType        word   — 4 = evType
+ *   +6  evtQWhat     word   — event code ($FFFF = free)
+ *   +8  evtQMessage  long
+ *  +12  evtQWhen     long   — Ticks
+ *  +16  evtQWhere    Point  — {v, h}
+ *  +20  evtQModifiers word  — hi: modifier keys, lo: MBState
+ */
+#define EVQHDR_HEAD    0x014C
+#define EVQHDR_TAIL    0x0150
+#define TICKS_ADDR     0x016A
+#define EVQEL_SIZE     22       /* sizeof(EvQEl) */
+#define SYSEVTBUF      0x0146   /* long: base of event buffer (CONSTANT) */
+#define EVTBUFCNT      0x0154   /* word: number of buffer entries */
+
+
+static inline uint32_t ram_read32(const uint8_t *ram, uint32_t addr) {
+    return ((uint32_t)ram[addr] << 24) | ((uint32_t)ram[addr+1] << 16) |
+           ((uint32_t)ram[addr+2] << 8) |  (uint32_t)ram[addr+3];
+}
+
+static inline void ram_write32(uint8_t *ram, uint32_t addr, uint32_t val) {
+    ram[addr]   = (uint8_t)(val >> 24);
+    ram[addr+1] = (uint8_t)(val >> 16);
+    ram[addr+2] = (uint8_t)(val >> 8);
+    ram[addr+3] = (uint8_t)val;
+}
+
+static inline void ram_write16(uint8_t *ram, uint32_t addr, uint16_t val) {
+    ram[addr]   = (uint8_t)(val >> 8);
+    ram[addr+1] = (uint8_t)val;
+}
+
+static inline uint16_t ram_read16(const uint8_t *ram, uint32_t addr) {
+    return ((uint16_t)ram[addr] << 8) | ram[addr+1];
+}
+
+static int vnc_inject_mouse_event(uint8_t what) {
+    uint8_t *ram = vnc_cfg.ram_base;
+    if (!ram)
+        return 0;
+
+    /* EvQHdr.qFlags ($014A): if non-zero, queue is locked — retry later */
+    if (ram[0x014A] || ram[0x014B])
+        return 0;
+
+    /* Find a free slot: scan event buffer for evtQWhat == $FFFF */
+    uint32_t buf_base = ram_read32(ram, SYSEVTBUF);
+    uint16_t buf_cnt  = ram_read16(ram, EVTBUFCNT);
+    if (buf_base == 0 || buf_base >= vnc_cfg.ram_size)
+        return 0;
+    if (buf_cnt == 0 || buf_cnt > 100)
+        buf_cnt = 5;  /* safety fallback */
+
+    uint32_t slot = 0;
+    for (uint16_t i = 0; i < buf_cnt; i++) {
+        uint32_t entry = buf_base + (uint32_t)i * EVQEL_SIZE;
+        if (entry + EVQEL_SIZE > vnc_cfg.ram_size)
+            break;
+        if (ram_read16(ram, entry + 6) == 0xFFFF) {
+            slot = entry;
+            break;
+        }
+    }
+    if (!slot)
+        return 0;  /* will retry */
+
+    uint16_t ex = vnc_cfg.mouse_event_x;
+    uint16_t ey = vnc_cfg.mouse_event_y;
+
+    /* Fill in EvQEl — claiming the slot (evtQWhat != $FFFF) */
+    ram_write32(ram, slot,      0);              /* qLink = NULL (will be queue tail) */
+    ram_write16(ram, slot + 4,  4);              /* qType = evType */
+    ram_write16(ram, slot + 6,  what);           /* evtQWhat: 1=mouseDown, 2=mouseUp */
+    ram_write32(ram, slot + 8,  0);              /* evtQMessage */
+    ram_write32(ram, slot + 12, ram_read32(ram, TICKS_ADDR)); /* evtQWhen */
+    ram_write16(ram, slot + 16, ey);             /* evtQWhere.v */
+    ram_write16(ram, slot + 18, ex);             /* evtQWhere.h */
+    /* evtQModifiers: low byte = MBState ($0172), high byte = modifier keys */
+    ram_write16(ram, slot + 20, (uint16_t)ram[0x0172]);
+
+    /* Append to EventQueue */
+    uint32_t tail = ram_read32(ram, EVQHDR_TAIL);
+    if (tail == 0) {
+        ram_write32(ram, EVQHDR_HEAD, slot);
+    } else {
+        ram_write32(ram, tail, slot);  /* old_tail->qLink = slot */
+    }
+    ram_write32(ram, EVQHDR_TAIL, slot);
+
+    return 1;
+}
+
 static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 {
 	/* eat up any reset cycles */
@@ -448,6 +555,18 @@ void *cpu_task() {
 cpu_loop:
   if (mouse_hook_enabled) {
     get_mouse_status(&mouse_dx, &mouse_dy, &mouse_buttons, &mouse_extra);
+  }
+
+  /* VNC mouse button: inject events into Mac OS event queue (CPU thread) */
+  if (vnc_cfg.mouse_pending) {
+    uint8_t pend = vnc_cfg.mouse_pending;
+    if (pend & 1) {  /* mouseDown first */
+      if (vnc_inject_mouse_event(1))
+        vnc_cfg.mouse_pending &= ~1;
+    } else if (pend & 2) {  /* mouseUp only after mouseDown is done */
+      if (vnc_inject_mouse_event(2))
+        vnc_cfg.mouse_pending &= ~2;
+    }
   }
 
   if (realtime_disassembly && (do_disasm || cpu_emulation_running)) {
@@ -936,6 +1055,8 @@ void sigint_handler(int sig_num) {
 
   //return;
   printf("Received sigint %d, exiting.\n", sig_num);
+  vnc_stop();
+
   if (mouse_fd != -1)
     close(mouse_fd);
   if (mem_fd)
@@ -1166,6 +1287,17 @@ switch_config:
     printf("[MAIN] CPU thread created successfully\n");
   }
 
+  if (vnc_cfg.enabled) {
+    int ram_idx = get_named_mapped_item(cfg, "sysram");
+    if (ram_idx != -1) {
+      vnc_cfg.ram_base = cfg->map_data[ram_idx];
+      vnc_cfg.ram_size = cfg->map_size[ram_idx];
+      vnc_start(&vnc_cfg);
+    } else {
+      printf("[VNC] No sysram mapped — VNC disabled\n");
+    }
+  }
+
   // wait for cpu task to end before closing up and finishing
   pthread_join(cpu_tid, NULL);
 
@@ -1184,6 +1316,8 @@ switch_config:
 
   if (load_new_config != 0)
     goto switch_config;
+
+  vnc_stop();
 
   if (cfg->platform->shutdown) {
     cfg->platform->shutdown(cfg);
@@ -1583,11 +1717,11 @@ unsigned int m68k_read_memory_8(unsigned int address) {
   // Reading IRA ($EFE3FE, RS=1) clears CA1 in IFR
   // Reading ORB ($EFE1FE, RS=0) clears CB1/CB2 in IFR
   // Reading T2C-L ($EFF1FE, RS=8) clears T2 in IFR
-  // Reading SR ($EFEBFE, RS=10) clears SR in IFR
+  // Reading SR ($EFF5FE, RS=10) clears SR in IFR
   if (address == 0xEFE3FE) via_ira_reads++;   // CA1 ACK
   if (address == 0xEFE1FE) via_orb_reads++;   // CB1/CB2 ACK
   if (address == 0xEFF1FE) via_t2cl_reads++;  // T2 ACK
-  if (address == 0xEFEBFE) via_sr_reads++;    // SR ACK
+  if (address == 0xEFF5FE) via_sr_reads++;    // SR ACK
 
   return val;
 }
