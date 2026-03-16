@@ -58,6 +58,7 @@ const char *mapcmd_names[MAPCMD_NUM] = {
   "id",
   "autodump_file",
   "autodump_mem",
+  "delay",
 };
 
 int get_config_item_type(char *cmd) {
@@ -401,6 +402,7 @@ struct emulator_config *load_config_file(char *filename) {
       case CONFITEM_MAP: {
         unsigned int maptype = 0, mapsize = 0, mapaddr = 0, autodump = 0;
         unsigned int mirraddr = ((unsigned int)-1);
+        unsigned int mapdelay = 0;
         char mapfile[128], mapid[128];
         memset(mapfile, 0x00, 128);
         memset(mapid, 0x00, 128);
@@ -448,12 +450,25 @@ struct emulator_config *load_config_file(char *filename) {
             case MAPCMD_AUTODUMP_MEM:
               autodump = get_map_cmd(cur_cmd);
               break;
+            case MAPCMD_DELAY:
+              get_next_string(parse_line, cur_cmd, &str_pos, ' ');
+              mapdelay = get_int(cur_cmd);
+              break;
             default:
               printf("[CFG] Unknown/unhandled map argument %s on line %d.\n", cur_cmd, cur_line);
               break;
           }
         }
         add_mapping(cfg, maptype, mapaddr, mapsize, mirraddr, mapfile, mapid, autodump);
+        if (mapdelay) {
+          /* Store delay on the mapping we just added */
+          for (int i = MAX_NUM_MAPPED_ITEMS - 1; i >= 0; i--) {
+            if (cfg->map_type[i] != MAPTYPE_NONE && cfg->map_offset[i] == mapaddr) {
+              cfg->map_delay[i] = mapdelay;
+              break;
+            }
+          }
+        }
 
         break;
       }

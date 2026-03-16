@@ -273,7 +273,34 @@ void paced_dummy_cycles(void) {
   *(gpio + 2) = GPFSEL2_INPUT;
 }
 
-#define PACED_DUMMY_CYCLES() paced_dummy_cycles()
+// Single dummy read cycle — minimum bus activity to let the BBU advance.
+void paced_dummy_cycle_1(void) {
+  *(gpio + 0) = GPFSEL0_OUTPUT;
+  *(gpio + 1) = GPFSEL1_OUTPUT;
+  *(gpio + 2) = GPFSEL2_OUTPUT;
+
+  *(gpio + 7) = ((0x400000 & 0xffff) << 8) | (REG_ADDR_LO << PIN_A0);
+  *(gpio + 7) = 1 << PIN_WR;
+  *(gpio + 10) = 1 << PIN_WR;
+  *(gpio + 10) = 0xffffec;
+
+  *(gpio + 7) = ((0x0200 | (0x400000 >> 16)) << 8) | (REG_ADDR_HI << PIN_A0);
+  *(gpio + 7) = 1 << PIN_WR;
+  *(gpio + 10) = 1 << PIN_WR;
+  *(gpio + 10) = 0xffffec;
+
+  *(gpio + 0) = GPFSEL0_INPUT;
+  *(gpio + 1) = GPFSEL1_INPUT;
+  *(gpio + 2) = GPFSEL2_INPUT;
+
+  *(gpio + 7) = (REG_DATA << PIN_A0);
+  *(gpio + 7) = 1 << PIN_RD;
+
+  while (*(gpio + 13) & (1 << PIN_TXN_IN_PROGRESS)) {}
+  *(gpio + 10) = 0xffffec;
+}
+
+#define PACED_DUMMY_CYCLES() paced_dummy_cycle_1()
 
 unsigned int ps_read_8_paced(unsigned int address) {
   *(gpio + 0) = GPFSEL0_OUTPUT;
@@ -301,6 +328,8 @@ unsigned int ps_read_8_paced(unsigned int address) {
   unsigned int value = *(gpio + 13);
 
   *(gpio + 10) = 0xffffec;
+
+  PACED_DUMMY_CYCLES();
 
   value = (value >> 8) & 0xffff;
 
@@ -338,6 +367,8 @@ void ps_write_8_paced(unsigned int address, unsigned int data) {
   *(gpio + 2) = GPFSEL2_INPUT;
 
   while (*(gpio + 13) & (1 << PIN_TXN_IN_PROGRESS)) {}
+
+  PACED_DUMMY_CYCLES();
 }
 
 void ps_write_status_reg(unsigned int value) {

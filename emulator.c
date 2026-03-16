@@ -206,13 +206,14 @@ static unsigned int iwm_data_lo = 0;       // data reg reads with bit7=0 (no val
 // Slow IO regions — addresses that need bus cycle delays to match real 68000 timing.
 // Populated from MAPTYPE_SLOWIO entries in the config file.
 #define MAX_SLOWIO_REGIONS 8
-static struct { uint32_t lo; uint32_t hi; } slowio[MAX_SLOWIO_REGIONS];
+#define SLOWIO_DEFAULT_DELAY 150
+static struct { uint32_t lo; uint32_t hi; int delay; } slowio[MAX_SLOWIO_REGIONS];
 static int slowio_count = 0;
 
-static inline int is_slowio(uint32_t addr) {
+static inline int slowio_get_delay(uint32_t addr) {
   for (int i = 0; i < slowio_count; i++) {
     if (addr >= slowio[i].lo && addr < slowio[i].hi)
-      return 1;
+      return slowio[i].delay;
   }
   return 0;
 }
@@ -242,9 +243,9 @@ static unsigned int pacedio_hit_count = 0;
 // the IWM has fully settled before each bus access.
 // PiStorm GPIO cycles are ~200ns — 5-20x too fast for slow peripherals.
 static unsigned int slowio_hit_count = 0;
-static inline void slowio_delay(void) {
+static inline void slowio_delay(int iterations) {
   slowio_hit_count++;
-  for (volatile int dly = 0; dly < 150; dly++) ;
+  for (volatile int dly = 0; dly < iterations; dly++) ;
 }
 
 #define MUSASHI_HAX
@@ -543,27 +544,6 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 
 			/* Call external hook to peek at CPU */
 			m68ki_instr_hook(REG_PC); /* auto-disable (see m68kcpu.h) */
-
-			/* Mac SE ROM SCSI delay loop at $41A816: moveq #$30,d0; dbra d0,*
-			 * On real 68000 @ 8MHz this burns ~60us. On PiStorm it's instant.
-			 * Without this delay, SCSI phase match checks run before the
-			 * target has time to transition phases. */
-			if (REG_PC == 0x0041A816 || REG_PC == 0x0041A8BC) {
-				usleep(60);
-			}
-
-			/* Mac SE ROM SCSI byte-by-byte pseudo-DMA loops.
-			 * These use move.b from $5FF260 (pseudo-DMA address) with btst/dbra.
-			 * On a real 68000, each iteration takes ~5us. On PiStorm the loop
-			 * runs so fast that the BBU can't complete its /DTACK+/DACK
-			 * handshake for the pseudo-DMA read/write between iterations.
-			 *   $41A5A6: byte-by-byte READ  (btst d3,$0050(a3))
-			 *   $41A582: byte-by-byte VERIFY (btst d3,$0050(a3))
-			 *   $41A5C4: byte-by-byte WRITE  (btst d3,$0050(a3))
-			 */
-			if (REG_PC == 0x0041A5A6 || REG_PC == 0x0041A582 || REG_PC == 0x0041A5C4) {
-				usleep(5);
-			}
 
 			/* Record previous program counter */
 			REG_PPC = REG_PC;
@@ -1117,11 +1097,34 @@ void stop_cpu_emulation(uint8_t disasm_cur) {
 }
 
 void sigint_handler(int sig_num) {
-  //if (sig_num) { }
-  //cpu_emulation_running = 0;
-
-  //return;
   printf("Received sigint %d, exiting.\n", sig_num);
+
+  /* Dump PC trace ring buffer — shows where CPU was when we hit Ctrl-C */
+  {
+    m68ki_cpu_core *state = &m68ki_cpu;
+    printf("PC trace (oldest → newest):\n ");
+    for (int i = 0; i < 32; i++) {
+      int idx = (state->pc_trace_idx + i) & 31;
+      printf(" %06X", state->pc_trace[idx] & 0xFFFFFF);
+      if ((i & 7) == 7 && i < 31) printf("\n ");
+    }
+    printf("\n");
+    printf("Current PC: %06X  SR: %04X\n",
+           m68k_get_reg(NULL, M68K_REG_PC) & 0xFFFFFF,
+           m68k_get_reg(NULL, M68K_REG_SR));
+    printf("D0=%08X D1=%08X D2=%08X D3=%08X\n",
+           m68k_get_reg(NULL, M68K_REG_D0), m68k_get_reg(NULL, M68K_REG_D1),
+           m68k_get_reg(NULL, M68K_REG_D2), m68k_get_reg(NULL, M68K_REG_D3));
+    printf("D4=%08X D5=%08X D6=%08X D7=%08X\n",
+           m68k_get_reg(NULL, M68K_REG_D4), m68k_get_reg(NULL, M68K_REG_D5),
+           m68k_get_reg(NULL, M68K_REG_D6), m68k_get_reg(NULL, M68K_REG_D7));
+    printf("A0=%08X A1=%08X A2=%08X A3=%08X\n",
+           m68k_get_reg(NULL, M68K_REG_A0), m68k_get_reg(NULL, M68K_REG_A1),
+           m68k_get_reg(NULL, M68K_REG_A2), m68k_get_reg(NULL, M68K_REG_A3));
+    printf("A4=%08X A5=%08X A6=%08X A7=%08X\n",
+           m68k_get_reg(NULL, M68K_REG_A4), m68k_get_reg(NULL, M68K_REG_A5),
+           m68k_get_reg(NULL, M68K_REG_A6), m68k_get_reg(NULL, M68K_REG_A7));
+  }
   vnc_stop();
 
   if (mouse_fd != -1)
@@ -1250,8 +1253,10 @@ switch_config:
       if (cfg->map_type[i] == MAPTYPE_SLOWIO) {
         slowio[slowio_count].lo = cfg->map_offset[i];
         slowio[slowio_count].hi = cfg->map_high[i];
-        printf("[SLOWIO] Region %d: %08X-%08X\n", slowio_count,
-               slowio[slowio_count].lo, slowio[slowio_count].hi);
+        slowio[slowio_count].delay = cfg->map_delay[i] ? (int)cfg->map_delay[i] : SLOWIO_DEFAULT_DELAY;
+        printf("[SLOWIO] Region %d: %08X-%08X delay=%d\n", slowio_count,
+               slowio[slowio_count].lo, slowio[slowio_count].hi,
+               slowio[slowio_count].delay);
         slowio_count++;
       }
     }
@@ -1665,8 +1670,7 @@ unsigned int m68k_read_memory_8(unsigned int address) {
     return 0;
   }
 
-  if (is_slowio(address))
-    slowio_delay();
+  { int _sd = slowio_get_delay(address); if (_sd) slowio_delay(_sd); }
 
   unsigned int val;
   if (is_pacedio(address)) {
@@ -1817,8 +1821,7 @@ unsigned int m68k_read_memory_16(unsigned int address) {
     return platform_res;
   }
 
-  if (is_slowio(address))
-    slowio_delay();
+  { int _sd = slowio_get_delay(address); if (_sd) slowio_delay(_sd); }
 
   uint32_t result16;
   if (address & 0x01) {
@@ -1838,8 +1841,7 @@ unsigned int m68k_read_memory_32(unsigned int address) {
     return platform_res;
   }
 
-  if (is_slowio(address))
-    slowio_delay();
+  { int _sd = slowio_get_delay(address); if (_sd) slowio_delay(_sd); }
 
   uint32_t result32;
   if (address & 0x01) {
@@ -2057,8 +2059,7 @@ void m68k_write_memory_8(unsigned int address, unsigned int value) {
   if (platform_write_check(OP_TYPE_BYTE, address, value))
     return;
 
-  if (is_slowio(address))
-    slowio_delay();
+  { int _sd = slowio_get_delay(address); if (_sd) slowio_delay(_sd); }
 
   // noscsi bypass: swallow all SCSI writes without hitting GPIO
   if (noscsi_enabled && address >= 0x580000 && address <= 0x5FFFFF) {
@@ -2182,8 +2183,7 @@ void m68k_write_memory_16(unsigned int address, unsigned int value) {
   }
 #endif
 
-  if (is_slowio(address))
-    slowio_delay();
+  { int _sd = slowio_get_delay(address); if (_sd) slowio_delay(_sd); }
 
   if (address & 0x01) {
     ps_write_8((uint32_t)address, value & 0xFF);
@@ -2218,8 +2218,7 @@ void m68k_write_memory_32(unsigned int address, unsigned int value) {
   }
 #endif
 
-  if (is_slowio(address))
-    slowio_delay();
+  { int _sd = slowio_get_delay(address); if (_sd) slowio_delay(_sd); }
 
   if (address & 0x01) {
     ps_write_8((uint32_t)address, value & 0xFF);

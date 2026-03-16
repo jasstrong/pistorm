@@ -35,6 +35,7 @@ typedef enum {
   MAPCMD_MAP_ID,
   MAPCMD_AUTODUMP_FILE,
   MAPCMD_AUTODUMP_MEM,
+  MAPCMD_DELAY,
   MAPCMD_NUM,
 } map_cmds;
 
@@ -69,6 +70,7 @@ struct emulator_config {
   unsigned int rom_size[MAX_NUM_MAPPED_ITEMS];
   unsigned char *map_data[MAX_NUM_MAPPED_ITEMS];
   unsigned int map_mirror[MAX_NUM_MAPPED_ITEMS];
+  unsigned int map_delay[MAX_NUM_MAPPED_ITEMS];
   char *map_id[MAX_NUM_MAPPED_ITEMS];
 
   struct platform_config *platform;
