@@ -43,7 +43,8 @@
 
 #include "m68kops.h"
 
-#define DEBUG_MAC_IO  /* Uncomment for per-access SCSI/VIA/IO debug spam */
+/* #define DEBUG_MAC_IO */  /* Uncomment for per-access SCSI/VIA/IO debug spam */
+/* #define DEBUG_DIAG */  /* Uncomment (or -DDEBUG_DIAG) for diagnostic counters & ring buffers */
 #define KEY_POLL_INTERVAL_MSEC 5000
 
 unsigned int ovl;
@@ -89,16 +90,21 @@ int mem_fd_gpclk;
 atomic_int irq = 0;
 int gayleirq;
 
+#ifdef DEBUG_DIAG
 // Diagnostic counters for interrupt debugging
 static atomic_uint dbg_ipl_assert = 0;
 static unsigned int dbg_cpu_irq = 0;
 static unsigned int dbg_cpu_deassert = 0;
 static unsigned int dbg_irq_ack_count = 0;
+#endif
 
 // PC/address watchpoints
+#ifdef DEBUG_MAC_IO
 static unsigned int watch_jiodone = 0;  // writes to ioResult ($1FFC10)
+#endif
 // static int trace_writes_left = 0;  // post-DskErr write trace counter (disabled)
 
+#ifdef DEBUG_DIAG
 // VIA IFR bit counters — tracks which interrupt sources the ISR sees
 static unsigned int via_ifr_bits[8] = {0};  // count per bit
 static unsigned int via_ifr_reads = 0;
@@ -127,7 +133,9 @@ static unsigned int rd8_scsi = 0;
 static unsigned int wr8_scsi = 0;
 static unsigned int rd8_iwm = 0;
 static unsigned int rd8_hi = 0;
+#endif
 
+#ifdef DEBUG_DIAG
 // SCSI read/write log — ring buffer captures most recent N accesses
 #define SCSI_LOG_SIZE 65536
 struct scsi_log_entry { uint32_t addr; uint8_t val; uint32_t pc; uint8_t is_write; };
@@ -170,7 +178,11 @@ void dump_scsi_log(const char *label) {
            label, scsi_log_total, n);
   }
 }
+#else
+void dump_scsi_log(const char *label) { (void)label; }
+#endif
 
+#ifdef DEBUG_DIAG
 // IWM read log — ring buffer captures most recent N reads
 #define IWM_LOG_SIZE 128
 static struct { uint32_t addr; uint8_t val; uint32_t pc; } iwm_log_buf[IWM_LOG_SIZE];
@@ -189,6 +201,7 @@ static unsigned int iwm_data_nonzero = 0;  // data reg reads returning non-$00
 static unsigned int iwm_data_ff = 0;       // data reg reads returning $FF (no data)
 static unsigned int iwm_data_hi = 0;       // data reg reads with bit7=1 (valid GCR byte)
 static unsigned int iwm_data_lo = 0;       // data reg reads with bit7=0 (no valid byte yet)
+#endif
 
 // Slow IO regions — addresses that need bus cycle delays to match real 68000 timing.
 // Populated from MAPTYPE_SLOWIO entries in the config file.
@@ -218,7 +231,9 @@ static inline int is_pacedio(uint32_t addr) {
   return 0;
 }
 
+#ifdef DEBUG_DIAG
 static unsigned int pacedio_hit_count = 0;
+#endif
 
 // Busy-wait to match real 68000 bus cycle timing.
 // A real 68000 at 7.83MHz: tst.b d(An) = 8 cycles = ~1μs.
@@ -282,7 +297,9 @@ void *ipl_task(void *args) {
       if (!atomic_load(&irq)) {
         M68K_END_TIMESLICE;
         atomic_store(&irq, 1);
+#ifdef DEBUG_DIAG
         atomic_fetch_add(&dbg_ipl_assert, 1);
+#endif
       }
     }
     if(do_reset==0)
@@ -507,26 +524,6 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			}
 #endif
 
-			/* Buffer snoop: log every change to $003A5EC0 (JMP target) */
-			{
-				static uint32_t *snoop_ptr = NULL;
-				static uint32_t snoop_prev = 0;
-				static int snoop_count = 0;
-				if (!snoop_ptr) {
-					for (int i = 0; i < state->write_ranges; i++) {
-						if (0x3A5EC0 >= state->write_addr[i] && 0x3A5EC4 <= state->write_upper[i]) {
-							snoop_ptr = (uint32_t *)(state->write_data[i] + (0x3A5EC0 - state->write_addr[i]));
-							break;
-						}
-					}
-				}
-				if (snoop_ptr && *snoop_ptr != snoop_prev) {
-					printf("[SNOOP] #%d buffer@3A5EC0: %08X -> %08X at PC=%08X\n",
-						snoop_count++, be32toh(snoop_prev), be32toh(*snoop_ptr), ADDRESS_68K(REG_PC));
-					snoop_prev = *snoop_ptr;
-				}
-			}
-
 			/* Read an instruction and call its handler */
 			REG_IR = m68ki_read_imm_16(state);
 			m68ki_instruction_jump_table[REG_IR](state);
@@ -589,6 +586,7 @@ cpu_loop:
     }
   }
 
+#ifdef DEBUG_DIAG
   {
     // Diagnostic: dump Sound Driver state when stuck at $4031BE/$4031C2
     static int sound_diag_done = 0;
@@ -841,6 +839,7 @@ cpu_loop:
       }
     }
   }
+#endif
 
   if (atomic_load(&irq)) {
     atomic_store(&irq, 0);
@@ -854,7 +853,9 @@ cpu_loop:
     if (ipl > 0) {
       M68K_SET_IRQ(ipl);
       last_last_irq = ipl;
+#ifdef DEBUG_DIAG
       dbg_cpu_irq++;
+#endif
     }
   } else if (last_last_irq != 0) {
     // Deassertion: check GPIO pin directly (no bus operation)
@@ -864,7 +865,9 @@ cpu_loop:
       // IPL pin is high (no interrupt) — clear CPU level
       M68K_SET_IRQ(0);
       last_last_irq = 0;
+#ifdef DEBUG_DIAG
       dbg_cpu_deassert++;
+#endif
     }
   }
 
@@ -1071,6 +1074,7 @@ void sigint_handler(int sig_num) {
     usleep(0);
   }
 
+#ifdef DEBUG_DIAG
   printf("IPL assertions: %u\n", atomic_load(&dbg_ipl_assert));
   printf("CPU IRQ set: %u\n", dbg_cpu_irq);
   printf("CPU IRQ ack: %u\n", dbg_irq_ack_count);
@@ -1080,6 +1084,7 @@ void sigint_handler(int sig_num) {
          via_ifr_bits[0], via_ifr_bits[1], via_ifr_bits[2],
          via_ifr_bits[3], via_ifr_bits[4], via_ifr_bits[5],
          via_ifr_bits[6]);
+#endif
 
   exit(0);
 }
@@ -1343,9 +1348,11 @@ void cpu_pulse_reset(void) {
 }
 
 unsigned int cpu_irq_ack(int level) {
+#ifdef DEBUG_DIAG
   dbg_irq_ack_count++;
   if (dbg_irq_ack_count <= 3)
     printf("[IRQ-ACK] level=%d count=%u\n", level, dbg_irq_ack_count);
+#endif
 
   // Clear the pending interrupt level after acknowledgment.
   // Without this, CPU_INT_LEVEL stays at 0x100 during the entire
@@ -1570,7 +1577,9 @@ static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t 
 }
 
 unsigned int m68k_read_memory_8(unsigned int address) {
+#ifdef DEBUG_DIAG
   rd8_total++;
+#endif
 
   // 68000 has 24-bit address bus — mask upper 8 bits
   address &= 0x00FFFFFF;
@@ -1579,11 +1588,13 @@ unsigned int m68k_read_memory_8(unsigned int address) {
     return platform_res;
   }
 
+#ifdef DEBUG_DIAG
   if (address >= 0x800000) rd8_hi++;
   if (address >= 0xDFE1FF && address <= 0xDFFFFF) rd8_iwm++;
   if (address >= 0xEFE1FE && address <= 0xEFFFFF) rd8_via++;
   if (address >= 0x580000 && address <= 0x5FFFFF)
     rd8_scsi++;
+#endif
 
   // noscsi bypass: return 0 for all SCSI reads without hitting GPIO
   if (noscsi_enabled && address >= 0x580000 && address <= 0x5FFFFF) {
@@ -1595,12 +1606,15 @@ unsigned int m68k_read_memory_8(unsigned int address) {
 
   unsigned int val;
   if (is_pacedio(address)) {
+#ifdef DEBUG_DIAG
     pacedio_hit_count++;
+#endif
     val = (unsigned int)ps_read_8_paced((uint32_t)address);
   } else {
     val = (unsigned int)ps_read_8((uint32_t)address);
   }
 
+#ifdef DEBUG_DIAG
   if (address >= 0x580000 && address <= 0x5FFFFF) {
     // Print first 64 SCSI reads in detail
     if (scsi_log_total < 64) {
@@ -1653,7 +1667,9 @@ unsigned int m68k_read_memory_8(unsigned int address) {
       scsi_log_total++;
     }
   }
+#endif
 
+#ifdef DEBUG_DIAG
   // IWM access capture: $DFE1FF-$DFFFFF (ring buffer + mode tracking)
   if (address >= 0xDFE1FF && address <= 0xDFFFFF) {
     uint32_t iwm_pc = m68k_get_reg(NULL, M68K_REG_PC);
@@ -1697,7 +1713,9 @@ unsigned int m68k_read_memory_8(unsigned int address) {
       else iwm_hshk_notready++;
     }
   }
+#endif
 
+#ifdef DEBUG_DIAG
   // VIA IFR tracing: count which interrupt sources the ISR sees
   // VIA IFR is at base ($EFE1FE) + RS13*512 = $EFFBFE
   if (address == 0xEFFBFE) {
@@ -1722,6 +1740,7 @@ unsigned int m68k_read_memory_8(unsigned int address) {
   if (address == 0xEFE1FE) via_orb_reads++;   // CB1/CB2 ACK
   if (address == 0xEFF1FE) via_t2cl_reads++;  // T2 ACK
   if (address == 0xEFF5FE) via_sr_reads++;    // SR ACK
+#endif
 
   return val;
 }
@@ -1923,6 +1942,7 @@ void m68k_write_memory_8(unsigned int address, unsigned int value) {
   address &= 0x00FFFFFF;
 
   if (address >= 0x580000 && address <= 0x5FFFFF) {
+#ifdef DEBUG_DIAG
     wr8_scsi++;
     // Print first 64 SCSI writes in detail
     if (wr8_scsi <= 64) {
@@ -1936,6 +1956,7 @@ void m68k_write_memory_8(unsigned int address, unsigned int value) {
     scsi_log_buf[idx].is_write = 1;
     scsi_log_head++;
     scsi_log_total++;
+#endif
 #ifdef DEBUG_MAC_IO
     // Dump registers on first ODR write during command phase
     {
@@ -1957,6 +1978,7 @@ void m68k_write_memory_8(unsigned int address, unsigned int value) {
         csd_verify_count++;
       }
     }
+#ifdef DEBUG_DIAG
     // Arm CSBS transition tracker when Start DMA Init Recv is written (reg 7)
     if ((address & 0xFFFFF0) == 0x5FF070 && !csbs_tracking_active) {
       csbs_tracking_active = 1;
@@ -1964,6 +1986,7 @@ void m68k_write_memory_8(unsigned int address, unsigned int value) {
       csbs_trans_polls = 0;
       printf("[SCSI-DMA-START] DMA armed, tracking CSBS transitions\n");
     }
+#endif
 #endif
   }
 
@@ -1984,7 +2007,9 @@ void m68k_write_memory_8(unsigned int address, unsigned int value) {
   // ps_write_8 ensures D8-D15 also has the correct value.
   if (address >= 0x580000 && address <= 0x5FFFFF) {
     int paced = is_pacedio(address);
+#ifdef DEBUG_DIAG
     if (paced) pacedio_hit_count++;
+#endif
     if (paced)
       ps_write_8_paced((uint32_t)address, value);
     else
@@ -2026,6 +2051,7 @@ void m68k_write_memory_8(unsigned int address, unsigned int value) {
            m68k_get_reg(NULL, M68K_REG_PC));
   }
 #endif
+#ifdef DEBUG_DIAG
   // Track VIA stats silently (needed for heartbeat summary)
   if (address == 0xEFFBFE) {
     via_ifr_writes++;
@@ -2041,9 +2067,12 @@ void m68k_write_memory_8(unsigned int address, unsigned int value) {
   }
   if (address == 0xEFE9FE) via_t1cl_writes++;
   if (address == 0xEFEBFE) via_t1ch_writes++;
+#endif
 
   if (is_pacedio(address)) {
+#ifdef DEBUG_DIAG
     pacedio_hit_count++;
+#endif
     ps_write_8_paced((uint32_t)address, value);
   } else {
     ps_write_8((uint32_t)address, value);

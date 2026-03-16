@@ -145,8 +145,10 @@ static void *vnc_thread(void *arg) {
            cfg->port, MAC_SCREEN_W, MAC_SCREEN_H);
 
     while (cfg->running && rfbIsActive(screen)) {
-        expand_screen(cfg->ram_base, cfg->ram_size, screen->frameBuffer);
-        rfbMarkRectAsModified(screen, 0, 0, MAC_SCREEN_W, MAC_SCREEN_H);
+        if (screen->clientHead) {
+            expand_screen(cfg->ram_base, cfg->ram_size, screen->frameBuffer);
+            rfbMarkRectAsModified(screen, 0, 0, MAC_SCREEN_W, MAC_SCREEN_H);
+        }
         rfbProcessEvents(screen, VNC_FRAME_MS * 1000);  /* timeout in microseconds */
     }
 
