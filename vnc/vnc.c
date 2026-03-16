@@ -95,6 +95,119 @@ static void vnc_ptr_event(int buttonMask, int x, int y, rfbClientPtr cl) {
     }
 }
 
+/* ── Keyboard: X11 keysym → Mac virtual keycode ────────────────────── */
+
+/* Mac modifier bit masks (evtQModifiers high byte) */
+#define MAC_MOD_CMD    0x0100  /* bit 8: cmdKey */
+#define MAC_MOD_SHIFT  0x0200  /* bit 9: shiftKey */
+#define MAC_MOD_ALPHA  0x0400  /* bit 10: alphaLock */
+#define MAC_MOD_OPT    0x0800  /* bit 11: optionKey */
+#define MAC_MOD_CTRL   0x1000  /* bit 12: controlKey */
+
+/* ASCII 0x00-0x7F → Mac virtual keycode.  0xFF = unmapped. */
+static const uint8_t ascii_to_mac_keycode[128] = {
+    /* 0x00-0x0F  (ctrl chars) */
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    /* 0x10-0x1F  (ctrl chars) */
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    /* 0x20 ' '  0x21 !  0x22 "  0x23 #  0x24 $  0x25 %  0x26 &  0x27 ' */
+       0x31,    0x12,   0x27,   0x14,   0x15,   0x17,   0x1A,   0x27,
+    /* 0x28 (  0x29 )  0x2A *  0x2B +  0x2C ,  0x2D -  0x2E .  0x2F / */
+       0x19,   0x1D,   0x1C,   0x18,   0x2B,   0x1B,   0x2F,   0x2C,
+    /* 0x30 0  0x31 1  0x32 2  0x33 3  0x34 4  0x35 5  0x36 6  0x37 7 */
+       0x1D,   0x12,   0x13,   0x14,   0x15,   0x17,   0x16,   0x1A,
+    /* 0x38 8  0x39 9  0x3A :  0x3B ;  0x3C <  0x3D =  0x3E >  0x3F ? */
+       0x1C,   0x19,   0x29,   0x29,   0x2B,   0x18,   0x2F,   0x2C,
+    /* 0x40 @  A      B      C      D      E      F      G      */
+       0x13,   0x00,   0x0B,   0x08,   0x02,   0x0E,   0x03,   0x05,
+    /* H      I      J      K      L      M      N      O      */
+       0x04,   0x22,   0x26,   0x28,   0x25,   0x2E,   0x2D,   0x1F,
+    /* P      Q      R      S      T      U      V      W      */
+       0x23,   0x0C,   0x0F,   0x01,   0x11,   0x20,   0x09,   0x0D,
+    /* X      Y      Z      [      \      ]      ^      _      */
+       0x07,   0x10,   0x06,   0x21,   0x2A,   0x1E,   0x16,   0x1B,
+    /* 0x60 `  a      b      c      d      e      f      g      */
+       0x32,   0x00,   0x0B,   0x08,   0x02,   0x0E,   0x03,   0x05,
+    /* h      i      j      k      l      m      n      o      */
+       0x04,   0x22,   0x26,   0x28,   0x25,   0x2E,   0x2D,   0x1F,
+    /* p      q      r      s      t      u      v      w      */
+       0x23,   0x0C,   0x0F,   0x01,   0x11,   0x20,   0x09,   0x0D,
+    /* x      y      z      {      |      }      ~      DEL    */
+       0x07,   0x10,   0x06,   0x21,   0x2A,   0x1E,   0x32,   0xFF,
+};
+
+static void vnc_kbd_event(rfbBool down, rfbKeySym keySym, rfbClientPtr cl) {
+    (void)cl;
+
+    uint8_t mac_keycode = 0xFF;
+    uint8_t mac_char = 0;
+    uint16_t mod_bit = 0;
+
+    if (keySym >= 0x20 && keySym <= 0x7E) {
+        /* Printable ASCII — keySym IS the ASCII code */
+        mac_keycode = ascii_to_mac_keycode[keySym & 0x7F];
+        mac_char = (uint8_t)keySym;
+    } else {
+        /* Special keys (X11 keysym 0xFF00+ range) */
+        switch (keySym) {
+        case 0xFF08: mac_keycode = 0x33; mac_char = 0x08; break; /* Backspace */
+        case 0xFF09: mac_keycode = 0x30; mac_char = 0x09; break; /* Tab */
+        case 0xFF0D: mac_keycode = 0x24; mac_char = 0x0D; break; /* Return */
+        case 0xFF1B: mac_keycode = 0x35; mac_char = 0x1B; break; /* Escape */
+        case 0xFFFF: mac_keycode = 0x75; mac_char = 0x7F; break; /* Fwd Delete */
+        case 0xFF51: mac_keycode = 0x7B; mac_char = 0x1C; break; /* Left */
+        case 0xFF52: mac_keycode = 0x7E; mac_char = 0x1E; break; /* Up */
+        case 0xFF53: mac_keycode = 0x7C; mac_char = 0x1D; break; /* Right */
+        case 0xFF54: mac_keycode = 0x7D; mac_char = 0x1F; break; /* Down */
+        /* Modifiers */
+        case 0xFFE1: case 0xFFE2:          /* Shift L/R */
+            mac_keycode = 0x38; mod_bit = MAC_MOD_SHIFT; break;
+        case 0xFFE3: case 0xFFE4:          /* Control L/R */
+            mac_keycode = 0x3B; mod_bit = MAC_MOD_CTRL; break;
+        case 0xFFE5:                        /* Caps Lock */
+            mac_keycode = 0x39; mod_bit = MAC_MOD_ALPHA; break;
+        case 0xFFE7: case 0xFFE8:          /* Meta L/R → Command */
+        case 0xFFEB: case 0xFFEC:          /* Super L/R → Command */
+            mac_keycode = 0x37; mod_bit = MAC_MOD_CMD; break;
+        case 0xFFE9: case 0xFFEA:          /* Alt L/R → Option */
+            mac_keycode = 0x3A; mod_bit = MAC_MOD_OPT; break;
+        default:
+            return;  /* unmapped */
+        }
+    }
+
+    if (mac_keycode == 0xFF)
+        return;
+
+    /* Update running modifier state */
+    if (mod_bit) {
+        if (down)
+            vnc_cfg->key_modifiers |= mod_bit;
+        else
+            vnc_cfg->key_modifiers &= ~mod_bit;
+    }
+
+    /* Only inject keyDown — Mac apps ignore keyUp, and injecting both doubles input */
+    if (!down)
+        return;
+
+    /* Enqueue key event for CPU thread */
+    uint8_t head = vnc_cfg->key_head;
+    uint8_t next = (head + 1) % VNC_KEY_QUEUE_SIZE;
+    if (next == vnc_cfg->key_tail)
+        return;  /* queue full — drop keystroke */
+
+    struct vnc_key_event *ke = &vnc_cfg->key_queue[head];
+    ke->mac_keycode = mac_keycode;
+    ke->mac_char = mac_char;
+    ke->down = down ? 1 : 0;
+    ke->modifiers = vnc_cfg->key_modifiers;
+    __sync_synchronize();
+    vnc_cfg->key_head = next;
+}
+
 static void *vnc_thread(void *arg) {
     struct vnc_config *cfg = (struct vnc_config *)arg;
 
@@ -138,6 +251,7 @@ static void *vnc_thread(void *arg) {
     memset(screen->frameBuffer, 0xFF, MAC_SCREEN_W * MAC_SCREEN_H);
 
     screen->ptrAddEvent = vnc_ptr_event;
+    screen->kbdAddEvent = vnc_kbd_event;
 
     rfbInitServer(screen);
     printf("[VNC] Password: \"mac\"\n");

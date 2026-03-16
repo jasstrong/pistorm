@@ -448,6 +448,62 @@ static int vnc_inject_mouse_event(uint8_t what) {
     return 1;
 }
 
+static int vnc_inject_key_event(uint8_t mac_keycode, uint8_t mac_char,
+                                uint8_t down, uint16_t modifiers) {
+    uint8_t *ram = vnc_cfg.ram_base;
+    if (!ram)
+        return 0;
+
+    /* EvQHdr.qFlags ($014A): if non-zero, queue is locked — retry later */
+    if (ram[0x014A] || ram[0x014B])
+        return 0;
+
+    /* Find a free slot: scan event buffer for evtQWhat == $FFFF */
+    uint32_t buf_base = ram_read32(ram, SYSEVTBUF);
+    uint16_t buf_cnt  = ram_read16(ram, EVTBUFCNT);
+    if (buf_base == 0 || buf_base >= vnc_cfg.ram_size)
+        return 0;
+    if (buf_cnt == 0 || buf_cnt > 100)
+        buf_cnt = 5;
+
+    uint32_t slot = 0;
+    for (uint16_t i = 0; i < buf_cnt; i++) {
+        uint32_t entry = buf_base + (uint32_t)i * EVQEL_SIZE;
+        if (entry + EVQEL_SIZE > vnc_cfg.ram_size)
+            break;
+        if (ram_read16(ram, entry + 6) == 0xFFFF) {
+            slot = entry;
+            break;
+        }
+    }
+    if (!slot)
+        return 0;
+
+    uint16_t what = down ? 3 : 5;  /* keyDown=3, keyUp=5 */
+
+    ram_write32(ram, slot,      0);
+    ram_write16(ram, slot + 4,  4);              /* qType = evType */
+    ram_write16(ram, slot + 6,  what);
+    /* evtQMessage: keycode in bits 8-15, char code in bits 0-7 */
+    ram_write32(ram, slot + 8,  ((uint32_t)mac_keycode << 8) | mac_char);
+    ram_write32(ram, slot + 12, ram_read32(ram, TICKS_ADDR));
+    /* evtQWhere: current mouse position from MTemp */
+    ram_write16(ram, slot + 16, ram_read16(ram, 0x0828));     /* MTemp.v */
+    ram_write16(ram, slot + 18, ram_read16(ram, 0x0828 + 2)); /* MTemp.h */
+    /* evtQModifiers: modifier flags | MBState */
+    ram_write16(ram, slot + 20, (modifiers & 0xFF00) | ram[0x0172]);
+
+    uint32_t tail = ram_read32(ram, EVQHDR_TAIL);
+    if (tail == 0) {
+        ram_write32(ram, EVQHDR_HEAD, slot);
+    } else {
+        ram_write32(ram, tail, slot);
+    }
+    ram_write32(ram, EVQHDR_TAIL, slot);
+
+    return 1;
+}
+
 static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 {
 	/* eat up any reset cycles */
@@ -564,6 +620,14 @@ cpu_loop:
       if (vnc_inject_mouse_event(2))
         vnc_cfg.mouse_pending &= ~2;
     }
+  }
+
+  /* VNC keyboard: drain key event ring buffer into Mac OS event queue */
+  while (vnc_cfg.key_tail != vnc_cfg.key_head) {
+    struct vnc_key_event *ke = &vnc_cfg.key_queue[vnc_cfg.key_tail];
+    if (!vnc_inject_key_event(ke->mac_keycode, ke->mac_char, ke->down, ke->modifiers))
+      break;  /* queue locked or full — retry next iteration */
+    vnc_cfg.key_tail = (vnc_cfg.key_tail + 1) % VNC_KEY_QUEUE_SIZE;
   }
 
   if (realtime_disassembly && (do_disasm || cpu_emulation_running)) {
