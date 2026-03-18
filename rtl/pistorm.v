@@ -220,8 +220,8 @@ module pistorm(
     LTCH_A_OE_n <= !(S1 || S2 || S3 || S4 || Sw || S5 || S6 || S7);
     LTCH_D_WR_OE_n <= !(!op_rw && (S3 || S4 || Sw || S5 || S6 || S7));
 
-    LTCH_D_RD_U <= S7;
-    LTCH_D_RD_L <= S7;
+    LTCH_D_RD_U <= S6;
+    LTCH_D_RD_L <= S6;
 
     M68K_AS_n <= !(S2 || S3 || S4 || Sw || S5 || S6);
     M68K_UDS_n <= (op_rw && (S2 || S3)) || (S4 || Sw || S5 || S6) ? op_uds_n : 1'b1;
