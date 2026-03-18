@@ -44,7 +44,7 @@
 #include "m68kops.h"
 
 /* #define DEBUG_MAC_IO */  /* Uncomment for per-access SCSI/VIA/IO debug spam */
-/* #define DEBUG_DIAG */  /* Uncomment (or -DDEBUG_DIAG) for diagnostic counters & ring buffers */
+/* #define DEBUG_DIAG */   /* Uncomment (or -DDEBUG_DIAG) for diagnostic counters & ring buffers */
 #define KEY_POLL_INTERVAL_MSEC 5000
 
 unsigned int ovl;
@@ -183,16 +183,47 @@ void dump_scsi_log(const char *label) { (void)label; }
 #endif
 
 #ifdef DEBUG_DIAG
-// IWM read log — ring buffer captures most recent N reads
-#define IWM_LOG_SIZE 128
-static struct { uint32_t addr; uint8_t val; uint32_t pc; } iwm_log_buf[IWM_LOG_SIZE];
+// Direct memory read from wtcram/ROM buffer — safe to call from inside m68k callbacks
+// (unlike m68k_read_memory_XX which is NOT re-entrant)
+// NOTE: get_mapped_data_pointer_by_address excludes MAPTYPE_RAM_WTC, so we
+// search cfg->map_data[] ourselves, accepting RAM, RAM_WTC, RAM_NOALLOC, and ROM.
+static uint8_t *direct_get_ptr(uint32_t address) {
+  extern struct emulator_config *cfg;
+  if (!cfg) return NULL;
+  address &= 0xFFFFFF;
+  for (int i = 0; i < MAX_NUM_MAPPED_ITEMS; i++) {
+    if (cfg->map_type[i] == MAPTYPE_NONE || !cfg->map_data[i]) continue;
+    if (address >= cfg->map_offset[i] && address < cfg->map_high[i]) {
+      if (cfg->map_type[i] == MAPTYPE_RAM || cfg->map_type[i] == MAPTYPE_RAM_WTC ||
+          cfg->map_type[i] == MAPTYPE_RAM_NOALLOC || cfg->map_type[i] == MAPTYPE_ROM)
+        return cfg->map_data[i] + (address - cfg->map_offset[i]);
+    }
+  }
+  return NULL;
+}
+static uint16_t direct_read_16(uint32_t address) {
+  uint8_t *p = direct_get_ptr(address);
+  if (p) return (p[0] << 8) | p[1];
+  return 0xDEAD;
+}
+static uint32_t direct_read_32(uint32_t address) {
+  uint8_t *p = direct_get_ptr(address);
+  if (p) return (p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
+  return 0xDEADDEAD;
+}
+
+// IWM access log — ring buffer captures most recent N accesses (reads + writes)
+#define IWM_LOG_SIZE 256
+static struct { uint32_t addr; uint8_t val; uint32_t pc; uint32_t caller; uint8_t is_write; } iwm_log_buf[IWM_LOG_SIZE];
 static unsigned int iwm_log_head = 0;   // next write position (wraps)
-static unsigned int iwm_log_total = 0;  // total IWM reads logged
+static unsigned int iwm_log_total = 0;  // total IWM accesses logged
 
 // IWM mode tracking — persistent Q6/Q7 state + per-mode counters
 // IWM register mapping: reg12=Q6off, reg13=Q6on, reg14=Q7off, reg15=Q7on
 // Modes: Q6=0,Q7=0 → data; Q6=1,Q7=0 → status; Q6=0,Q7=1 → handshake; Q6=1,Q7=1 → write
 static int iwm_q6 = 0, iwm_q7 = 0;
+// Phase line state tracking (set/cleared by accessing phase registers)
+static int iwm_ph[4] = {0};  // ph0-ph3 current state
 static unsigned int iwm_mode_rd[4] = {0};  // [q7*2+q6] read counts
 static unsigned int iwm_hshk_ready = 0;    // handshake reads with bit7=1 (byte ready)
 static unsigned int iwm_hshk_notready = 0; // handshake reads with bit7=0
@@ -201,6 +232,141 @@ static unsigned int iwm_data_nonzero = 0;  // data reg reads returning non-$00
 static unsigned int iwm_data_ff = 0;       // data reg reads returning $FF (no data)
 static unsigned int iwm_data_hi = 0;       // data reg reads with bit7=1 (valid GCR byte)
 static unsigned int iwm_data_lo = 0;       // data reg reads with bit7=0 (no valid byte yet)
+
+// IWM sense line names indexed by {ph3,ph2,ph1,ph0}
+static const char *iwm_sense_names[16] = {
+  "DIRTN","CSTIN","STEP","WRPRT","MOTORON","TK0","EJECT","TACH",
+  "RDDATA0","RDDATA1","?A","?B","SIDES","?D","?E","DRVIN"
+};
+
+static void iwm_update_state(unsigned int reg) {
+  // Phase lines: reg0=ph0L, reg1=ph0H, reg2=ph1L, ..., reg7=ph3H
+  if (reg < 8) {
+    iwm_ph[reg / 2] = reg & 1;
+  }
+  // Q6/Q7: reg12=Q6L, reg13=Q6H, reg14=Q7L, reg15=Q7H
+  if (reg == 12) iwm_q6 = 0;
+  else if (reg == 13) iwm_q6 = 1;
+  else if (reg == 14) iwm_q7 = 0;
+  else if (reg == 15) iwm_q7 = 1;
+}
+
+static void iwm_log_access(unsigned int address, unsigned int val, int is_write) {
+  static const char *iwm_reg_names[] = {
+    "ph0L","ph0H","ph1L","ph1H","ph2L","ph2H","ph3L","ph3H",
+    "mtrOff","mtrOn","intDrv","extDrv","Q6L","Q6H","Q7L","Q7H"
+  };
+
+  uint32_t iwm_pc = m68k_get_reg(NULL, M68K_REG_PC);
+  unsigned int iwm_reg = (address - 0xDFE1FF) >> 9;
+
+  // One-shot dump of RAM code when PC is in RAM (< $400000)
+  // The code may be temporary (loaded then freed), so capture it while executing
+  {
+    static int ram_code_dumped = 0;
+    if (!ram_code_dumped && (iwm_pc & 0xFFFFFF) < 0x400000 && (iwm_pc & 0xFFFFFF) >= 0x1000) {
+      ram_code_dumped = 1;
+      uint32_t pc24 = iwm_pc & 0xFFFFFF;
+      uint32_t dump_start = (pc24 > 0x80) ? (pc24 - 0x80) : 0;
+      uint32_t dump_end = pc24 + 0x80;
+      printf("[IWM] *** RAM CODE DUMP (PC=%06X) ***\n", pc24);
+      for (uint32_t a = dump_start; a < dump_end; a += 16) {
+        printf("[IWM] %06X:", a);
+        for (int j = 0; j < 16; j += 2)
+          printf(" %04X", direct_read_16(a + j));
+        printf("\n");
+      }
+      // Also dump key low-memory vectors while we're in a valid context
+      printf("[IWM] LowMem: SonyPatch($B40)=%08X IWMBase($1E0)=%08X SonyVars($134)=%08X\n",
+             direct_read_32(0xB40), direct_read_32(0x1E0), direct_read_32(0x134));
+      printf("[IWM] *** END RAM CODE DUMP ***\n");
+    }
+  }
+
+  // Update IWM state BEFORE logging (so logged state reflects this access)
+  if (iwm_reg < 16) iwm_update_state(iwm_reg);
+
+  unsigned int sense_sel = (iwm_ph[3] << 3) | (iwm_ph[2] << 2) | (iwm_ph[1] << 1) | iwm_ph[0];
+
+  // Realtime log: only print on significant state transitions, not every access
+  {
+    static int last_mode = -1;  // q7*2+q6
+    static unsigned int suppress_count = 0;
+    static unsigned int last_summary_total = 0;
+    int mode = iwm_q7 * 2 + iwm_q6;
+
+    // Always print mode transitions (data→status→handshake→write)
+    int mode_changed = (mode != last_mode);
+    // Print phase/sense changes (drive polling state transitions)
+    static unsigned int last_sense_log = ~0u;
+    int sense_changed = (sense_sel != last_sense_log);
+    // Print first few data reads to see what values come back
+    static unsigned int data_rd_count = 0;
+    int is_data_rd = (!is_write && mode == 0);  // Q6=0, Q7=0 = data register
+    if (is_data_rd) data_rd_count++;
+    int show_data = (is_data_rd && data_rd_count <= 20);
+
+    if (mode_changed || sense_changed || show_data) {
+      if (suppress_count > 0) {
+        printf("[IWM]   ... %u accesses suppressed\n", suppress_count);
+        suppress_count = 0;
+      }
+      printf("[IWM] #%u %s reg%u(%s) val=%02X ph=%d%d%d%d(%s) Q6=%d Q7=%d pc=%08X",
+             iwm_log_total, is_write ? "WR" : "RD",
+             iwm_reg, (iwm_reg < 16) ? iwm_reg_names[iwm_reg] : "?",
+             val & 0xFF,
+             iwm_ph[3], iwm_ph[2], iwm_ph[1], iwm_ph[0],
+             iwm_sense_names[sense_sel],
+             iwm_q6, iwm_q7, iwm_pc);
+      printf("\n");
+      last_mode = mode;
+      last_sense_log = sense_sel;
+    } else {
+      suppress_count++;
+    }
+
+    // Periodic summary every 5000 accesses
+    if (iwm_log_total - last_summary_total >= 5000) {
+      last_summary_total = iwm_log_total;
+      printf("[IWM] === SUMMARY at #%u: data_rd=%u(hi=%u lo=%u zero=%u ff=%u) hshk=%u(rdy=%u nrdy=%u) status=%u ===\n",
+             iwm_log_total, iwm_mode_rd[0], iwm_data_hi, iwm_data_lo,
+             iwm_data_zero, iwm_data_ff,
+             iwm_mode_rd[2], iwm_hshk_ready, iwm_hshk_notready,
+             iwm_mode_rd[1]);
+    }
+  }
+
+  unsigned int idx = iwm_log_head % IWM_LOG_SIZE;
+  iwm_log_buf[idx].addr = address;
+  iwm_log_buf[idx].val = val;
+  iwm_log_buf[idx].pc = iwm_pc;
+  iwm_log_buf[idx].caller = 0;
+  // For status register reads (reg14=Q7L with Q6 set), capture SP and stack
+  if (iwm_reg == 14 && iwm_q6 == 1 && !is_write) {
+    uint32_t sp = m68k_get_reg(NULL, M68K_REG_A7);
+    // Store SP in caller field, stack words in a separate small dump
+    iwm_log_buf[idx].caller = sp;
+  }
+  iwm_log_buf[idx].is_write = is_write;
+  iwm_log_head++;
+  iwm_log_total++;
+
+  // Count reads by current mode (only for reads)
+  if (!is_write) {
+    int mode = iwm_q7 * 2 + iwm_q6;
+    iwm_mode_rd[mode]++;
+    if (mode == 0) { // data register (Q6=0, Q7=0)
+      if (val & 0x80) iwm_data_hi++;
+      else iwm_data_lo++;
+      if (val == 0x00) iwm_data_zero++;
+      else if (val == 0xFF) iwm_data_ff++;
+      else iwm_data_nonzero++;
+    } else if (mode == 2) { // handshake register (Q6=0, Q7=1)
+      if (val & 0x80) iwm_hshk_ready++;
+      else iwm_hshk_notready++;
+    }
+  }
+}
 #endif
 
 // Slow IO regions — addresses that need bus cycle delays to match real 68000 timing.
@@ -221,13 +387,15 @@ static inline int slowio_get_delay(uint32_t addr) {
 // Populated from MAPTYPE_PACEDIO entries in the config file.
 // Paced IO stretches the bus cycle itself (not inter-cycle delay like slowio).
 #define MAX_PACEDIO_REGIONS 8
-static struct { uint32_t lo; uint32_t hi; } pacedio[MAX_PACEDIO_REGIONS];
+static struct { uint32_t lo; uint32_t hi; int extra_cycles; } pacedio[MAX_PACEDIO_REGIONS];
 static int pacedio_count = 0;
 
+// Returns 0 if not paced, or (1 + extra_cycles) if paced.
+// extra_cycles comes from the "delay" config parameter on pacedio mappings.
 static inline int is_pacedio(uint32_t addr) {
   for (int i = 0; i < pacedio_count; i++) {
     if (addr >= pacedio[i].lo && addr < pacedio[i].hi)
-      return 1;
+      return 1 + pacedio[i].extra_cycles;
   }
   return 0;
 }
@@ -281,6 +449,38 @@ unsigned int cpu_type = M68K_CPU_TYPE_68000;
 unsigned int loop_cycles = 300, irq_status = 0;
 struct emulator_config *cfg = NULL;
 char keyboard_file[256] = "/dev/input/event1";
+
+// Gestalt trap ($A1AD) intercept for 68030/68040 emulation.
+// Returns 1 if handled (caller should skip the A-line exception), 0 otherwise.
+int gestalt_trap_intercept(void) {
+  if (!cfg || cfg->platform->id != PLATFORM_MAC)
+    return 0;
+  if (cpu_type != M68K_CPU_TYPE_68030 && cpu_type != M68K_CPU_TYPE_68030_24 &&
+      cpu_type != M68K_CPU_TYPE_68040 && cpu_type != M68K_CPU_TYPE_68040_24)
+    return 0;
+
+  uint32_t selector = m68k_get_reg(NULL, M68K_REG_D0);
+  uint32_t result;
+
+  int is_040 = (cpu_type == M68K_CPU_TYPE_68040 || cpu_type == M68K_CPU_TYPE_68040_24);
+
+  if (selector == 0x70726F63) {  // 'proc'
+    result = is_040 ? 5 : 4;
+  } else if (selector == 0x66707520) {  // 'fpu '
+    result = 3;  // gestalt68040FPU for both 68030 and 68040
+  } else if (selector == 0x6D6D7520) {  // 'mmu '
+    result = is_040 ? 3 : 2;  // gestaltMMU68040 or gestaltMMU68030
+  } else if (selector == 0x63707574) {  // 'cput' (gestaltNativeCPUtype)
+    result = is_040 ? 0x104 : 0x103;
+  } else if (selector == 0x6D616368) {  // 'mach' (gestaltMachineType)
+    result = is_040 ? 22 : 9;  // gestaltQuadra700 (68040) or gestaltMacSE030 (68030)
+  } else {
+    return 0;  // not handled — let the trap dispatcher run
+  }
+  m68k_set_reg(NULL, M68K_REG_D0, 0);       // noErr
+  m68k_set_reg(NULL, M68K_REG_A0, result);
+  return 1;
+}
 
 uint16_t irq_delay = 0;
 unsigned int amiga_reset=0, amiga_reset_last=0;
@@ -548,9 +748,9 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			/* Record previous program counter */
 			REG_PPC = REG_PC;
 
-			/* PC trace ring buffer for crash diagnostics */
-			state->pc_trace[state->pc_trace_idx & 31] = REG_PC;
-			state->pc_trace_idx = (state->pc_trace_idx + 1) & 31;
+			/* PC trace ring buffer — disabled for performance */
+			/* state->pc_trace[state->pc_trace_idx & 31] = REG_PC;
+			state->pc_trace_idx = (state->pc_trace_idx + 1) & 31; */
 
 			/* Record previous D/A register state (in case of bus error) */
 //#define M68K_BUSERR_THING
@@ -684,26 +884,50 @@ cpu_loop:
                  u, handle, dce_real, flags, busy_byte, qhead, qtail);
         }
         // Key low-memory vectors
-        printf("[DIAG] SonyVec($226)=%08X\n", m68k_read_memory_32(0x226));
-        printf("[DIAG] jSonyPatch($B40)=%08X\n", m68k_read_memory_32(0xB40));
-        printf("[DIAG] IWMBase($1E0)=%08X\n", m68k_read_memory_32(0x1E0));
-        printf("[DIAG] VIABase($1D4)=%08X\n", m68k_read_memory_32(0x1D4));
-        printf("[DIAG] SonyVars($134)=%08X\n", m68k_read_memory_32(0x134));
-        printf("[DIAG] JIODone($8FC)=%08X\n", m68k_read_memory_32(0x8FC));
-        printf("[DIAG] DskErr($142)=%04X\n", m68k_read_memory_16(0x142));
-        // Dump stack
+        printf("[DIAG] SonyVec($226)=%08X\n", direct_read_32(0x226));
+        printf("[DIAG] jSonyPatch($B40)=%08X\n", direct_read_32(0xB40));
+        printf("[DIAG] IWMBase($1E0)=%08X\n", direct_read_32(0x1E0));
+        printf("[DIAG] VIABase($1D4)=%08X\n", direct_read_32(0x1D4));
+        printf("[DIAG] SonyVars($134)=%08X\n", direct_read_32(0x134));
+        printf("[DIAG] JIODone($8FC)=%08X\n", direct_read_32(0x8FC));
+        printf("[DIAG] DskErr($142)=%04X\n", direct_read_16(0x142));
+        // Dump stack (using direct reads — safe from callback context)
         uint32_t sp = m68k_get_reg(NULL, M68K_REG_A7);
         printf("[DIAG] SP=%08X stack:", sp);
         for (int i = 0; i < 12; i++)
-          printf(" %04X", m68k_read_memory_16(sp + i * 2));
+          printf(" %04X", direct_read_16(sp + i * 2));
         printf("\n");
         // SonyVars structure (first 32 bytes)
-        uint32_t sv = m68k_read_memory_32(0x134);
+        uint32_t sv = direct_read_32(0x134);
         if (sv) {
-          printf("[DIAG] SonyVars:");
+          printf("[DIAG] SonyVars @%08X:", sv);
           for (int i = 0; i < 32; i += 2)
-            printf(" %04X", m68k_read_memory_16(sv + i));
+            printf(" %04X", direct_read_16(sv + i));
           printf("\n");
+        }
+        // Dump .Sony driver patch code in RAM (SonyPatch vector points here)
+        {
+          uint32_t spatch = direct_read_32(0xB40);
+          printf("[DIAG] SonyPatch target=%08X\n", spatch);
+          if (spatch && spatch < 0x400000) {
+            // Dump 256 bytes of code starting 64 bytes before the patch target
+            uint32_t dump_start = (spatch > 0x40) ? (spatch - 0x40) : 0;
+            printf("[DIAG] RAM code dump %06X-%06X:\n", dump_start, dump_start + 0xFF);
+            for (uint32_t a = dump_start; a < dump_start + 0x100; a += 16) {
+              printf("[DIAG] %06X:", a);
+              for (int j = 0; j < 16; j += 2)
+                printf(" %04X", direct_read_16(a + j));
+              printf("\n");
+            }
+          }
+          // Also dump code around the PCs we saw in the stuck loop ($13100-$13200)
+          printf("[DIAG] RAM code dump 013100-0131FF:\n");
+          for (uint32_t a = 0x13100; a < 0x13200; a += 16) {
+            printf("[DIAG] %06X:", a);
+            for (int j = 0; j < 16; j += 2)
+              printf(" %04X", direct_read_16(a + j));
+            printf("\n");
+          }
         }
         // Dump captured IWM reads (ring buffer — most recent IWM_LOG_SIZE entries)
         {
@@ -713,9 +937,17 @@ cpu_loop:
           for (unsigned int i = 0; i < n; i++) {
             unsigned int idx = (start + i) % IWM_LOG_SIZE;
             uint32_t reg = (iwm_log_buf[idx].addr - 0xDFE1FF) >> 9;
-            printf("[IWM] #%u reg%u addr=%06X val=%02X pc=%08X\n",
-                   start + i, reg, iwm_log_buf[idx].addr, iwm_log_buf[idx].val,
-                   iwm_log_buf[idx].pc);
+            if (iwm_log_buf[idx].caller) {
+              uint32_t rsp = iwm_log_buf[idx].caller & 0xFFFFFF;
+              printf("[IWM] #%u reg%u addr=%06X val=%02X pc=%08X sp=%06X stk=%04X/%04X/%04X/%04X\n",
+                     start + i, reg, iwm_log_buf[idx].addr, iwm_log_buf[idx].val,
+                     iwm_log_buf[idx].pc, rsp,
+                     direct_read_16(rsp), direct_read_16(rsp + 2),
+                     direct_read_16(rsp + 4), direct_read_16(rsp + 6));
+            } else
+              printf("[IWM] #%u reg%u addr=%06X val=%02X pc=%08X\n",
+                     start + i, reg, iwm_log_buf[idx].addr, iwm_log_buf[idx].val,
+                     iwm_log_buf[idx].pc);
           }
         }
         sound_diag_done = 1;
@@ -769,9 +1001,12 @@ cpu_loop:
                pacedio_hit_count, pacedio_hit_count - prev_pacedio);
         prev_pacedio = pacedio_hit_count;
       }
-      printf("[IWM-MODE] data=%u status=%u hshk=%u write=%u Q6=%d Q7=%d\n",
-             iwm_mode_rd[0], iwm_mode_rd[1], iwm_mode_rd[2], iwm_mode_rd[3],
-             iwm_q6, iwm_q7);
+      { unsigned int ss = (iwm_ph[3]<<3)|(iwm_ph[2]<<2)|(iwm_ph[1]<<1)|iwm_ph[0];
+        printf("[IWM-MODE] data=%u status=%u hshk=%u write=%u Q6=%d Q7=%d ph=%d%d%d%d(%s) total=%u\n",
+               iwm_mode_rd[0], iwm_mode_rd[1], iwm_mode_rd[2], iwm_mode_rd[3],
+               iwm_q6, iwm_q7, iwm_ph[3], iwm_ph[2], iwm_ph[1], iwm_ph[0],
+               iwm_sense_names[ss], iwm_log_total);
+      }
       {
         uint32_t vbl_proc = m68k_read_memory_32(0x08EE);
         uint16_t ier_hw = ps_read_8(0xEFFDFE);
@@ -1269,8 +1504,10 @@ switch_config:
       if (cfg->map_type[i] == MAPTYPE_PACEDIO) {
         pacedio[pacedio_count].lo = cfg->map_offset[i];
         pacedio[pacedio_count].hi = cfg->map_high[i];
-        printf("[PACEDIO] Region %d: %08X-%08X\n", pacedio_count,
-               pacedio[pacedio_count].lo, pacedio[pacedio_count].hi);
+        pacedio[pacedio_count].extra_cycles = cfg->map_delay[i];
+        printf("[PACEDIO] Region %d: %08X-%08X extra_cycles=%d\n", pacedio_count,
+               pacedio[pacedio_count].lo, pacedio[pacedio_count].hi,
+               pacedio[pacedio_count].extra_cycles);
         pacedio_count++;
       }
     }
@@ -1673,22 +1910,21 @@ unsigned int m68k_read_memory_8(unsigned int address) {
   { int _sd = slowio_get_delay(address); if (_sd) slowio_delay(_sd); }
 
   unsigned int val;
-  if (is_pacedio(address)) {
+  int paced = is_pacedio(address);
+  if (paced) {
 #ifdef DEBUG_DIAG
     pacedio_hit_count++;
 #endif
     val = (unsigned int)ps_read_8_paced((uint32_t)address);
+    for (int _i = 1; _i < paced; _i++)
+      paced_dummy_cycle_1();
   } else {
     val = (unsigned int)ps_read_8((uint32_t)address);
   }
 
 #ifdef DEBUG_DIAG
   if (address >= 0x580000 && address <= 0x5FFFFF) {
-    // Print first 64 SCSI reads in detail
-    if (scsi_log_total < 64) {
-      printf("[SCSI-RD] #%u addr=%06X val=%02X pc=%08X\n",
-             scsi_log_total, address, val & 0xFF, m68k_get_reg(NULL, M68K_REG_PC));
-    }
+    // SCSI read detail printing disabled — too noisy during IWM debugging
     // Ring buffer: suppress repetitive CSBS polling (only log transitions)
     int do_log = 1;
     if (address == 0x5FF040) {
@@ -1738,48 +1974,9 @@ unsigned int m68k_read_memory_8(unsigned int address) {
 #endif
 
 #ifdef DEBUG_DIAG
-  // IWM access capture: $DFE1FF-$DFFFFF (ring buffer + mode tracking)
+  // IWM access capture: $DFE1FF-$DFFFFF
   if (address >= 0xDFE1FF && address <= 0xDFFFFF) {
-    uint32_t iwm_pc = m68k_get_reg(NULL, M68K_REG_PC);
-    unsigned int iwm_reg = (address - 0xDFE1FF) >> 9;
-    static const char *iwm_reg_names[] = {
-      "ph0L","ph0H","ph1L","ph1H","ph2L","ph2H","ph3L","ph3H",
-      "mtrOff","mtrOn","intDrv","extDrv","Q6L","Q6H","Q7L","Q7H"
-    };
-    // Print first 64 IWM accesses in detail
-    if (iwm_log_total < 64) {
-      printf("[IWM-RD] #%u reg%u(%s) addr=%06X val=%02X pc=%08X Q6=%d Q7=%d\n",
-             iwm_log_total, iwm_reg,
-             iwm_reg < 16 ? iwm_reg_names[iwm_reg] : "?",
-             address, val & 0xFF, iwm_pc, iwm_q6, iwm_q7);
-    }
-    unsigned int idx = iwm_log_head % IWM_LOG_SIZE;
-    iwm_log_buf[idx].addr = address;
-    iwm_log_buf[idx].val = val;
-    iwm_log_buf[idx].pc = iwm_pc;
-    iwm_log_head++;
-    iwm_log_total++;
-
-    // Track Q6/Q7 state changes (reg12=Q6off, reg13=Q6on, reg14=Q7off, reg15=Q7on)
-    unsigned int reg = (address - 0xDFE1FF) >> 9;
-    if (reg == 12) iwm_q6 = 0;
-    else if (reg == 13) iwm_q6 = 1;
-    else if (reg == 14) iwm_q7 = 0;
-    else if (reg == 15) iwm_q7 = 1;
-
-    // Count reads by current mode and track key values
-    int mode = iwm_q7 * 2 + iwm_q6;
-    iwm_mode_rd[mode]++;
-    if (mode == 0) { // data register (Q6=0, Q7=0)
-      if (val & 0x80) iwm_data_hi++;
-      else iwm_data_lo++;
-      if (val == 0x00) iwm_data_zero++;
-      else if (val == 0xFF) iwm_data_ff++;
-      else iwm_data_nonzero++;
-    } else if (mode == 2) { // handshake register (Q6=0, Q7=1)
-      if (val & 0x80) iwm_hshk_ready++;
-      else iwm_hshk_notready++;
-    }
+    iwm_log_access(address, val, 0);
   }
 #endif
 
@@ -2010,11 +2207,7 @@ void m68k_write_memory_8(unsigned int address, unsigned int value) {
   if (address >= 0x580000 && address <= 0x5FFFFF) {
 #ifdef DEBUG_DIAG
     wr8_scsi++;
-    // Print first 64 SCSI writes in detail
-    if (wr8_scsi <= 64) {
-      printf("[SCSI-WR] #%u addr=%06X val=%02X pc=%08X\n",
-             wr8_scsi, address, value & 0xFF, m68k_get_reg(NULL, M68K_REG_PC));
-    }
+    // SCSI write detail printing disabled — too noisy during IWM debugging
     unsigned int idx = scsi_log_head % SCSI_LOG_SIZE;
     scsi_log_buf[idx].addr = address;
     scsi_log_buf[idx].val = value & 0xFF;
@@ -2075,10 +2268,13 @@ void m68k_write_memory_8(unsigned int address, unsigned int value) {
 #ifdef DEBUG_DIAG
     if (paced) pacedio_hit_count++;
 #endif
-    if (paced)
+    if (paced) {
       ps_write_8_paced((uint32_t)address, value);
-    else
+      for (int _i = 1; _i < paced; _i++)
+        paced_dummy_cycle_1();
+    } else {
       ps_write_8((uint32_t)address, value);
+    }
     return;
   }
 
@@ -2132,15 +2328,24 @@ void m68k_write_memory_8(unsigned int address, unsigned int value) {
   }
   if (address == 0xEFE9FE) via_t1cl_writes++;
   if (address == 0xEFEBFE) via_t1ch_writes++;
+  // IWM write capture
+  if (address >= 0xDFE1FF && address <= 0xDFFFFF) {
+    iwm_log_access(address, value, 1);
+  }
 #endif
 
-  if (is_pacedio(address)) {
+  {
+    int paced = is_pacedio(address);
+    if (paced) {
 #ifdef DEBUG_DIAG
-    pacedio_hit_count++;
+      pacedio_hit_count++;
 #endif
-    ps_write_8_paced((uint32_t)address, value);
-  } else {
-    ps_write_8((uint32_t)address, value);
+      ps_write_8_paced((uint32_t)address, value);
+      for (int _i = 1; _i < paced; _i++)
+        paced_dummy_cycle_1();
+    } else {
+      ps_write_8((uint32_t)address, value);
+    }
   }
   return;
 }

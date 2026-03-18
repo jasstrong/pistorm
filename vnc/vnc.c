@@ -33,6 +33,10 @@ static void write_be16(uint8_t *p, uint16_t v) {
     p[1] = (uint8_t)(v);
 }
 
+/* Shadow copy of 1bpp framebuffer for dirty-row detection */
+static uint8_t shadow_fb[MAC_SCREEN_STRIDE * MAC_SCREEN_H];
+static int shadow_valid = 0;
+
 static void expand_screen(const uint8_t *ram, uint32_t ram_size, char *framebuf) {
     uint32_t scrn_base = read_be32(ram + SCRNBASE_ADDR);
 
@@ -44,17 +48,27 @@ static void expand_screen(const uint8_t *ram, uint32_t ram_size, char *framebuf)
     }
 
     const uint8_t *src = ram + scrn_base;
-    char *dst = framebuf;
 
     for (int row = 0; row < MAC_SCREEN_H; row++) {
+        const uint8_t *row_src = src + row * MAC_SCREEN_STRIDE;
+        uint8_t *row_shadow = shadow_fb + row * MAC_SCREEN_STRIDE;
+
+        /* Skip rows that haven't changed */
+        if (shadow_valid && memcmp(row_src, row_shadow, MAC_SCREEN_STRIDE) == 0)
+            continue;
+
+        /* Row changed — update shadow and expand */
+        memcpy(row_shadow, row_src, MAC_SCREEN_STRIDE);
+        char *dst = framebuf + row * MAC_SCREEN_W;
         for (int col = 0; col < MAC_SCREEN_STRIDE; col++) {
-            uint8_t byte = src[row * MAC_SCREEN_STRIDE + col];
+            uint8_t byte = row_src[col];
             /* Mac convention: bit set = black (0x00), bit clear = white (0xFF) */
             for (int bit = 7; bit >= 0; bit--) {
                 *dst++ = (byte & (1 << bit)) ? 0x00 : (char)0xFF;
             }
         }
     }
+    shadow_valid = 1;
 }
 
 static void vnc_ptr_event(int buttonMask, int x, int y, rfbClientPtr cl) {
@@ -211,8 +225,10 @@ static void vnc_kbd_event(rfbBool down, rfbKeySym keySym, rfbClientPtr cl) {
 static void *vnc_thread(void *arg) {
     struct vnc_config *cfg = (struct vnc_config *)arg;
 
-    int argc = 0;
-    rfbScreenInfoPtr screen = rfbGetScreen(&argc, NULL,
+    /* Pass -encodings raw to disable compression */
+    int argc = 3;
+    char *argv[] = { "pistorm", "-encodings", "raw", NULL };
+    rfbScreenInfoPtr screen = rfbGetScreen(&argc, argv,
                                            MAC_SCREEN_W, MAC_SCREEN_H,
                                            8,   /* bitsPerSample */
                                            1,   /* samplesPerPixel */

@@ -2335,9 +2335,28 @@ static inline void m68ki_exception_bus_error(m68ki_cpu_core *state)
 extern int cpu_log_enabled;
 
 /* Exception for A-Line instructions */
+/* Ring buffer of recent A-line traps for debugging unimplemented trap crashes */
+#define ALINE_RING_SIZE 256
+extern uint32_t aline_ring_pc[ALINE_RING_SIZE];
+extern uint16_t aline_ring_trap[ALINE_RING_SIZE];
+extern unsigned int aline_ring_idx;
+extern void aline_ring_dump(void);
+
+/* Address of the _Unimplemented trap handler — set at runtime */
+extern uint32_t unimp_trap_addr;
+extern int unimp_trap_addr_valid;
+
 static inline void m68ki_exception_1010(m68ki_cpu_core *state)
 {
 	uint sr;
+
+	/* A-line ring buffer — disabled for performance */
+	/* unsigned int ri = aline_ring_idx & (ALINE_RING_SIZE - 1);
+	aline_ring_pc[ri] = ADDRESS_68K(REG_PPC);
+	aline_ring_trap[ri] = REG_IR;
+	aline_ring_idx++; */
+
+
 #if M68K_LOG_1010_1111 == OPT_ON
 	M68K_DO_LOG_EMU((M68K_LOG_FILEHANDLE "%s at %08x: called 1010 instruction %04x (%s)\n",
 					 m68ki_cpu_names[CPU_TYPE], ADDRESS_68K(REG_PPC), REG_IR,
@@ -2358,6 +2377,7 @@ static inline void m68ki_exception_1111(m68ki_cpu_core *state)
 	uint sr;
 
 	printf("[LINE-F] PC=%08X opcode=%04X SR=%04X\n", ADDRESS_68K(REG_PPC), REG_IR, m68ki_get_sr(state));
+	aline_ring_dump();
 	printf("  D: %08X %08X %08X %08X %08X %08X %08X %08X\n",
 		REG_DA[0], REG_DA[1], REG_DA[2], REG_DA[3],
 		REG_DA[4], REG_DA[5], REG_DA[6], REG_DA[7]);

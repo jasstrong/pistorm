@@ -56,6 +56,21 @@ extern void m68ki_build_opcode_table(void);
 
 volatile int  m68ki_initial_cycles;
 volatile int  m68ki_remaining_cycles = 0;                     /* Number of clocks remaining */
+
+/* A-line trap ring buffer — definitions (declared extern in m68kcpu.h) */
+uint32_t aline_ring_pc[ALINE_RING_SIZE];
+uint16_t aline_ring_trap[ALINE_RING_SIZE];
+unsigned int aline_ring_idx = 0;
+uint32_t unimp_trap_addr = 0;
+int unimp_trap_addr_valid = 0;
+void aline_ring_dump(void) {
+	printf("[A-LINE] Last %d traps:\n", ALINE_RING_SIZE);
+	for (int i = 0; i < ALINE_RING_SIZE; i++) {
+		unsigned int j = (aline_ring_idx + i) & (ALINE_RING_SIZE - 1);
+		if (aline_ring_trap[j])
+			printf("  [%3d] PC=%08X trap=$%04X\n", i, aline_ring_pc[j], aline_ring_trap[j]);
+	}
+}
 uint m68ki_tracing = 0;
 uint m68ki_address_space;
 

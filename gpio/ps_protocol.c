@@ -211,12 +211,11 @@ unsigned int ps_read_8(unsigned int address) {
 
   *(gpio + 10) = 0xffffec;
 
-  value = (value >> 8) & 0xffff;
-
+  unsigned int raw16 = (value >> 8) & 0xffff;
   if ((address & 1) == 0)
-    return (value >> 8) & 0xff;  // EVEN, A0=0,UDS
+    return (raw16 >> 8) & 0xff;  // EVEN, A0=0,UDS
   else
-    return value & 0xff;  // ODD , A0=1,LDS
+    return raw16 & 0xff;  // ODD , A0=1,LDS
 }
 
 unsigned int ps_read_32(unsigned int address) {
@@ -329,14 +328,51 @@ unsigned int ps_read_8_paced(unsigned int address) {
 
   *(gpio + 10) = 0xffffec;
 
+  unsigned int raw16 = (value >> 8) & 0xffff;
+
   PACED_DUMMY_CYCLES();
 
-  value = (value >> 8) & 0xffff;
-
   if ((address & 1) == 0)
-    return (value >> 8) & 0xff;  // EVEN, A0=0,UDS
+    return (raw16 >> 8) & 0xff;  // EVEN, A0=0,UDS
   else
-    return value & 0xff;  // ODD , A0=1,LDS
+    return raw16 & 0xff;  // ODD , A0=1,LDS
+}
+
+// Like ps_read_8_paced but always returns upper byte (D8-D15).
+// For devices whose data bus is wired to D8-D15 where the BBU doesn't
+// always steer to D0-D7 (e.g. IWM during SET register accesses).
+unsigned int ps_read_8_paced_hi(unsigned int address) {
+  *(gpio + 0) = GPFSEL0_OUTPUT;
+  *(gpio + 1) = GPFSEL1_OUTPUT;
+  *(gpio + 2) = GPFSEL2_OUTPUT;
+
+  *(gpio + 7) = ((address & 0xffff) << 8) | (REG_ADDR_LO << PIN_A0);
+  *(gpio + 7) = 1 << PIN_WR;
+  *(gpio + 10) = 1 << PIN_WR;
+  *(gpio + 10) = 0xffffec;
+
+  *(gpio + 7) = ((0x0300 | (address >> 16)) << 8) | (REG_ADDR_HI << PIN_A0);
+  *(gpio + 7) = 1 << PIN_WR;
+  *(gpio + 10) = 1 << PIN_WR;
+  *(gpio + 10) = 0xffffec;
+
+  *(gpio + 0) = GPFSEL0_INPUT;
+  *(gpio + 1) = GPFSEL1_INPUT;
+  *(gpio + 2) = GPFSEL2_INPUT;
+
+  *(gpio + 7) = (REG_DATA << PIN_A0);
+  *(gpio + 7) = 1 << PIN_RD;
+
+  while (*(gpio + 13) & (1 << PIN_TXN_IN_PROGRESS)) {}
+  unsigned int value = *(gpio + 13);
+
+  *(gpio + 10) = 0xffffec;
+
+  unsigned int raw16 = (value >> 8) & 0xffff;
+
+  PACED_DUMMY_CYCLES();
+
+  return (raw16 >> 8) & 0xff;  // Always D8-D15
 }
 
 void ps_write_8_paced(unsigned int address, unsigned int data) {
