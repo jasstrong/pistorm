@@ -216,6 +216,16 @@ module pistorm(
   wire S6 = state == 2'd3 && c7m;
   wire S7 = state == 2'd0 && !c7m && !wait_req;
 
+  /* Delay /AS deassertion by ~10ns (2 c200m cycles) to give the BBU
+   * time to hold /DEVSEL while the data latch captures at S7.
+   * Assertion is immediate (AND gate); only deassertion is delayed. */
+  wire as_raw_n = !(S2 || S3 || S4 || Sw || S5 || S6);
+  reg [1:0] as_deassert_delay;
+  always @(posedge c200m) begin
+    as_deassert_delay <= {as_deassert_delay[0], as_raw_n};
+  end
+  wire as_delayed_n = as_raw_n & as_deassert_delay[1];
+
   always @(*) begin
     LTCH_A_OE_n <= !(S1 || S2 || S3 || S4 || Sw || S5 || S6 || S7);
     LTCH_D_WR_OE_n <= !(!op_rw && (S3 || S4 || Sw || S5 || S6 || S7));
@@ -223,7 +233,7 @@ module pistorm(
     LTCH_D_RD_U <= S7;
     LTCH_D_RD_L <= S7;
 
-    M68K_AS_n <= !(S2 || S3 || S4 || Sw || S5 || S6);
+    M68K_AS_n <= as_delayed_n;
     M68K_UDS_n <= (op_rw && (S2 || S3)) || (S4 || Sw || S5 || S6) ? op_uds_n : 1'b1;
     M68K_LDS_n <= (op_rw && (S2 || S3)) || (S4 || Sw || S5 || S6) ? op_lds_n : 1'b1;
   end
