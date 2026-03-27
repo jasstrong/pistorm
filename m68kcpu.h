@@ -2568,19 +2568,50 @@ static inline void m68ki_exception_illegal(m68ki_cpu_core *state)
 				uint32_t pc_i = ADDRESS_68K(state->pc_trace[idx]);
 				if (pc_i > 0 && pc_i != fpc) { caller_pc = pc_i; break; }
 			}
-			/* Surgical fix: patch only the specific instruction that jumped here */
+			/* Instruction-pattern scan: find ALL $4xxxxx in the code block */
 			if (caller_pc && caller_pc < 0x400000) {
-				/* Scan ±8 bytes of caller for this EXACT poison address */
-				for (uint32_t scan = caller_pc > 8 ? caller_pc - 8 : 0;
-				     scan <= caller_pc + 6 && scan < 0x400000 - 3; scan += 2) {
-					uint32_t val = m68ki_read_32(state, scan);
-					if (val == fpc) {
-						m68ki_write_32(state, scan, new_pc);
-						printf("  [POISON-FIX] $%06X: $%08X → $%08X (add to fixup table!)\n",
-						       scan, fpc, new_pc);
-						break;
+				/* Find block boundaries from PC history */
+				uint32_t blk_lo = caller_pc, blk_hi = caller_pc;
+				for (int hi = 0; hi < 32; hi++) {
+					int idx = (state->pc_trace_idx + hi) & 31;
+					uint32_t pc_i = ADDRESS_68K(state->pc_trace[idx]);
+					if (pc_i > 0 && pc_i < 0x400000) {
+						if (pc_i < blk_lo) blk_lo = pc_i;
+						if (pc_i > blk_hi) blk_hi = pc_i;
 					}
 				}
+				/* Extend to 4KB around the block */
+				uint32_t scan_lo = blk_lo > 0x800 ? blk_lo - 0x800 : 0;
+				uint32_t scan_hi = blk_hi + 0x800;
+				if (scan_hi > 0x400000) scan_hi = 0x400000;
+				/* Scan for instruction patterns with $004xxxxx operands */
+				int patched = 0;
+				for (uint32_t s = scan_lo; s < scan_hi - 5; s += 2) {
+					uint16_t op = m68ki_read_16(state, s);
+					int is_abs = 0;
+					/* JSR/JMP abs.L, LEA abs.L, PEA abs.L */
+					if (op == 0x4EF9 || op == 0x4EB9 || op == 0x4879 ||
+					    op == 0x41F9 || op == 0x43F9 || op == 0x45F9 ||
+					    op == 0x47F9 || op == 0x49F9 || op == 0x4BF9 || op == 0x4DF9)
+						is_abs = 1;
+					/* MOVE.L #imm,Dn / MOVEA.L #imm,An */
+					if ((op & 0xF1FF) == 0x203C || (op & 0xF1FF) == 0x207C)
+						is_abs = 1;
+					/* MOVE.L #imm,abs.W / MOVE.L #imm,abs.L */
+					if (op == 0x21FC || op == 0x23FC)
+						is_abs = 1;
+					if (is_abs) {
+						uint32_t val = m68ki_read_32(state, s + 2);
+						if (val >= 0x00400000 && val < 0x00440000) {
+							uint32_t fixed = val + 0x400000;
+							m68ki_write_32(state, s + 2, fixed);
+							patched++;
+						}
+					}
+				}
+				if (patched)
+					printf("  [BLOCK-FIX] %d instruction patches in $%06X-$%06X\n",
+					       patched, scan_lo, scan_hi);
 			}
 			/* Suppress repeated redirects to same address */
 			{
