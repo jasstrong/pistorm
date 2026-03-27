@@ -6,6 +6,7 @@
 #include <ctype.h>
 #include "platforms/platforms.h"
 #include "platforms/shared/rtc.h"
+#include "gpio/ps_protocol.h"
 #include "vnc/vnc.h"
 
 //#define DEBUG_MAC_PLATFORM
@@ -231,11 +232,43 @@ void shutdown_platform_mac68k(struct emulator_config *cfg) {
     printf("[MAC68K] Platform shutdown completed.\n");
 }
 
+/* Big SE: remap SCSI from $880000 to $580000 on the SE bus */
+#define BIGSE_SCSI_VIRT  0x880000
+#define BIGSE_SCSI_SIZE  0x080000
+#define BIGSE_SCSI_PHYS  0x580000
+
+int custom_read_mac68k(struct emulator_config *cfg, unsigned int addr,
+                       unsigned int *val, unsigned char type) {
+    if (cfg) {}
+    if (ovl_sysrom_pos >= 0x800000 &&
+        addr >= BIGSE_SCSI_VIRT && addr < BIGSE_SCSI_VIRT + BIGSE_SCSI_SIZE) {
+        uint32_t phys = addr - BIGSE_SCSI_VIRT + BIGSE_SCSI_PHYS;
+        /* SE bus is 8/16-bit; SCSI chip is on D8-D15 with stride $10 */
+        *val = ps_read_8(phys);
+        (void)type;
+        return 1;
+    }
+    return -1;
+}
+
+int custom_write_mac68k(struct emulator_config *cfg, unsigned int addr,
+                        unsigned int val, unsigned char type) {
+    if (cfg) {}
+    if (ovl_sysrom_pos >= 0x800000 &&
+        addr >= BIGSE_SCSI_VIRT && addr < BIGSE_SCSI_VIRT + BIGSE_SCSI_SIZE) {
+        uint32_t phys = addr - BIGSE_SCSI_VIRT + BIGSE_SCSI_PHYS;
+        ps_write_8(phys, val);
+        (void)type;
+        return 1;
+    }
+    return -1;
+}
+
 void create_platform_mac68k(struct platform_config *cfg, char *subsys) {
     cfg->register_read = NULL;
     cfg->register_write = NULL;
-    cfg->custom_read = NULL;
-    cfg->custom_write = NULL;
+    cfg->custom_read = custom_read_mac68k;
+    cfg->custom_write = custom_write_mac68k;
     cfg->platform_initial_setup = setup_platform_mac68k;
     cfg->handle_reset = handle_reset_mac68k;
     cfg->shutdown = shutdown_platform_mac68k;

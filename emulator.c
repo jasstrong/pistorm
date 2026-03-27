@@ -48,6 +48,7 @@
 #define KEY_POLL_INTERVAL_MSEC 5000
 
 unsigned int ovl;
+extern uint32_t ovl_sysrom_pos;
 
 int kb_hook_enabled = 0;
 int mouse_hook_enabled = 0;
@@ -748,9 +749,9 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			/* Record previous program counter */
 			REG_PPC = REG_PC;
 
-			/* PC trace ring buffer — disabled for performance */
-			/* state->pc_trace[state->pc_trace_idx & 31] = REG_PC;
-			state->pc_trace_idx = (state->pc_trace_idx + 1) & 31; */
+			/* PC trace ring buffer */
+			state->pc_trace[state->pc_trace_idx & 31] = REG_PC;
+			state->pc_trace_idx = (state->pc_trace_idx + 1) & 31;
 
 			/* Record previous D/A register state (in case of bus error) */
 //#define M68K_BUSERR_THING
@@ -1861,11 +1862,17 @@ static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t 
       break;
     case PLATFORM_MAC:
       /* Mac SE BBU clears OVL on first access to ROM/SCSI range */
-      if (ovl && addr >= 0x400000 && addr < 0x600000) {
+      if (ovl && addr >= ovl_sysrom_pos && addr < ovl_sysrom_pos + 0x100000) {
         ovl = 0;
         m68ki_cpu.ovl = 0;
         printf("[MAC] OVL off (read from ROM/SCSI range %08X).\n", addr);
         handle_ovl_mappings_mac68k(cfg);
+      }
+      /* Custom read handler (Big SE SCSI remap, etc.) */
+      if (cfg->platform->custom_read &&
+          cfg->platform->custom_read(cfg, addr, &target, type) != -1) {
+        *res = target;
+        return 1;
       }
       break;
     default:
@@ -2071,11 +2078,16 @@ static inline int32_t platform_write_check(uint8_t type, uint32_t addr, uint32_t
        *  ($40 0000 through $5F FFFF), RAM appears at $00 0000."
        * OVL is only re-asserted by a hardware reset.
        */
-      if (ovl && addr >= 0x400000 && addr < 0x600000) {
+      if (ovl && addr >= ovl_sysrom_pos && addr < ovl_sysrom_pos + 0x100000) {
         ovl = 0;
         m68ki_cpu.ovl = 0;
         printf("[MAC] OVL off (write to ROM/SCSI range %08X).\n", addr);
         handle_ovl_mappings_mac68k(cfg);
+      }
+      /* Custom write handler (Big SE SCSI remap, etc.) */
+      if (cfg->platform->custom_write &&
+          cfg->platform->custom_write(cfg, addr, val, type) != -1) {
+        return 1;
       }
       break;
     }
