@@ -456,25 +456,34 @@ char keyboard_file[256] = "/dev/input/event1";
 int gestalt_trap_intercept(void) {
   if (!cfg || cfg->platform->id != PLATFORM_MAC)
     return 0;
-  if (cpu_type != M68K_CPU_TYPE_68030 && cpu_type != M68K_CPU_TYPE_68030_24 &&
-      cpu_type != M68K_CPU_TYPE_68040 && cpu_type != M68K_CPU_TYPE_68040_24)
-    return 0;
 
   uint32_t selector = m68k_get_reg(NULL, M68K_REG_D0);
   uint32_t result;
 
   int is_040 = (cpu_type == M68K_CPU_TYPE_68040 || cpu_type == M68K_CPU_TYPE_68040_24);
+  int is_030 = (cpu_type == M68K_CPU_TYPE_68030 || cpu_type == M68K_CPU_TYPE_68030_24);
+  int is_big_se = (ovl_sysrom_pos >= 0x800000);  /* Big SE: ROM at $800000 */
 
   if (selector == 0x70726F63) {  // 'proc'
-    result = is_040 ? 5 : 4;
+    if (is_040) result = 5;
+    else if (is_030) result = 4;
+    else return 0;
   } else if (selector == 0x66707520) {  // 'fpu '
-    result = 3;  // gestalt68040FPU for both 68030 and 68040
+    if (is_040 || is_030) result = 3;
+    else return 0;
   } else if (selector == 0x6D6D7520) {  // 'mmu '
-    result = is_040 ? 3 : 2;  // gestaltMMU68040 or gestaltMMU68030
+    if (is_040) result = 3;
+    else if (is_030) result = 2;
+    else return 0;
   } else if (selector == 0x63707574) {  // 'cput' (gestaltNativeCPUtype)
-    result = is_040 ? 0x104 : 0x103;
+    if (is_040) result = 0x104;
+    else if (is_030) result = 0x103;
+    else return 0;
   } else if (selector == 0x6D616368) {  // 'mach' (gestaltMachineType)
-    result = is_040 ? 22 : 9;  // gestaltQuadra700 (68040) or gestaltMacSE030 (68030)
+    if (is_big_se) result = 6;          // gestaltMacII — ROM at $800000 in 24-bit
+    else if (is_040) result = 22;       // gestaltQuadra700
+    else if (is_030) result = 9;        // gestaltMacSE030
+    else return 0;
   } else {
     return 0;  // not handled — let the trap dispatcher run
   }

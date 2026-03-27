@@ -1395,6 +1395,16 @@ static inline uint m68ki_read_32_fc(m68ki_cpu_core *state, uint address, uint fc
 // M68KI_WRITE_8_FC
 static inline void m68ki_write_8_fc(m68ki_cpu_core *state, uint address, uint fc, uint value)
 {
+	/* Big SE: trace byte writes to $0326-$0327 */
+	{
+		uint a = ADDRESS_68K(address);
+		if (a == 0x326 || a == 0x327) {
+			extern uint32_t ovl_sysrom_pos;
+			if (ovl_sysrom_pos >= 0x800000)
+				printf("[W8_%03X] $%06X ← $%02X  PC=$%06X\n",
+				       a, a, value & 0xFF, ADDRESS_68K(REG_PC));
+		}
+	}
 	m68ki_set_fc(fc); /* auto-disable (see m68kcpu.h) */
 	state->mmu_tmp_fc = fc;
 	state->mmu_tmp_rw = 0;
@@ -1438,6 +1448,25 @@ static inline void m68ki_write_8_fc(m68ki_cpu_core *state, uint address, uint fc
 // M68KI_WRITE_16_FC
 static inline void m68ki_write_16_fc(m68ki_cpu_core *state, uint address, uint fc, uint value)
 {
+	/* Big SE: trace all writes to $0326 AND reads from $0326 via the MOVE.W */
+	if (ADDRESS_68K(address) == 0x000326) {
+		extern uint32_t ovl_sysrom_pos;
+		if (ovl_sysrom_pos >= 0x800000)
+			printf("[W0326] W16 $0326 ← $%04X  PC=$%06X\n",
+			       value, ADDRESS_68K(REG_PC));
+	}
+	/* Catch the MOVE.W $0326,(A2)+ at PC=$80A472 — log what it writes */
+	if (ADDRESS_68K(REG_PC) == 0x80A476) { /* PC is AFTER the instruction */
+		extern uint32_t ovl_sysrom_pos;
+		if (ovl_sysrom_pos >= 0x800000) {
+			static int a472_log = 0;
+			if (a472_log++ < 5)
+				printf("[A472] W16 $%06X ← $%04X  val@326=$%04X  PC=$%06X\n",
+				       ADDRESS_68K(address), value,
+				       m68ki_read_16(state, 0x326),
+				       ADDRESS_68K(REG_PC));
+		}
+	}
 	m68ki_set_fc(fc); /* auto-disable (see m68kcpu.h) */
 	state->mmu_tmp_fc = fc;
 	state->mmu_tmp_rw = 0;
@@ -1501,14 +1530,31 @@ static inline void m68ki_write_32_fc(m68ki_cpu_core *state, uint address, uint f
 	/* 68000/010/EC020: mask to 24-bit before fast-path range checks */
 	address = ADDRESS_68K(address);
 
-	/* Big SE: catch writes of $00400000 to heap area only (skip RAM test) */
-	if (value == 0x00400000 && address >= 0x8000 && address < 0x400000) {
+	/* Big SE: proactive patching for KNOWN ROM addresses only.
+	 * These are ROM routine addresses referenced by System 7 patches.
+	 * Built iteratively from crash logs. */
+	if (value >= 0x00400000 && value < 0x00440000 && ADDRESS_68K(address) < 0x400000) {
 		extern uint32_t ovl_sysrom_pos;
 		if (ovl_sysrom_pos >= 0x800000) {
-			uint32_t _pc = ADDRESS_68K(REG_PC);
-			if (_pc >= 0x800000) /* only ROM code, not RAM test */
-				printf("[ROM400] W32 $%06X ← $%08X  PC=$%06X\n",
-				       address, value, _pc);
+			static const uint32_t fixup_table[] = {
+				0x00404058, 0x0041A2A0, 0x0041A2C4, 0x0041A2AA,
+				0x0041A2E4, 0x00417708, 0x0041A8C8, 0x0041A898,
+				0x0041A51C, 0x0041A376, 0x0043375C, 0x00434709,
+				0x00403FEA, 0x0040BBCE, 0x0040BC4A, 0x00402C50,
+				0x0040839E,
+				0  /* sentinel */
+			};
+			for (const uint32_t *p = fixup_table; *p; p++) {
+				if (value == *p) {
+					value += 0x400000;
+					static int wl_log = 0;
+					if (wl_log++ < 30)
+						printf("[FIXUP] $%06X: $%08X → $%08X  PC=$%06X\n",
+						       ADDRESS_68K(address), value - 0x400000, value,
+						       ADDRESS_68K(REG_PC));
+					break;
+				}
+			}
 		}
 	}
 
@@ -2511,27 +2557,50 @@ static inline void m68ki_exception_illegal(m68ki_cpu_core *state)
 		printf("\n");
 		{ extern void dump_scsi_log(const char *); dump_scsi_log("ILLEGAL"); }
 
-		/* Big SE: when hitting poison zone, dump the RAM code block */
+		/* Big SE: auto-fixup poison hits — patch $4xxxxx → $8xxxxx and continue */
 		printf("  [POISON-CHECK] fpc=$%06X IR=$%04X\n", fpc, REG_IR);
 		if (fpc >= 0x400000 && fpc < 0x800000 && REG_IR == 0x4AFC) {
-			uint32_t ram_pc = 0;
+			uint32_t new_pc = fpc + 0x400000;
+			/* Find the caller that JSR/JMP'd here */
+			uint32_t caller_pc = 0;
 			for (int hi = 31; hi >= 0; hi--) {
 				int idx = (state->pc_trace_idx + hi) & 31;
 				uint32_t pc_i = ADDRESS_68K(state->pc_trace[idx]);
-				if (pc_i > 0 && pc_i < 0x400000) { ram_pc = pc_i; break; }
+				if (pc_i > 0 && pc_i != fpc) { caller_pc = pc_i; break; }
 			}
-			printf("\n  [POISON] fpc=$%06X ram_pc=$%06X\n", fpc, ram_pc);
-			if (ram_pc) {
-				uint32_t ds = (ram_pc > 0x100) ? (ram_pc - 0x100) & ~1 : 0;
-				uint32_t de = ram_pc + 0x100;
-				printf("  [POISON-DUMP] $%06X-$%06X:\n", ds, de);
-				for (uint32_t a = ds; a < de; a += 16) {
-					printf("  %06X:", a);
-					for (int b = 0; b < 16; b += 2)
-						printf(" %04X", m68ki_read_16(state, a + b));
-					printf("\n");
+			/* Surgical fix: patch only the specific instruction that jumped here */
+			if (caller_pc && caller_pc < 0x400000) {
+				/* Scan ±8 bytes of caller for this EXACT poison address */
+				for (uint32_t scan = caller_pc > 8 ? caller_pc - 8 : 0;
+				     scan <= caller_pc + 6 && scan < 0x400000 - 3; scan += 2) {
+					uint32_t val = m68ki_read_32(state, scan);
+					if (val == fpc) {
+						m68ki_write_32(state, scan, new_pc);
+						printf("  [POISON-FIX] $%06X: $%08X → $%08X (add to fixup table!)\n",
+						       scan, fpc, new_pc);
+						break;
+					}
 				}
 			}
+			/* Suppress repeated redirects to same address */
+			{
+				static uint32_t last_fpc = 0;
+				static int repeat_count = 0;
+				if (fpc == last_fpc) {
+					repeat_count++;
+					if (repeat_count == 100)
+						printf("  [POISON-REDIR] $%06X → $%06X (suppressing repeats)\n", fpc, new_pc);
+				} else {
+					if (repeat_count > 100)
+						printf("  [POISON-REDIR] $%06X repeated %d times\n", last_fpc, repeat_count);
+					repeat_count = 0;
+				}
+				last_fpc = fpc;
+			}
+			/* Redirect execution to $8xxxxx */
+			printf("  [POISON-REDIR] $%06X → $%06X (caller=$%06X)\n", fpc, new_pc, caller_pc);
+			REG_PC = new_pc;
+			return;
 		}
 	}
 
