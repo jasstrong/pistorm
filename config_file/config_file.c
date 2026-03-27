@@ -4,6 +4,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/types.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "rominfo.h"
 
@@ -238,12 +242,33 @@ void add_mapping(struct emulator_config *cfg, unsigned int type, unsigned int ad
     case MAPTYPE_RAM:
       printf("[CFG] Allocating %d bytes for RAM mapping (%d MB)...\n", size, size / 1024 / 1024);
 alloc_mapram:
-      cfg->map_data[index] = (unsigned char *)malloc(size);
-      if (!cfg->map_data[index]) {
-        printf("[CFG] ERROR: Unable to allocate memory for mapped RAM!\n");
-        goto mapping_failed;
+      {
+        /* mmap RAM to a file for live debugging (hex editor, etc.) */
+        char ram_path[256];
+        snprintf(ram_path, sizeof(ram_path), "pistorm-ram-%s.bin", map_id);
+        int ram_fd = open(ram_path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (ram_fd >= 0) {
+          ftruncate(ram_fd, size);
+          cfg->map_data[index] = (unsigned char *)mmap(NULL, size,
+            PROT_READ | PROT_WRITE, MAP_SHARED, ram_fd, 0);
+          if (cfg->map_data[index] == MAP_FAILED) {
+            printf("[CFG] mmap failed, falling back to malloc\n");
+            close(ram_fd);
+            cfg->map_data[index] = NULL;
+          } else {
+            memset(cfg->map_data[index], 0x00, size);
+            printf("[CFG] RAM mmap'd to %s (%d bytes)\n", ram_path, size);
+          }
+        }
+        if (!cfg->map_data[index]) {
+          cfg->map_data[index] = (unsigned char *)malloc(size);
+          if (!cfg->map_data[index]) {
+            printf("[CFG] ERROR: Unable to allocate memory for mapped RAM!\n");
+            goto mapping_failed;
+          }
+          memset(cfg->map_data[index], 0x00, size);
+        }
       }
-      memset(cfg->map_data[index], 0x00, size);
       if (type == MAPTYPE_RAM_WTC) {
         // This may look a bit weird, but it adds a read range for the WTC RAM. Writes still go through to the mapped read/write functions.
         m68k_add_rom_range(cfg->map_offset[index], cfg->map_high[index], cfg->map_data[index]);

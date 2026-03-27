@@ -91,6 +91,30 @@ def patch_rom(infile, outfile):
     for l in log:
         print(l)
 
+    # === 3. Exception vector data table at $19E8 (64 longwords) ===
+    print("\n=== Exception vector table at $19E8 ===")
+    for i in range(64):
+        off = 0x19E8 + i * 4
+        if patch32(off, 0x400000, 0x800000):
+            pass  # logged by patch32
+    for l in log[len(log)-63:]:
+        print(l)
+    log.clear()
+
+    # === 4. Brute-force: patch ALL remaining $00400000 in main code section ===
+    # The ROM stores ROMBase ($400000) as data constants in various places.
+    # These aren't caught by instruction-pattern matching.
+    print("\n=== Remaining $00400000 values (data constants) ===")
+    for i in range(0, min(half, 0x1B000), 4):  # main code section only
+        val = struct.unpack_from('>I', rom, i)[0]
+        if val == 0x00400000:
+            struct.pack_into('>I', rom, i, 0x00800000)
+            patches += 1
+            log.append(f"  ${i+0x800000:06X} (+${i:05X}): $00400000 → $00800000 (data const)")
+    for l in log:
+        print(l)
+    log.clear()
+
     print(f"\n=== Total patches: {patches} ===")
 
     # Fix checksum: ROM uses 32-bit sum of all 16-bit words from offset 4 to end,

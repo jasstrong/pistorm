@@ -1501,6 +1501,17 @@ static inline void m68ki_write_32_fc(m68ki_cpu_core *state, uint address, uint f
 	/* 68000/010/EC020: mask to 24-bit before fast-path range checks */
 	address = ADDRESS_68K(address);
 
+	/* Big SE: catch writes of $00400000 to heap area only (skip RAM test) */
+	if (value == 0x00400000 && address >= 0x8000 && address < 0x400000) {
+		extern uint32_t ovl_sysrom_pos;
+		if (ovl_sysrom_pos >= 0x800000) {
+			uint32_t _pc = ADDRESS_68K(REG_PC);
+			if (_pc >= 0x800000) /* only ROM code, not RAM test */
+				printf("[ROM400] W32 $%06X ← $%08X  PC=$%06X\n",
+				       address, value, _pc);
+		}
+	}
+
 	address_translation_cache *cache = &state->fc_write_translation_cache;
 	if(cache->offset && address >= cache->lower && address < cache->upper)
 	{
@@ -2499,6 +2510,29 @@ static inline void m68ki_exception_illegal(m68ki_cpu_core *state)
 			printf(" %04X", m68ki_read_16(state, 0x3A5F40 + i * 2));
 		printf("\n");
 		{ extern void dump_scsi_log(const char *); dump_scsi_log("ILLEGAL"); }
+
+		/* Big SE: when hitting poison zone, dump the RAM code block */
+		printf("  [POISON-CHECK] fpc=$%06X IR=$%04X\n", fpc, REG_IR);
+		if (fpc >= 0x400000 && fpc < 0x800000 && REG_IR == 0x4AFC) {
+			uint32_t ram_pc = 0;
+			for (int hi = 31; hi >= 0; hi--) {
+				int idx = (state->pc_trace_idx + hi) & 31;
+				uint32_t pc_i = ADDRESS_68K(state->pc_trace[idx]);
+				if (pc_i > 0 && pc_i < 0x400000) { ram_pc = pc_i; break; }
+			}
+			printf("\n  [POISON] fpc=$%06X ram_pc=$%06X\n", fpc, ram_pc);
+			if (ram_pc) {
+				uint32_t ds = (ram_pc > 0x100) ? (ram_pc - 0x100) & ~1 : 0;
+				uint32_t de = ram_pc + 0x100;
+				printf("  [POISON-DUMP] $%06X-$%06X:\n", ds, de);
+				for (uint32_t a = ds; a < de; a += 16) {
+					printf("  %06X:", a);
+					for (int b = 0; b < 16; b += 2)
+						printf(" %04X", m68ki_read_16(state, a + b));
+					printf("\n");
+				}
+			}
+		}
 	}
 
 	if (m68ki_illg_callback(REG_IR))

@@ -2366,6 +2366,17 @@ void m68k_write_memory_16(unsigned int address, unsigned int value) {
   // 68000 has 24-bit address bus — mask upper 8 bits
   address &= 0x00FFFFFF;
 
+  /* Big SE: catch decompressor writing $0040 high word (potential $004xxxxx) */
+  { extern uint32_t ovl_sysrom_pos;
+    if (ovl_sysrom_pos >= 0x800000 && address < 0x400000 &&
+        value == 0x0040) {
+      static int decomp16_log = 0;
+      if (decomp16_log++ < 10)
+        printf("[DECOMP-WR16] $%06X ← $%04X  PC=$%06X\n",
+               address, value, m68k_get_reg(NULL, M68K_REG_PC) & 0xFFFFFF);
+    }
+  }
+
   if (platform_write_check(OP_TYPE_WORD, address, value))
     return;
 
@@ -2415,6 +2426,17 @@ void m68k_write_memory_16(unsigned int address, unsigned int value) {
 void m68k_write_memory_32(unsigned int address, unsigned int value) {
   // 68000 has 24-bit address bus — mask upper 8 bits
   address &= 0x00FFFFFF;
+
+  /* Big SE: catch decompressor writing $004xxxxx values to RAM */
+  { extern uint32_t ovl_sysrom_pos;
+    if (ovl_sysrom_pos >= 0x800000 && address < 0x400000 &&
+        value >= 0x00400000 && value <= 0x004FFFFF) {
+      static int decomp_log = 0;
+      if (decomp_log++ < 30)
+        printf("[DECOMP-WR32] $%06X ← $%08X  PC=$%06X\n",
+               address, value, m68k_get_reg(NULL, M68K_REG_PC) & 0xFFFFFF);
+    }
+  }
 
   if (platform_write_check(OP_TYPE_LONGWORD, address, value))
     return;
