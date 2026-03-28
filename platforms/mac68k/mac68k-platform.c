@@ -237,6 +237,12 @@ void shutdown_platform_mac68k(struct emulator_config *cfg) {
 #define BIGSE_SCSI_SIZE  0x080000
 #define BIGSE_SCSI_PHYS  0x580000
 
+/* Big SE: video buffer remap — top 64K of 8MB ($7F0000) → top 64K of
+ * physical 4MB ($3F0000) so the BBU reads correct pixel data for the CRT. */
+#define BIGSE_VBUF_VIRT  0x7F0000
+#define BIGSE_VBUF_SIZE  0x010000
+#define BIGSE_VBUF_PHYS  0x3F0000
+
 int custom_read_mac68k(struct emulator_config *cfg, unsigned int addr,
                        unsigned int *val, unsigned char type) {
     if (cfg) {}
@@ -254,12 +260,29 @@ int custom_read_mac68k(struct emulator_config *cfg, unsigned int addr,
 int custom_write_mac68k(struct emulator_config *cfg, unsigned int addr,
                         unsigned int val, unsigned char type) {
     if (cfg) {}
-    if (ovl_sysrom_pos >= 0x800000 &&
-        addr >= BIGSE_SCSI_VIRT && addr < BIGSE_SCSI_VIRT + BIGSE_SCSI_SIZE) {
-        uint32_t phys = addr - BIGSE_SCSI_VIRT + BIGSE_SCSI_PHYS;
-        ps_write_8(phys, val);
-        (void)type;
-        return 1;
+    if (ovl_sysrom_pos >= 0x800000) {
+        /* SCSI remap */
+        if (addr >= BIGSE_SCSI_VIRT && addr < BIGSE_SCSI_VIRT + BIGSE_SCSI_SIZE) {
+            uint32_t phys = addr - BIGSE_SCSI_VIRT + BIGSE_SCSI_PHYS;
+            ps_write_8(phys, val);
+            (void)type;
+            return 1;
+        }
+        /* Video buffer remap — WTC already wrote to Pi RAM buffer;
+         * now send the write to the physical SE bus for the BBU/CRT. */
+        if (addr >= BIGSE_VBUF_VIRT && addr < BIGSE_VBUF_VIRT + BIGSE_VBUF_SIZE) {
+            uint32_t phys = addr - BIGSE_VBUF_VIRT + BIGSE_VBUF_PHYS;
+            /* type: 0=byte, 1=word, 2=longword (enum map_op_types) */
+            if (type >= 2) {  /* longword */
+                ps_write_16(phys, val >> 16);
+                ps_write_16(phys + 2, val & 0xFFFF);
+            } else if (type == 1) {  /* word */
+                ps_write_16(phys, val);
+            } else {
+                ps_write_8(phys, val);
+            }
+            return 1;
+        }
     }
     return -1;
 }

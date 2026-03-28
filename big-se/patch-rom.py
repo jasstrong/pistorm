@@ -70,7 +70,7 @@ def patch_rom(infile, outfile):
 
     # CMPI.L #imm patterns (less likely to be addresses, but scan anyway)
 
-    print("\n=== Absolute address instructions (ROM $4xxxxx → $8xxxxx) ===")
+    print("\n=== Absolute address instructions (ROM $4xxxxx → $8xxxxx, $3Fxxxx → $7Fxxxx) ===")
     for off in range(0, half - 5, 2):
         opcode = struct.unpack_from('>H', rom, off)[0]
 
@@ -80,12 +80,17 @@ def patch_rom(infile, outfile):
                 log[-1] = f"  {abs_opcodes[opcode]:10s} " + log[-1].split(': ', 1)[1]
             if patch32(off + 2, 0x580000, 0x880000):
                 log[-1] = f"  {abs_opcodes[opcode]:10s} " + log[-1].split(': ', 1)[1]
+            # Video/sound buffer: $3F0000-$3FFFFF → $7F0000-$7FFFFF
+            if patch32(off + 2, 0x3F0000, 0x7F0000):
+                log[-1] = f"  {abs_opcodes[opcode]:10s} " + log[-1].split(': ', 1)[1]
 
         elif opcode in moveq_imm:
             # Next 4 bytes are the immediate value
             if patch32(off + 2, 0x400000, 0x800000):
                 log[-1] = f"  {moveq_imm[opcode]:10s} " + log[-1].split(': ', 1)[1]
             if patch32(off + 2, 0x580000, 0x880000):
+                log[-1] = f"  {moveq_imm[opcode]:10s} " + log[-1].split(': ', 1)[1]
+            if patch32(off + 2, 0x3F0000, 0x7F0000):
                 log[-1] = f"  {moveq_imm[opcode]:10s} " + log[-1].split(': ', 1)[1]
 
     for l in log:
@@ -114,6 +119,22 @@ def patch_rom(infile, outfile):
     for l in log:
         print(l)
     log.clear()
+
+    # === 5. Force MemTop = 8MB at end of sizing routine ===
+    # At $401CFE, MOVEA.L SP,A6 copies the sizing result (4MB) to A6 (MemTop).
+    # Replace with MOVEA.L #$800000,A6 — all BBU/VIA config runs normally
+    # (so the BBU knows the physical 4MB layout), but the system sees 8MB.
+    # The MOVEA.W #$400,SP that followed is sacrificed, but the vector copy
+    # at $401D04 doesn't use the stack, and $800048 sets up its own SP.
+    print("\n=== Memory sizing: force MemTop = 8MB ===")
+    sizing_patch = bytes([
+        0x2C, 0x7C, 0x00, 0x80, 0x00, 0x00,  # MOVEA.L #$800000, A6
+    ])
+    off = 0x1CFE
+    old_bytes = bytes(rom[off:off+len(sizing_patch)])
+    rom[off:off+len(sizing_patch)] = sizing_patch
+    patches += 1
+    print(f"  ${off+0x800000:06X} (+${off:05X}): {old_bytes.hex()} → {sizing_patch.hex()}")
 
     print(f"\n=== Total patches: {patches} ===")
 

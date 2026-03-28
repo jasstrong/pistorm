@@ -1448,25 +1448,44 @@ static inline void m68ki_write_8_fc(m68ki_cpu_core *state, uint address, uint fc
 // M68KI_WRITE_16_FC
 static inline void m68ki_write_16_fc(m68ki_cpu_core *state, uint address, uint fc, uint value)
 {
-	/* Big SE: trace all writes to $0326 AND reads from $0326 via the MOVE.W */
-	if (ADDRESS_68K(address) == 0x000326) {
+	/* Big SE: proactive instruction fixup on 16-bit write.
+	 * When writing to RAM, check if we just completed a $004xxxxx
+	 * operand after a known opcode. If so, patch both halves. */
+	{
 		extern uint32_t ovl_sysrom_pos;
-		if (ovl_sysrom_pos >= 0x800000)
-			printf("[W0326] W16 $0326 ← $%04X  PC=$%06X\n",
-			       value, ADDRESS_68K(REG_PC));
-	}
-	/* Catch the MOVE.W $0326,(A2)+ at PC=$80A472 — log what it writes */
-	if (ADDRESS_68K(REG_PC) == 0x80A476) { /* PC is AFTER the instruction */
-		extern uint32_t ovl_sysrom_pos;
-		if (ovl_sysrom_pos >= 0x800000) {
-			static int a472_log = 0;
-			if (a472_log++ < 5)
-				printf("[A472] W16 $%06X ← $%04X  val@326=$%04X  PC=$%06X\n",
-				       ADDRESS_68K(address), value,
-				       m68ki_read_16(state, 0x326),
-				       ADDRESS_68K(REG_PC));
+		uint32_t a = ADDRESS_68K(address);
+		if (ovl_sysrom_pos >= 0x800000 && a >= 4 && a < 0x400000) {
+			/* Check: is there a known opcode at a-4 with $0040-$0043 at a-2? */
+			uint16_t hi_word = m68ki_read_16(state, a - 2);
+			if (hi_word >= 0x0040 && hi_word <= 0x0043) {
+				uint16_t opcode = m68ki_read_16(state, a - 4);
+				int is_abs = 0;
+				static const uint16_t abs_ops[] = {
+					0x4EF9, 0x4EB9, 0x4879,
+					0x41F9, 0x43F9, 0x45F9, 0x47F9, 0x49F9, 0x4BF9, 0x4DF9,
+					0x21FC, 0x23FC, 0
+				};
+				for (const uint16_t *p = abs_ops; *p; p++)
+					if (opcode == *p) { is_abs = 1; break; }
+				if ((opcode & 0xF1FF) == 0x203C || (opcode & 0xF1FF) == 0x207C)
+					is_abs = 1;
+				if (is_abs) {
+					uint32_t full = ((uint32_t)hi_word << 16) | value;
+					if (full >= 0x00400000 && full < 0x00440000) {
+						/* Patch both halves */
+						uint32_t fixed = full + 0x400000;
+						m68ki_write_16(state, a - 2, fixed >> 16);
+						value = fixed & 0xFFFF;
+						static int w16fix_log = 0;
+						if (w16fix_log++ < 30)
+							printf("[W16-FIX] $%06X: %04X $%08X → $%08X  PC=$%06X\n",
+							       a - 4, opcode, full, fixed, ADDRESS_68K(REG_PC));
+					}
+				}
+			}
 		}
 	}
+	/* (debug hooks for $0326 tracing removed) */
 	m68ki_set_fc(fc); /* auto-disable (see m68kcpu.h) */
 	state->mmu_tmp_fc = fc;
 	state->mmu_tmp_rw = 0;
@@ -1530,33 +1549,7 @@ static inline void m68ki_write_32_fc(m68ki_cpu_core *state, uint address, uint f
 	/* 68000/010/EC020: mask to 24-bit before fast-path range checks */
 	address = ADDRESS_68K(address);
 
-	/* Big SE: proactive patching for KNOWN ROM addresses only.
-	 * These are ROM routine addresses referenced by System 7 patches.
-	 * Built iteratively from crash logs. */
-	if (value >= 0x00400000 && value < 0x00440000 && ADDRESS_68K(address) < 0x400000) {
-		extern uint32_t ovl_sysrom_pos;
-		if (ovl_sysrom_pos >= 0x800000) {
-			static const uint32_t fixup_table[] = {
-				0x00404058, 0x0041A2A0, 0x0041A2C4, 0x0041A2AA,
-				0x0041A2E4, 0x00417708, 0x0041A8C8, 0x0041A898,
-				0x0041A51C, 0x0041A376, 0x0043375C, 0x00434709,
-				0x00403FEA, 0x0040BBCE, 0x0040BC4A, 0x00402C50,
-				0x0040839E,
-				0  /* sentinel */
-			};
-			for (const uint32_t *p = fixup_table; *p; p++) {
-				if (value == *p) {
-					value += 0x400000;
-					static int wl_log = 0;
-					if (wl_log++ < 30)
-						printf("[FIXUP] $%06X: $%08X → $%08X  PC=$%06X\n",
-						       ADDRESS_68K(address), value - 0x400000, value,
-						       ADDRESS_68K(REG_PC));
-					break;
-				}
-			}
-		}
-	}
+	/* Big SE: no write-time fixup — using proactive scan instead. */
 
 	address_translation_cache *cache = &state->fc_write_translation_cache;
 	if(cache->offset && address >= cache->lower && address < cache->upper)
@@ -2405,6 +2398,13 @@ extern int unimp_trap_addr_valid;
 
 static inline void m68ki_exception_1010(m68ki_cpu_core *state)
 {
+	/* Gestalt trap ($A1AD) intercept — report 68030/FPU/MMU to System */
+	if (REG_IR == 0xA1AD) {
+		extern int gestalt_trap_intercept(void);
+		if (gestalt_trap_intercept())
+			return;  /* handled — PC already past the A-line word */
+	}
+
 	uint sr;
 
 	/* A-line ring buffer — disabled for performance */
@@ -2606,6 +2606,9 @@ static inline void m68ki_exception_illegal(m68ki_cpu_core *state)
 							uint32_t fixed = val + 0x400000;
 							m68ki_write_32(state, s + 2, fixed);
 							patched++;
+							if (patched <= 30)
+								printf("    $%06X: %04X $%08X → $%08X\n",
+								       s, op, val, fixed);
 						}
 					}
 				}

@@ -755,6 +755,86 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			/* Call external hook to peek at CPU */
 			m68ki_instr_hook(REG_PC); /* auto-disable (see m68kcpu.h) */
 
+			/* Big SE: force MemTop to 8MB after memory sizing returns.
+			 * $800048 is the first instruction after the sizing JMP.
+			 * A6 (FP) holds MemTop; low-mem $108 holds it later. */
+			{
+				extern uint32_t ovl_sysrom_pos;
+				static int memtop_done = 0;
+				if (!memtop_done && ovl_sysrom_pos >= 0x800000 &&
+				    ADDRESS_68K(REG_PC) == 0x800048) {
+					uint32_t old = REG_DA[14];
+					REG_DA[14] = 0x800000;
+					printf("[BIG-SE] MemTop forced: A6=$%06X → $800000\n", old);
+					memtop_done = 1;
+				}
+			}
+
+			/* Big SE: scan loaded code regions for $4xxxxx operands.
+			 * Two triggers:
+			 * 1. Device Manager dispatch at $81A424 = JMP (A0)
+			 * 2. First entry into any 64K region $01xxxx-$07xxxx
+			 * The dispatch hook catches Device Manager patches;
+			 * the region-entry hook catches Sound Manager etc. */
+			{
+				extern uint32_t ovl_sysrom_pos;
+				if (ovl_sysrom_pos >= 0x800000) {
+					uint32_t pc24 = ADDRESS_68K(REG_PC);
+					int do_scan = 0;
+					uint32_t scan_lo = 0, scan_hi = 0;
+
+					/* Trigger 1: Device Manager dispatch */
+					if (pc24 == 0x81A424) {
+						uint32_t a0 = ADDRESS_68K(REG_DA[8]);
+						if (a0 >= 0x010000 && a0 < 0x080000) {
+							scan_lo = a0 & 0xFF0000;
+							scan_hi = scan_lo + 0x10000;
+							do_scan = 1;
+						}
+					}
+
+					/* Trigger 2: first entry into loaded code region */
+					{
+						static uint8_t rgn_scanned[8];
+						unsigned rgn = pc24 >> 16;
+						if (rgn >= 1 && rgn <= 7 && !rgn_scanned[rgn]) {
+							rgn_scanned[rgn] = 1;
+							scan_lo = rgn << 16;
+							scan_hi = scan_lo + 0x10000;
+							do_scan = 1;
+						}
+					}
+
+					if (do_scan) {
+						int patched = 0;
+						static const uint16_t abs_ops[] = {
+							0x4EF9, 0x4EB9, 0x4879,
+							0x41F9, 0x43F9, 0x45F9, 0x47F9,
+							0x49F9, 0x4BF9, 0x4DF9,
+							0x21FC, 0x23FC, 0
+						};
+						for (uint32_t s = scan_lo; s < scan_hi - 5; s += 2) {
+							uint16_t op = m68ki_read_16(state, s);
+							int is_abs = 0;
+							for (const uint16_t *p = abs_ops; *p; p++)
+								if (op == *p) { is_abs = 1; break; }
+							if ((op & 0xF1FF) == 0x203C || (op & 0xF1FF) == 0x207C)
+								is_abs = 1;
+							if (is_abs) {
+								uint32_t val = m68ki_read_32(state, s + 2);
+								if (val >= 0x00400000 && val < 0x00440000) {
+									m68ki_write_32(state, s + 2, val + 0x400000);
+									patched++;
+								}
+							}
+						}
+						if (patched)
+							printf("[PRESCAN] %d patches in $%06X-$%06X (PC=$%06X)\n",
+								patched, scan_lo, scan_hi, pc24);
+					}
+				}
+			}
+
 			/* Record previous program counter */
 			REG_PPC = REG_PC;
 
