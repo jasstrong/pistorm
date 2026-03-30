@@ -885,6 +885,14 @@ cpu_loop:
     }
   }
 
+  {
+    static unsigned int cycle_count = 0;
+    if (++cycle_count >= 10000) {
+      cycle_count = 0;
+      printf("[PC] $%06X\n", m68k_get_reg(NULL, M68K_REG_PC) & 0xFFFFFF);
+    }
+  }
+
 #ifdef DEBUG_DIAG
   {
     // Diagnostic: dump Sound Driver state when stuck at $4031BE/$4031C2

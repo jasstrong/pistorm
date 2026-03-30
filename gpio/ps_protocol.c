@@ -194,12 +194,12 @@ void ps_setup_protocol() {
     printf("[GPIO] Pi 4: skipping GPCLK setup (use gpclk.ko module)\n");
 
   *(gpio + 10) = 0xffffec;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 0) = GPFSEL0_INPUT;
   *(gpio + 1) = GPFSEL1_INPUT;
   *(gpio + 2) = GPFSEL2_INPUT;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   /* Release Mac from reset FIRST — the CPLD holds RESET_n low at power-on
    * (status[1]=0). Without releasing reset, the SE bus won't assert DTACK
@@ -236,79 +236,67 @@ void ps_setup_protocol() {
   printf("[GPIO] TXN=%d IPL=%d (GPLEV0=0x%08X)\n",
          (lev >> 0) & 1, (lev >> 1) & 1, lev);
 
-  /* Bus transaction test using real GPCLK (never touch GPIO4!) */
-  printf("[GPIO] Bus transaction test...\n");
-  uint32_t txn0 = (*(gpio + 13) >> PIN_TXN_IN_PROGRESS) & 1;
-  printf("[GPIO]   initial TXN=%d\n", txn0);
-
-  /* Write ADDR_LO — should set TXN high */
-  *(gpio + 0) = GPFSEL0_OUTPUT;
-  *(gpio + 1) = GPFSEL1_OUTPUT;
-  *(gpio + 2) = GPFSEL2_OUTPUT;
-  GPIO_SYNC;
-  GPIO_WRITEREG(REG_DATA, 0);
-  GPIO_WRITEREG(REG_ADDR_LO, 0);
-  usleep(100);
-  uint32_t txn1 = (*(gpio + 13) >> PIN_TXN_IN_PROGRESS) & 1;
-  printf("[GPIO]   after ADDR_LO: TXN=%d (expect 1)\n", txn1);
-
-  /* Write ADDR_HI — triggers bus cycle */
-  GPIO_WRITEREG(REG_ADDR_HI, 0x0200);
-  *(gpio + 0) = GPFSEL0_INPUT;
-  *(gpio + 1) = GPFSEL1_INPUT;
-  *(gpio + 2) = GPFSEL2_INPUT;
-  GPIO_SYNC;
-
-  /* Wait for TXN to clear (bus cycle complete) */
-  int timeout = 1000000;
-  while ((*(gpio + 13) & (1 << PIN_TXN_IN_PROGRESS)) && --timeout > 0) {}
-  uint32_t txn2 = (*(gpio + 13) >> PIN_TXN_IN_PROGRESS) & 1;
-  printf("[GPIO]   after bus cycle: TXN=%d (timeout=%s)\n",
-         txn2, timeout == 0 ? "YES" : "no");
-
-  if (txn1 == 1 && txn2 == 0)
-    printf("[GPIO] CPLD communication OK\n");
-  else
-    printf("[GPIO] CPLD communication FAILED\n");
+  /* Bus transaction stress test */
+  printf("[GPIO] Stress test (1000 transactions)...\n");
+  int pass = 0, fail = 0;
+  for (int t = 0; t < 1000; t++) {
+    GPFSEL_OUTPUT;
+    GPIO_WRITEREG(REG_ADDR_LO, 0x0000);
+    GPIO_WRITEREG(REG_ADDR_HI, 0x0240);
+    GPFSEL_INPUT;
+    GPIO_PIN_RD;
+    int timeout = 1000000;
+    while ((*(gpio + 13) & (1 << PIN_TXN_IN_PROGRESS)) && --timeout > 0) {}
+    unsigned int value = *(gpio + 13);
+    *(gpio + 10) = 0xFFFFEC;
+    GPIO_FLUSH; GPIO_SYNC;
+    if (timeout == 0) {
+      printf("[GPIO]   FAIL at %d: GPLEV0=0x%08X\n", t, value);
+      fail++;
+      break;
+    }
+    pass++;
+  }
+  printf("[GPIO] Result: %d pass, %d fail\n", pass, fail);
 }
 
 void ps_write_16(unsigned int address, unsigned int data) {
   *(gpio + 0) = GPFSEL0_OUTPUT;
   *(gpio + 1) = GPFSEL1_OUTPUT;
   *(gpio + 2) = GPFSEL2_OUTPUT;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 7) = ((data & 0xffff) << 8) | (REG_DATA << PIN_A0);
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 0xffffec;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 7) = ((address & 0xffff) << 8) | (REG_ADDR_LO << PIN_A0);
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 0xffffec;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 7) = ((0x0000 | (address >> 16)) << 8) | (REG_ADDR_HI << PIN_A0);
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 0xffffec;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 0) = GPFSEL0_INPUT;
   *(gpio + 1) = GPFSEL1_INPUT;
   *(gpio + 2) = GPFSEL2_INPUT;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   while (*(gpio + 13) & (1 << PIN_TXN_IN_PROGRESS)) {}
 }
@@ -320,39 +308,39 @@ void ps_write_8(unsigned int address, unsigned int data) {
   *(gpio + 0) = GPFSEL0_OUTPUT;
   *(gpio + 1) = GPFSEL1_OUTPUT;
   *(gpio + 2) = GPFSEL2_OUTPUT;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 7) = ((data & 0xffff) << 8) | (REG_DATA << PIN_A0);
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 0xffffec;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 7) = ((address & 0xffff) << 8) | (REG_ADDR_LO << PIN_A0);
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 0xffffec;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 7) = ((0x0100 | (address >> 16)) << 8) | (REG_ADDR_HI << PIN_A0);
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 0xffffec;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 0) = GPFSEL0_INPUT;
   *(gpio + 1) = GPFSEL1_INPUT;
   *(gpio + 2) = GPFSEL2_INPUT;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   while (*(gpio + 13) & (1 << PIN_TXN_IN_PROGRESS)) {}
 }
@@ -368,42 +356,42 @@ unsigned int ps_read_16(unsigned int address) {
   *(gpio + 0) = GPFSEL0_OUTPUT;
   *(gpio + 1) = GPFSEL1_OUTPUT;
   *(gpio + 2) = GPFSEL2_OUTPUT;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 7) = ((address & 0xffff) << 8) | (REG_ADDR_LO << PIN_A0);
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 0xffffec;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 7) = ((0x0200 | (address >> 16)) << 8) | (REG_ADDR_HI << PIN_A0);
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 0xffffec;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 0) = GPFSEL0_INPUT;
   *(gpio + 1) = GPFSEL1_INPUT;
   *(gpio + 2) = GPFSEL2_INPUT;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 7) = (REG_DATA << PIN_A0);
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_RD;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   while (*(gpio + 13) & (1 << PIN_TXN_IN_PROGRESS)) {}
   GPIO_SYNC;
   unsigned int value = *(gpio + 13);
 
   *(gpio + 10) = 0xffffec;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   return (value >> 8) & 0xffff;
 }
@@ -412,42 +400,42 @@ unsigned int ps_read_8(unsigned int address) {
   *(gpio + 0) = GPFSEL0_OUTPUT;
   *(gpio + 1) = GPFSEL1_OUTPUT;
   *(gpio + 2) = GPFSEL2_OUTPUT;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 7) = ((address & 0xffff) << 8) | (REG_ADDR_LO << PIN_A0);
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 0xffffec;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 7) = ((0x0300 | (address >> 16)) << 8) | (REG_ADDR_HI << PIN_A0);
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 0xffffec;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 0) = GPFSEL0_INPUT;
   *(gpio + 1) = GPFSEL1_INPUT;
   *(gpio + 2) = GPFSEL2_INPUT;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 7) = (REG_DATA << PIN_A0);
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_RD;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   while (*(gpio + 13) & (1 << PIN_TXN_IN_PROGRESS)) {}
   GPIO_SYNC;
   unsigned int value = *(gpio + 13);
 
   *(gpio + 10) = 0xffffec;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   unsigned int raw16 = (value >> 8) & 0xffff;
   if ((address & 1) == 0)
@@ -476,53 +464,53 @@ void paced_dummy_cycles(void) {
   *(gpio + 0) = GPFSEL0_OUTPUT;
   *(gpio + 1) = GPFSEL1_OUTPUT;
   *(gpio + 2) = GPFSEL2_OUTPUT;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   for (int i = 0; i < 3; i++) {
     uint32_t addr = 0x400000 + (i * 2);  // ROM range — BBU responds immediately
 
     *(gpio + 7) = ((addr & 0xffff) << 8) | (REG_ADDR_LO << PIN_A0);
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
     *(gpio + 7) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
     *(gpio + 10) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
     *(gpio + 10) = 0xffffec;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
     *(gpio + 7) = ((0x0200 | (addr >> 16)) << 8) | (REG_ADDR_HI << PIN_A0);
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
     *(gpio + 7) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
     *(gpio + 10) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
     *(gpio + 10) = 0xffffec;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
     *(gpio + 0) = GPFSEL0_INPUT;
     *(gpio + 1) = GPFSEL1_INPUT;
     *(gpio + 2) = GPFSEL2_INPUT;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
     *(gpio + 7) = (REG_DATA << PIN_A0);
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
     *(gpio + 7) = 1 << PIN_RD;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
     while (*(gpio + 13) & (1 << PIN_TXN_IN_PROGRESS)) {}
     *(gpio + 10) = 0xffffec;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
     *(gpio + 0) = GPFSEL0_OUTPUT;
     *(gpio + 1) = GPFSEL1_OUTPUT;
     *(gpio + 2) = GPFSEL2_OUTPUT;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   }
 
   *(gpio + 0) = GPFSEL0_INPUT;
   *(gpio + 1) = GPFSEL1_INPUT;
   *(gpio + 2) = GPFSEL2_INPUT;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 }
 
 // Single dummy read cycle — minimum bus activity to let the BBU advance.
@@ -530,39 +518,39 @@ void paced_dummy_cycle_1(void) {
   *(gpio + 0) = GPFSEL0_OUTPUT;
   *(gpio + 1) = GPFSEL1_OUTPUT;
   *(gpio + 2) = GPFSEL2_OUTPUT;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 7) = ((0x400000 & 0xffff) << 8) | (REG_ADDR_LO << PIN_A0);
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 0xffffec;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 7) = ((0x0200 | (0x400000 >> 16)) << 8) | (REG_ADDR_HI << PIN_A0);
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 0xffffec;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 0) = GPFSEL0_INPUT;
   *(gpio + 1) = GPFSEL1_INPUT;
   *(gpio + 2) = GPFSEL2_INPUT;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 7) = (REG_DATA << PIN_A0);
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_RD;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   while (*(gpio + 13) & (1 << PIN_TXN_IN_PROGRESS)) {}
   *(gpio + 10) = 0xffffec;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 }
 
 #define PACED_DUMMY_CYCLES() paced_dummy_cycle_1()
@@ -571,42 +559,42 @@ unsigned int ps_read_8_paced(unsigned int address) {
   *(gpio + 0) = GPFSEL0_OUTPUT;
   *(gpio + 1) = GPFSEL1_OUTPUT;
   *(gpio + 2) = GPFSEL2_OUTPUT;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 7) = ((address & 0xffff) << 8) | (REG_ADDR_LO << PIN_A0);
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 0xffffec;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 7) = ((0x0300 | (address >> 16)) << 8) | (REG_ADDR_HI << PIN_A0);
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 0xffffec;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 0) = GPFSEL0_INPUT;
   *(gpio + 1) = GPFSEL1_INPUT;
   *(gpio + 2) = GPFSEL2_INPUT;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 7) = (REG_DATA << PIN_A0);
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_RD;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   while (*(gpio + 13) & (1 << PIN_TXN_IN_PROGRESS)) {}
   GPIO_SYNC;
   unsigned int value = *(gpio + 13);
 
   *(gpio + 10) = 0xffffec;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   unsigned int raw16 = (value >> 8) & 0xffff;
 
@@ -625,42 +613,42 @@ unsigned int ps_read_8_paced_hi(unsigned int address) {
   *(gpio + 0) = GPFSEL0_OUTPUT;
   *(gpio + 1) = GPFSEL1_OUTPUT;
   *(gpio + 2) = GPFSEL2_OUTPUT;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 7) = ((address & 0xffff) << 8) | (REG_ADDR_LO << PIN_A0);
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 0xffffec;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 7) = ((0x0300 | (address >> 16)) << 8) | (REG_ADDR_HI << PIN_A0);
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 0xffffec;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 0) = GPFSEL0_INPUT;
   *(gpio + 1) = GPFSEL1_INPUT;
   *(gpio + 2) = GPFSEL2_INPUT;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 7) = (REG_DATA << PIN_A0);
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_RD;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   while (*(gpio + 13) & (1 << PIN_TXN_IN_PROGRESS)) {}
   GPIO_SYNC;
   unsigned int value = *(gpio + 13);
 
   *(gpio + 10) = 0xffffec;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   unsigned int raw16 = (value >> 8) & 0xffff;
 
@@ -676,39 +664,39 @@ void ps_write_8_paced(unsigned int address, unsigned int data) {
   *(gpio + 0) = GPFSEL0_OUTPUT;
   *(gpio + 1) = GPFSEL1_OUTPUT;
   *(gpio + 2) = GPFSEL2_OUTPUT;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 7) = ((data & 0xffff) << 8) | (REG_DATA << PIN_A0);
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 0xffffec;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 7) = ((address & 0xffff) << 8) | (REG_ADDR_LO << PIN_A0);
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 0xffffec;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 7) = ((0x0100 | (address >> 16)) << 8) | (REG_ADDR_HI << PIN_A0);
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 0xffffec;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 0) = GPFSEL0_INPUT;
   *(gpio + 1) = GPFSEL1_INPUT;
   *(gpio + 2) = GPFSEL2_INPUT;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   while (*(gpio + 13) & (1 << PIN_TXN_IN_PROGRESS)) {}
 
@@ -719,46 +707,46 @@ void ps_write_status_reg(unsigned int value) {
   *(gpio + 0) = GPFSEL0_OUTPUT;
   *(gpio + 1) = GPFSEL1_OUTPUT;
   *(gpio + 2) = GPFSEL2_OUTPUT;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 7) = ((value & 0xffff) << 8) | (REG_STATUS << PIN_A0);
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 7) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_WR;
-  GPIO_SYNC; // delay
+  GPIO_FLUSH; GPIO_SYNC; // delay
 #ifdef CHIP_FASTPATH
   *(gpio + 7) = 1 << PIN_WR;
-  GPIO_SYNC; // delay 210810
+  GPIO_FLUSH; GPIO_SYNC; // delay 210810
 #endif
   *(gpio + 10) = 1 << PIN_WR;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 0xffffec;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 0) = GPFSEL0_INPUT;
   *(gpio + 1) = GPFSEL1_INPUT;
   *(gpio + 2) = GPFSEL2_INPUT;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 }
 
 unsigned int ps_read_status_reg() {
   *(gpio + 7) = (REG_STATUS << PIN_A0);
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_RD;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_RD;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_RD;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_RD;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 #ifdef CHIP_FASTPATH
   *(gpio + 7) = 1 << PIN_RD;
-  GPIO_SYNC; // delay 210810
+  GPIO_FLUSH; GPIO_SYNC; // delay 210810
   *(gpio + 7) = 1 << PIN_RD;
-  GPIO_SYNC; // delay 210810
+  GPIO_FLUSH; GPIO_SYNC; // delay 210810
 #endif
 
   /* Status read is combinational in the CPLD — no TXN involvement.
@@ -766,7 +754,7 @@ unsigned int ps_read_status_reg() {
   unsigned int value = *(gpio + 13);
 
   *(gpio + 10) = 0xffffec;
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
   return (value >> 8) & 0xffff;
 }

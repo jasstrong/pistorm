@@ -94,26 +94,24 @@ extern unsigned int ps_peri_base;
   asm volatile("dsb sy" ::: "memory"); \
   while ((*(gpio + 13)) & (1 << PIN_CLK)) {} \
   while (!((*(gpio + 13)) & (1 << PIN_CLK))) {} \
-  while ((*(gpio + 13)) & (1 << PIN_CLK)) {} \
-  while (!((*(gpio + 13)) & (1 << PIN_CLK))) {} \
   asm volatile("dsb sy" ::: "memory"); \
 } while(0)
 
 #define GPIO_WRITEREG(reg, val) \
   *(gpio + 7) = (val << 8) | (reg << PIN_A0); \
-  GPIO_SYNC; \
+  GPIO_FLUSH; GPIO_SYNC; \
   *(gpio + 7) = 1 << PIN_WR; \
-  GPIO_SYNC; \
+  GPIO_FLUSH; GPIO_SYNC; \
   *(gpio + 10) = 1 << PIN_WR; \
-  GPIO_SYNC; \
+  GPIO_FLUSH; GPIO_SYNC; \
   *(gpio + 10) = 0xFFFFEC; \
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
 #define GPIO_PIN_RD \
   *(gpio + 7) = (REG_DATA << PIN_A0); \
-  GPIO_SYNC; \
+  GPIO_FLUSH; GPIO_SYNC; \
   *(gpio + 7) = 1 << PIN_RD; \
-  GPIO_SYNC;
+  GPIO_FLUSH; GPIO_SYNC;
 
 #define WAIT_TXN \
   while (*(gpio + 13) & (1 << PIN_TXN_IN_PROGRESS)) {}
