@@ -240,9 +240,12 @@ void ps_setup_protocol() {
   printf("[GPIO] Stress test (1000 transactions)...\n");
   int pass = 0, fail = 0;
   for (int t = 0; t < 1000; t++) {
+    uint32_t txn_before = *(gpio + 13) & 1;
     GPFSEL_OUTPUT;
     GPIO_WRITEREG(REG_ADDR_LO, 0x0000);
+    uint32_t txn_after_lo = *(gpio + 13) & 1;
     GPIO_WRITEREG(REG_ADDR_HI, 0x0240);
+    uint32_t txn_after_hi = *(gpio + 13) & 1;
     GPFSEL_INPUT;
     GPIO_PIN_RD;
     int timeout = 1000000;
@@ -251,7 +254,8 @@ void ps_setup_protocol() {
     *(gpio + 10) = 0xFFFFEC;
     GPIO_FLUSH; GPIO_SYNC;
     if (timeout == 0) {
-      printf("[GPIO]   FAIL at %d: GPLEV0=0x%08X\n", t, value);
+      printf("[GPIO]   FAIL at %d: before=%d after_LO=%d after_HI=%d GPLEV0=0x%08X\n",
+             t, txn_before, txn_after_lo, txn_after_hi, value);
       fail++;
       break;
     }

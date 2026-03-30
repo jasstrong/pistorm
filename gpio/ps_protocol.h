@@ -85,33 +85,41 @@ extern unsigned int ps_peri_base;
  * On Pi 4 (Device-nGnRE mapping), writes can be acknowledged before
  * reaching the peripheral. A readback from any GPIO register forces
  * all pending writes to complete. */
-#define GPIO_FLUSH do { asm volatile("dsb st" ::: "memory"); (void)(*(volatile unsigned *)(gpio + 13)); } while(0)
-
-/* Wait for 2 CPLD clock edges (low→high→low→high) on GPIO4.
- * This ensures the CPLD has sampled our pin state on at least
- * 2 rising edges — enough for the 2-stage synchronizer. */
-#define GPIO_SYNC do { \
+/* Match Pi 3 GPIO timing: ~50ns between register writes.
+ * DSB forces the write into the AXI fabric, readback forces it to
+ * the peripheral, NOPs provide ~50ns fixed delay matching the
+ * Pi 3's natural A53 write-to-write timing. */
+#define GPIO_WAIT do { \
   asm volatile("dsb sy" ::: "memory"); \
-  while ((*(gpio + 13)) & (1 << PIN_CLK)) {} \
-  while (!((*(gpio + 13)) & (1 << PIN_CLK))) {} \
-  asm volatile("dsb sy" ::: "memory"); \
+  (void)(*(volatile unsigned *)(gpio + 13)); \
+  asm volatile( \
+    "nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; " \
+    "nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; " \
+    "nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; " \
+    "nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; " \
+    "nop; nop; nop; nop; nop; nop; nop; nop; nop; nop"  \
+    ::: "memory"); \
 } while(0)
 
 #define GPIO_WRITEREG(reg, val) \
   *(gpio + 7) = (val << 8) | (reg << PIN_A0); \
-  GPIO_FLUSH; GPIO_SYNC; \
+  GPIO_WAIT; \
   *(gpio + 7) = 1 << PIN_WR; \
-  GPIO_FLUSH; GPIO_SYNC; \
+  GPIO_WAIT; \
   *(gpio + 10) = 1 << PIN_WR; \
-  GPIO_FLUSH; GPIO_SYNC; \
+  GPIO_WAIT; \
   *(gpio + 10) = 0xFFFFEC; \
-  GPIO_FLUSH; GPIO_SYNC;
+  GPIO_WAIT;
 
 #define GPIO_PIN_RD \
   *(gpio + 7) = (REG_DATA << PIN_A0); \
-  GPIO_FLUSH; GPIO_SYNC; \
+  GPIO_WAIT; \
   *(gpio + 7) = 1 << PIN_RD; \
-  GPIO_FLUSH; GPIO_SYNC;
+  GPIO_WAIT;
+
+/* Keep GPIO_FLUSH and GPIO_SYNC as aliases for code that uses them */
+#define GPIO_FLUSH GPIO_WAIT
+#define GPIO_SYNC GPIO_WAIT
 
 #define WAIT_TXN \
   while (*(gpio + 13) & (1 << PIN_TXN_IN_PROGRESS)) {}
