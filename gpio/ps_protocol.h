@@ -67,24 +67,6 @@ extern unsigned int ps_peri_base;
 #define GPFSEL1_OUTPUT 0x09249249
 #define GPFSEL2_OUTPUT 0x00000249
 
-#define GPFSEL_OUTPUT \
-  *(gpio + 10) = 0xFFFFEC; \
-  GPIO_FLUSH; \
-  *(gpio + 0) = GPFSEL0_OUTPUT; \
-  *(gpio + 1) = GPFSEL1_OUTPUT; \
-  *(gpio + 2) = GPFSEL2_OUTPUT; \
-  GPIO_FLUSH;
-
-#define GPFSEL_INPUT \
-  *(gpio + 0) = GPFSEL0_INPUT; \
-  *(gpio + 1) = GPFSEL1_INPUT; \
-  *(gpio + 2) = GPFSEL2_INPUT; \
-  GPIO_FLUSH;
-
-/* Force GPIO write to reach the peripheral before continuing.
- * On Pi 4 (Device-nGnRE mapping), writes can be acknowledged before
- * reaching the peripheral. A readback from any GPIO register forces
- * all pending writes to complete. */
 /* Match Pi 3 GPIO timing: ~50ns between register writes.
  * DSB forces the write into the AXI fabric, readback forces it to
  * the peripheral, NOPs provide ~50ns fixed delay matching the
@@ -100,6 +82,23 @@ extern unsigned int ps_peri_base;
     "nop; nop; nop; nop; nop; nop; nop; nop; nop; nop"  \
     ::: "memory"); \
 } while(0)
+
+#define GPFSEL_OUTPUT \
+  *(gpio + 10) = 0xFFFFEC; \
+  GPIO_WAIT; \
+  *(gpio + 0) = GPFSEL0_OUTPUT; \
+  *(gpio + 1) = GPFSEL1_OUTPUT; \
+  *(gpio + 2) = GPFSEL2_OUTPUT; \
+  GPIO_WAIT;
+
+#define GPFSEL_INPUT \
+  *(gpio + 0) = GPFSEL0_INPUT; \
+  *(gpio + 1) = GPFSEL1_INPUT; \
+  *(gpio + 2) = GPFSEL2_INPUT; \
+  GPIO_WAIT;
+
+#define GPIO_FLUSH GPIO_WAIT
+#define GPIO_SYNC GPIO_WAIT
 
 #define GPIO_WRITEREG(reg, val) \
   *(gpio + 7) = (val << 8) | (reg << PIN_A0); \

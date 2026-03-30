@@ -236,6 +236,62 @@ void ps_setup_protocol() {
   printf("[GPIO] TXN=%d IPL=%d (GPLEV0=0x%08X)\n",
          (lev >> 0) & 1, (lev >> 1) & 1, lev);
 
+  /* Step-by-step single read diagnostic */
+  {
+    printf("[GPIO] Step-by-step read from $400000...\n");
+    GPFSEL_OUTPUT;
+    printf("  1. GPFSEL=OUT:     GPLEV0=0x%08X\n", *(gpio+13));
+    GPIO_WRITEREG(REG_ADDR_LO, 0x0000);
+    printf("  2. After ADDR_LO:  GPLEV0=0x%08X TXN=%d\n", *(gpio+13), *(gpio+13)&1);
+    GPIO_WRITEREG(REG_ADDR_HI, 0x0240);
+    printf("  3. After ADDR_HI:  GPLEV0=0x%08X TXN=%d\n", *(gpio+13), *(gpio+13)&1);
+    GPFSEL_INPUT;
+    printf("  4. GPFSEL=IN:      GPLEV0=0x%08X\n", *(gpio+13));
+    *(gpio + 7) = (REG_DATA << PIN_A0);
+    GPIO_WAIT;
+    printf("  5. A=DATA:         GPLEV0=0x%08X A0=%d A1=%d\n",
+           *(gpio+13), (*(gpio+13)>>2)&1, (*(gpio+13)>>3)&1);
+    *(gpio + 7) = 1 << PIN_RD;
+    GPIO_WAIT;
+    printf("  6. RD high:        GPLEV0=0x%08X RD=%d\n",
+           *(gpio+13), (*(gpio+13)>>6)&1);
+    int timeout = 1000000;
+    while ((*(gpio+13) & 1) && --timeout > 0) {}
+    printf("  7. TXN clear (%s): GPLEV0=0x%08X\n",
+           timeout==0?"TIMEOUT":"ok", *(gpio+13));
+    unsigned int raw = *(gpio+13);
+    printf("  8. Data read:      GPLEV0=0x%08X → 0x%04X (expect 0xB2E3)\n",
+           raw, (raw>>8)&0xFFFF);
+    *(gpio + 10) = 0xFFFFEC;
+    GPIO_WAIT;
+  }
+
+  /* ROM read-back test: read first 256 bytes from SE bus at $400000
+   * and compare against our ROM file. */
+  {
+    printf("[GPIO] ROM readback test ($400000, 256 bytes)...\n");
+    FILE *romf = fopen("big-se/se-rom.bin", "rb");
+    if (romf) {
+      uint8_t expected[256];
+      fread(expected, 1, 256, romf);
+      fclose(romf);
+      int errors = 0;
+      for (int i = 0; i < 256; i += 2) {
+        uint32_t addr = 0x400000 + i;
+        unsigned int got = ps_read_16(addr);
+        uint16_t exp = (expected[i] << 8) | expected[i+1];
+        if (got != exp) {
+          if (errors < 20)
+            printf("[ROM]  +$%02X: got=$%04X exp=$%04X\n", i, got, exp);
+          errors++;
+        }
+      }
+      printf("[ROM] %d/128 words correct, %d errors\n", 128 - errors, errors);
+    } else {
+      printf("[ROM] Cannot open se-rom.bin for comparison\n");
+    }
+  }
+
   /* Bus transaction stress test */
   printf("[GPIO] Stress test (1000 transactions)...\n");
   int pass = 0, fail = 0;
@@ -391,7 +447,6 @@ unsigned int ps_read_16(unsigned int address) {
   GPIO_FLUSH; GPIO_SYNC;
 
   while (*(gpio + 13) & (1 << PIN_TXN_IN_PROGRESS)) {}
-  GPIO_SYNC;
   unsigned int value = *(gpio + 13);
 
   *(gpio + 10) = 0xffffec;
@@ -435,7 +490,6 @@ unsigned int ps_read_8(unsigned int address) {
   GPIO_FLUSH; GPIO_SYNC;
 
   while (*(gpio + 13) & (1 << PIN_TXN_IN_PROGRESS)) {}
-  GPIO_SYNC;
   unsigned int value = *(gpio + 13);
 
   *(gpio + 10) = 0xffffec;
@@ -594,7 +648,6 @@ unsigned int ps_read_8_paced(unsigned int address) {
   GPIO_FLUSH; GPIO_SYNC;
 
   while (*(gpio + 13) & (1 << PIN_TXN_IN_PROGRESS)) {}
-  GPIO_SYNC;
   unsigned int value = *(gpio + 13);
 
   *(gpio + 10) = 0xffffec;
@@ -648,7 +701,6 @@ unsigned int ps_read_8_paced_hi(unsigned int address) {
   GPIO_FLUSH; GPIO_SYNC;
 
   while (*(gpio + 13) & (1 << PIN_TXN_IN_PROGRESS)) {}
-  GPIO_SYNC;
   unsigned int value = *(gpio + 13);
 
   *(gpio + 10) = 0xffffec;
