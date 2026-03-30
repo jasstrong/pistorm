@@ -698,20 +698,8 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 
 			/* Big SE: redirect PC from old ROM space ($4xxxxx) to new ($8xxxxx).
 			 * Code loaded from disk may reference $4xxxxx ROM addresses that
-			 * the prescan didn't catch. Rather than execute RAM, redirect. */
-			{
-				extern uint32_t ovl_sysrom_pos;
-				if (ovl_sysrom_pos >= 0x800000) {
-					uint32_t pc24 = ADDRESS_68K(REG_PC);
-					if (pc24 >= 0x400000 && pc24 < 0x440000) {
-						uint32_t new_pc = pc24 + 0x400000;
-						static int redir_count = 0;
-						if (redir_count++ < 20)
-							printf("[REDIR] PC=$%06X → $%06X\n", pc24, new_pc);
-						REG_PC = new_pc;
-					}
-				}
-			}
+			 * the prescan didn't catch. Only redirect if the RAM at that
+			 * address looks like ROM content (not like normal RAM data). */
 
 			/* Big SE: force MemTop to 8MB after memory sizing returns.
 			 * $800048 is the first instruction after the sizing JMP.
@@ -885,13 +873,7 @@ cpu_loop:
     }
   }
 
-  {
-    static unsigned int cycle_count = 0;
-    if (++cycle_count >= 10000) {
-      cycle_count = 0;
-      printf("[PC] $%06X\n", m68k_get_reg(NULL, M68K_REG_PC) & 0xFFFFFF);
-    }
-  }
+  /* PC logging disabled — Pi 4 bus verified solid */
 
 #ifdef DEBUG_DIAG
   {

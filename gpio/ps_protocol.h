@@ -67,61 +67,53 @@ extern unsigned int ps_peri_base;
 #define GPFSEL1_OUTPUT 0x09249249
 #define GPFSEL2_OUTPUT 0x00000249
 
-/* Match Pi 3 GPIO timing: ~50ns between register writes.
- * DSB forces the write into the AXI fabric, readback forces it to
- * the peripheral, NOPs provide ~50ns fixed delay matching the
- * Pi 3's natural A53 write-to-write timing. */
-#define GPIO_WAIT do { \
-  asm volatile("dsb sy" ::: "memory"); \
-  (void)(*(volatile unsigned *)(gpio + 13)); \
-  asm volatile( \
-    "nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; " \
-    "nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; " \
-    "nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; " \
-    "nop; nop; nop; nop; nop; nop; nop; nop; nop; nop; " \
-    "nop; nop; nop; nop; nop; nop; nop; nop; nop; nop"  \
-    ::: "memory"); \
-} while(0)
+/* With nGnRnE mapping, each volatile store blocks until it reaches
+ * the GPIO peripheral (~50-100ns round-trip).  This gives the CPLD
+ * 10-20 c200m edges between GPIO transitions — plenty for the
+ * 2-stage synchronizers.  Only a compiler barrier is needed. */
+#define GPIO_FLUSH asm volatile("" ::: "memory")
+#define GPIO_SYNC  asm volatile("" ::: "memory")
+#define GPIO_WAIT  asm volatile("" ::: "memory")
 
 #define GPFSEL_OUTPUT \
   *(gpio + 10) = 0xFFFFEC; \
-  GPIO_WAIT; \
+  GPIO_SYNC; \
   *(gpio + 0) = GPFSEL0_OUTPUT; \
   *(gpio + 1) = GPFSEL1_OUTPUT; \
   *(gpio + 2) = GPFSEL2_OUTPUT; \
-  GPIO_WAIT;
+  GPIO_SYNC;
 
 #define GPFSEL_INPUT \
   *(gpio + 0) = GPFSEL0_INPUT; \
   *(gpio + 1) = GPFSEL1_INPUT; \
   *(gpio + 2) = GPFSEL2_INPUT; \
-  GPIO_WAIT;
-
-#define GPIO_FLUSH GPIO_WAIT
-#define GPIO_SYNC GPIO_WAIT
+  GPIO_SYNC;
 
 #define GPIO_WRITEREG(reg, val) \
   *(gpio + 7) = (val << 8) | (reg << PIN_A0); \
-  GPIO_WAIT; \
+  GPIO_SYNC; \
   *(gpio + 7) = 1 << PIN_WR; \
-  GPIO_WAIT; \
+  GPIO_SYNC; \
   *(gpio + 10) = 1 << PIN_WR; \
-  GPIO_WAIT; \
+  GPIO_SYNC; \
   *(gpio + 10) = 0xFFFFEC; \
-  GPIO_WAIT;
+  GPIO_SYNC;
 
 #define GPIO_PIN_RD \
   *(gpio + 7) = (REG_DATA << PIN_A0); \
-  GPIO_WAIT; \
+  GPIO_SYNC; \
   *(gpio + 7) = 1 << PIN_RD; \
-  GPIO_WAIT;
+  GPIO_SYNC;
 
-/* Keep GPIO_FLUSH and GPIO_SYNC as aliases for code that uses them */
-#define GPIO_FLUSH GPIO_WAIT
-#define GPIO_SYNC GPIO_WAIT
-
-#define WAIT_TXN \
-  while (*(gpio + 13) & (1 << PIN_TXN_IN_PROGRESS)) {}
+/* WAIT_TXN: spin until TXN clears, with timeout.
+ * Returns 0 on success, 1 on timeout (TXN still high). */
+#define WAIT_TXN_TIMEOUT 500000
+static inline int wait_txn(volatile unsigned int *gpio) {
+  int t = WAIT_TXN_TIMEOUT;
+  while ((*(gpio + 13) & (1 << PIN_TXN_IN_PROGRESS)) && --t > 0) {}
+  return t == 0;
+}
+#define WAIT_TXN wait_txn(gpio)
 
 #define END_TXN \
   *(gpio + 10) = 0xFFFFEC;

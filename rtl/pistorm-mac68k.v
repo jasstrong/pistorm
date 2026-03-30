@@ -99,6 +99,13 @@ module pistorm(
   assign M68K_RESET_n = reset_out ? 1'b0 : 1'bz;
   assign M68K_HALT_n = reset_out ? 1'b0 : 1'bz;
 
+  /* Register status_init to break the combinational path from
+   * status write → status_init → mux.  One c200m cycle latency is fine. */
+  reg status_init;
+  always @(posedge c200m) begin
+    status_init <= status[0];
+  end
+
   reg op_req = 1'b0;
   reg op_rw = 1'b1;
   reg op_uds_n = 1'b1;
@@ -131,23 +138,36 @@ module pistorm(
   reg a0;
 
   always @(posedge c200m) begin
-    if (rising_s1)
+    if (status_init) begin
+      /* Software reset: STATUS_BIT_INIT forces everything idle */
       op_req <= 1'b0;
-
-    if (rising_s7)
       PI_TXN_IN_PROGRESS <= 1'b0;
+    end else begin
+      if (rising_s1)
+        op_req <= 1'b0;
 
+      if (rising_s7)
+        PI_TXN_IN_PROGRESS <= 1'b0;
+    end
+
+    /* Status register writes always work — even during init.
+     * status_init is registered so clearing status[0] takes
+     * effect on the next c200m edge — no deadlock. */
     if (wr_rising) begin
       case (PI_A)
         REG_ADDR_LO: begin
-          a0 <= PI_D[0];
-          PI_TXN_IN_PROGRESS <= 1'b1;
+          if (!status_init) begin
+            a0 <= PI_D[0];
+            PI_TXN_IN_PROGRESS <= 1'b1;
+          end
         end
         REG_ADDR_HI: begin
-          op_req <= 1'b1;
-          op_rw <= PI_D[9];
-          op_uds_n <= PI_D[8] ? a0 : 1'b0;
-          op_lds_n <= PI_D[8] ? !a0 : 1'b0;
+          if (!status_init) begin
+            op_req <= 1'b1;
+            op_rw <= PI_D[9];
+            op_uds_n <= PI_D[8] ? a0 : 1'b0;
+            op_lds_n <= PI_D[8] ? !a0 : 1'b0;
+          end
         end
         REG_STATUS: begin
           status <= PI_D;
@@ -239,45 +259,64 @@ module pistorm(
   end
 
   always @(negedge c7m) begin
-    case (state)
-      2'd0: begin // S0|Sr -> S1|Sr
-        if (op_req_sync) begin
-          wait_req <= 1'b0;
-          state <= state + 2'd1;
-        end
-        else begin
-          wait_req <= 1'b1;
-        end
-      end
-
-      2'd1: begin // S2 -> S3
-        state <= state + 2'd1;
-      end
-
-      2'd2: begin // S4|Sw -> S5|Sw
-        if (!M68K_DTACK_n || (!M68K_VMA_n && e_counter == 4'd8)) begin
-          wait_dtack <= 1'b0;
-          state <= state + 2'd1;
-        end
-        else begin
-          if (!M68K_VPA_n && e_counter == 4'd2) begin
-            M68K_VMA_n <= 1'b0;
+    if (status_init) begin
+      /* Software reset: return to idle */
+      state <= 2'd0;
+      wait_req <= 1'b1;
+      wait_dtack <= 1'b0;
+      M68K_VMA_n <= 1'b1;
+    end else begin
+      case (state)
+        2'd0: begin // S0|Sr -> S1|Sr
+          if (op_req_sync) begin
+            wait_req <= 1'b0;
+            state <= state + 2'd1;
           end
-          wait_dtack <= 1'b1;
+          else begin
+            wait_req <= 1'b1;
+          end
         end
-      end
 
-      2'd3: begin // S6 -> S7
-        M68K_VMA_n <= 1'b1;
-        state <= state + 2'd1;
-      end
-    endcase
+        2'd1: begin // S2 -> S3
+          state <= state + 2'd1;
+        end
+
+        2'd2: begin // S4|Sw -> S5|Sw
+          if (!M68K_DTACK_n || !M68K_BERR_n || (!M68K_VMA_n && e_counter == 4'd8)) begin
+            wait_dtack <= 1'b0;
+            state <= state + 2'd1;
+          end
+          else begin
+            if (!M68K_VPA_n && e_counter == 4'd2) begin
+              M68K_VMA_n <= 1'b0;
+            end
+            wait_dtack <= 1'b1;
+          end
+        end
+
+        2'd3: begin // S6 -> S7
+          M68K_VMA_n <= 1'b1;
+          state <= state + 2'd1;
+        end
+      endcase
+    end
   end
 
+  /* 2-stage synchronizer for op_req crossing from c200m to c7m domain.
+   * The original single-stage sync was a metastability hazard — op_req
+   * changes on c200m edges and could violate setup/hold on c7m posedge.
+   * op_req_sync2 is safe to use on c7m negedge (half period settling). */
+  reg op_req_sync1;
   reg op_req_sync;
 
   always @(posedge c7m) begin
-    op_req_sync <= op_req;
+    if (status_init) begin
+      op_req_sync1 <= 1'b0;
+      op_req_sync <= 1'b0;
+    end else begin
+      op_req_sync1 <= op_req;
+      op_req_sync <= op_req_sync1;
+    end
 
     case (state)
       2'd0: M68K_RW <= 1'b1; // S7 -> S0
