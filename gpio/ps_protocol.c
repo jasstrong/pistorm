@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -31,88 +32,283 @@ unsigned int gpfsel0_o;
 unsigned int gpfsel1_o;
 unsigned int gpfsel2_o;
 
+unsigned int ps_peri_base = PERI_BASE_PI3;  /* default, overridden by detection */
+static int pi_model = 3;  /* 3 = Pi 3, 4 = Pi 4 */
+
+void ps_detect_pi_model(void) {
+  FILE *f = fopen("/proc/device-tree/model", "r");
+  if (f) {
+    char model[128] = {0};
+    fread(model, 1, sizeof(model)-1, f);
+    fclose(f);
+    if (strstr(model, "Pi 4") || strstr(model, "Pi 5")) {
+      ps_peri_base = PERI_BASE_PI4;
+      pi_model = 4;
+      printf("[GPIO] Detected Pi 4/5: peripheral base $%08X\n", ps_peri_base);
+    } else if (strstr(model, "Pi 3") || strstr(model, "Pi 2")) {
+      ps_peri_base = PERI_BASE_PI3;
+      pi_model = 3;
+      printf("[GPIO] Detected Pi 2/3: peripheral base $%08X\n", ps_peri_base);
+    } else if (strstr(model, "Pi Zero") || strstr(model, "Model B")) {
+      ps_peri_base = PERI_BASE_PI0_1;
+      pi_model = 1;
+      printf("[GPIO] Detected Pi 0/1: peripheral base $%08X\n", ps_peri_base);
+    } else {
+      printf("[GPIO] Unknown model '%s', assuming Pi 3\n", model);
+    }
+  } else {
+    printf("[GPIO] Cannot read /proc/device-tree/model, assuming Pi 3\n");
+  }
+}
+
 static void setup_io() {
-  int fd = open("/dev/mem", O_RDWR | O_SYNC);
-  if (fd < 0) {
-    printf("Unable to open /dev/mem. Run as root using sudo?\n");
-    exit(-1);
+  {
+    int fd = open("/dev/mem", O_RDWR | O_SYNC);
+    if (fd < 0) {
+      printf("Unable to open /dev/mem. Run as root using sudo?\n");
+      exit(-1);
+    }
+    void *gpio_map = mmap(NULL, BCM2708_PERI_SIZE,
+                          PROT_READ | PROT_WRITE, MAP_SHARED,
+                          fd, BCM2708_PERI_BASE);
+    close(fd);
+    if (gpio_map == MAP_FAILED) {
+      printf("mmap failed, errno = %d\n", errno);
+      exit(-1);
+    }
+    gpio = ((volatile unsigned *)gpio_map) + GPIO_ADDR / 4;
+    gpclk = ((volatile unsigned *)gpio_map) + GPCLK_ADDR / 4;
+    printf("[GPIO] Using /dev/mem, base=$%08X\n", ps_peri_base);
   }
-
-  void *gpio_map = mmap(
-      NULL,                    // Any adddress in our space will do
-      BCM2708_PERI_SIZE,       // Map length
-      PROT_READ | PROT_WRITE,  // Enable reading & writting to mapped memory
-      MAP_SHARED,              // Shared with other processes
-      fd,                      // File to map
-      BCM2708_PERI_BASE        // Offset to GPIO peripheral
-  );
-
-  close(fd);
-
-  if (gpio_map == MAP_FAILED) {
-    printf("mmap failed, errno = %d\n", errno);
-    exit(-1);
-  }
-
-  gpio = ((volatile unsigned *)gpio_map) + GPIO_ADDR / 4;
-  gpclk = ((volatile unsigned *)gpio_map) + GPCLK_ADDR / 4;
 }
 
 static void setup_gpclk() {
-  // Enable 200MHz CLK output on GPIO4, adjust divider and pll source depending
-  // on pi model
-  *(gpclk + (CLK_GP0_CTL / 4)) = CLK_PASSWD | (1 << 5);
+  /* Enable 200MHz CLK output on GPIO4.
+   * Pi 3: PLLC=1200MHz / 6 = 200MHz, source 5
+   * Pi 4: PLLC=1000MHz / 5 = 200MHz, source 5
+   *        (PLLD=750MHz, OSC=54MHz on Pi 4) */
+
+  int clk_div, clk_src;
+  if (pi_model >= 4) {
+    clk_div = 3;   // PLLC_PER 600MHz / 3 = 200MHz (core_freq=600)
+    clk_src = 5;   // pllc
+    printf("[GPIO] Pi 4 GPCLK: PLLC/%d = 200MHz\n", clk_div);
+  } else {
+    clk_div = 6;   // PLLC 1200MHz / 6 = 200MHz
+    clk_src = 5;   // pllc
+  }
+
+  /* Step 1: Kill the clock */
+  *(gpclk + (CLK_GP0_CTL / 4)) = CLK_PASSWD | (1 << 5);  /* KILL */
   usleep(10);
-  while ((*(gpclk + (CLK_GP0_CTL / 4))) & (1 << 7))
-    ;
-  usleep(100);
-  *(gpclk + (CLK_GP0_DIV / 4)) =
-      CLK_PASSWD | (6 << 12);  // divider , 6=200MHz on pi3
-  usleep(10);
-  *(gpclk + (CLK_GP0_CTL / 4)) =
-      CLK_PASSWD | 5 | (1 << 4);  // pll? 6=plld, 5=pllc
-  usleep(10);
-  while (((*(gpclk + (CLK_GP0_CTL / 4))) & (1 << 7)) == 0)
+  while ((*(gpclk + (CLK_GP0_CTL / 4))) & (1 << 7))       /* wait not BUSY */
     ;
   usleep(100);
 
-  SET_GPIO_ALT(PIN_CLK, 0);  // gpclk0
+  /* Step 2: Set divider (integer only, no MASH) */
+  *(gpclk + (CLK_GP0_DIV / 4)) = CLK_PASSWD | (clk_div << 12);
+  usleep(10);
+
+  /* Step 3: Set source, no enable yet */
+  *(gpclk + (CLK_GP0_CTL / 4)) = CLK_PASSWD | clk_src;
+  usleep(10);
+
+  /* Step 4: Enable */
+  *(gpclk + (CLK_GP0_CTL / 4)) = CLK_PASSWD | clk_src | (1 << 4);
+  usleep(10);
+
+  /* Wait for BUSY (clock running) */
+  int timeout = 1000;
+  while (((*(gpclk + (CLK_GP0_CTL / 4))) & (1 << 7)) == 0) {
+    usleep(100);
+    if (--timeout == 0) {
+      printf("[GPIO] GPCLK never went BUSY!\n");
+      break;
+    }
+  }
+  usleep(100);
+
+  /* Set GPIO4 to ALT0 (GPCLK0) */
+  SET_GPIO_ALT(PIN_CLK, 0);
+
+  printf("[GPIO] GPCLK CTL=0x%08X DIV=0x%08X\n",
+         *(gpclk + (CLK_GP0_CTL / 4)),
+         *(gpclk + (CLK_GP0_DIV / 4)));
+}
+
+static void setup_pullups() {
+  if (pi_model >= 4) {
+    /* BCM2711: GPIO_PUP_PDN_CNTRL_REG0-1 at offset 0xE4-0xE8
+     * 2 bits per GPIO: 00=none, 01=up, 10=down
+     * Pull-up on: TXN(0), IPL(1), RST(5), D0-D15(8-23)
+     * No pull on: A0(2), A1(3), CLK(4), RD(6), WR(7) */
+    volatile unsigned int *pup0 = gpio + (0xE4 / 4);  /* GPIO 0-15 */
+    volatile unsigned int *pup1 = gpio + (0xE8 / 4);  /* GPIO 16-31 */
+    unsigned int val0 = *pup0;
+    unsigned int val1 = *pup1;
+    /* GPIO 0-15 */
+    for (int i = 0; i < 16; i++) {
+      val0 &= ~(0x3 << (i * 2));
+      if (i == 0 || i == 1 || i == 5 || (i >= 8 && i <= 15))
+        val0 |= (0x1 << (i * 2));  /* pull-up */
+    }
+    *pup0 = val0;
+    /* GPIO 16-23 */
+    for (int i = 0; i < 8; i++) {
+      val1 &= ~(0x3 << (i * 2));
+      val1 |= (0x1 << (i * 2));  /* pull-up on D8-D15 */
+    }
+    *pup1 = val1;
+    printf("[GPIO] Pi 4: configured pull-ups on GPIO 0-1, 5, 8-23\n");
+  } else {
+    /* BCM2835: legacy pull-up mechanism */
+    GPIO_PULL = 2;  /* pull-up */
+    usleep(10);
+    GPIO_PULLCLK0 = (1 << PIN_TXN_IN_PROGRESS) | (1 << PIN_IPL_ZERO);
+    usleep(10);
+    GPIO_PULL = 0;
+    GPIO_PULLCLK0 = 0;
+  }
 }
 
 void ps_setup_protocol() {
+  ps_detect_pi_model();
   setup_io();
-  setup_gpclk();
+  setup_pullups();
+
+  /* Ensure GPIO4 is ALT0 (GPCLK0) FIRST — a previous run may have
+   * left it as output, killing the CPLD clock. Restore it and wait
+   * for any stuck bus cycle to complete before touching anything else. */
+  INP_GPIO(PIN_CLK);
+  SET_GPIO_ALT(PIN_CLK, 0);
+
+  if (pi_model >= 4) {
+    printf("[GPIO] Pi 4: restored GPIO4=ALT0, waiting for CPLD...\n");
+    usleep(500000);  /* 500ms for stuck bus cycle to complete */
+    printf("[GPIO] TXN=%d\n", (*(gpio + 13) >> PIN_TXN_IN_PROGRESS) & 1);
+  }
+
+  if (pi_model < 4)
+    setup_gpclk();
+  else
+    printf("[GPIO] Pi 4: skipping GPCLK setup (use gpclk.ko module)\n");
 
   *(gpio + 10) = 0xffffec;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 0) = GPFSEL0_INPUT;
   *(gpio + 1) = GPFSEL1_INPUT;
   *(gpio + 2) = GPFSEL2_INPUT;
+  GPIO_FLUSH;
+
+  /* Release Mac from reset FIRST — the CPLD holds RESET_n low at power-on
+   * (status[1]=0). Without releasing reset, the SE bus won't assert DTACK
+   * and any stuck bus cycle can never complete. REG_STATUS writes work
+   * even when TXN is stuck (they don't use the bus cycle state machine). */
+  /* Full CPLD init: reset state machine, then release Mac from reset */
+  printf("[GPIO] CPLD init: STATUS=INIT...\n");
+  ps_write_status_reg(STATUS_BIT_INIT);
+  usleep(1500);
+  ps_write_status_reg(0);
+  usleep(100);
+  printf("[GPIO] CPLD init: STATUS=RESET (releasing Mac)...\n");
+  ps_write_status_reg(0);
+  usleep(100000);
+  ps_write_status_reg(STATUS_BIT_RESET);
+  usleep(100000);
+  uint32_t status_readback = ps_read_status_reg();
+  printf("[GPIO] Status readback=0x%04X, TXN=%d, RESET pin=%d\n",
+         status_readback,
+         (*(gpio + 13) >> PIN_TXN_IN_PROGRESS) & 1,
+         (*(gpio + 13) >> PIN_RESET) & 1);
+
+  /* If TXN is still stuck, the SE bus should now be able to respond */
+  if ((*(gpio + 13)) & (1 << PIN_TXN_IN_PROGRESS)) {
+    printf("[GPIO] TXN still stuck — writing ADDR_HI to complete stale cycle\n");
+    GPFSEL_OUTPUT;
+    GPIO_WRITEREG(REG_ADDR_HI, 0x0200);
+    GPFSEL_INPUT;
+    usleep(500000);
+    printf("[GPIO] TXN=%d\n", (*(gpio + 13) >> PIN_TXN_IN_PROGRESS) & 1);
+  }
+
+  uint32_t lev = *(gpio + 13);
+  printf("[GPIO] TXN=%d IPL=%d (GPLEV0=0x%08X)\n",
+         (lev >> 0) & 1, (lev >> 1) & 1, lev);
+
+  /* Bus transaction test using real GPCLK (never touch GPIO4!) */
+  printf("[GPIO] Bus transaction test...\n");
+  uint32_t txn0 = (*(gpio + 13) >> PIN_TXN_IN_PROGRESS) & 1;
+  printf("[GPIO]   initial TXN=%d\n", txn0);
+
+  /* Write ADDR_LO — should set TXN high */
+  *(gpio + 0) = GPFSEL0_OUTPUT;
+  *(gpio + 1) = GPFSEL1_OUTPUT;
+  *(gpio + 2) = GPFSEL2_OUTPUT;
+  GPIO_FLUSH;
+  GPIO_WRITEREG(REG_DATA, 0);
+  GPIO_WRITEREG(REG_ADDR_LO, 0);
+  usleep(100);
+  uint32_t txn1 = (*(gpio + 13) >> PIN_TXN_IN_PROGRESS) & 1;
+  printf("[GPIO]   after ADDR_LO: TXN=%d (expect 1)\n", txn1);
+
+  /* Write ADDR_HI — triggers bus cycle */
+  GPIO_WRITEREG(REG_ADDR_HI, 0x0200);
+  *(gpio + 0) = GPFSEL0_INPUT;
+  *(gpio + 1) = GPFSEL1_INPUT;
+  *(gpio + 2) = GPFSEL2_INPUT;
+  GPIO_FLUSH;
+
+  /* Wait for TXN to clear (bus cycle complete) */
+  int timeout = 1000000;
+  while ((*(gpio + 13) & (1 << PIN_TXN_IN_PROGRESS)) && --timeout > 0) {}
+  uint32_t txn2 = (*(gpio + 13) >> PIN_TXN_IN_PROGRESS) & 1;
+  printf("[GPIO]   after bus cycle: TXN=%d (timeout=%s)\n",
+         txn2, timeout == 0 ? "YES" : "no");
+
+  if (txn1 == 1 && txn2 == 0)
+    printf("[GPIO] CPLD communication OK\n");
+  else
+    printf("[GPIO] CPLD communication FAILED\n");
 }
 
 void ps_write_16(unsigned int address, unsigned int data) {
   *(gpio + 0) = GPFSEL0_OUTPUT;
   *(gpio + 1) = GPFSEL1_OUTPUT;
   *(gpio + 2) = GPFSEL2_OUTPUT;
+  GPIO_FLUSH;
 
   *(gpio + 7) = ((data & 0xffff) << 8) | (REG_DATA << PIN_A0);
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 0xffffec;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 7) = ((address & 0xffff) << 8) | (REG_ADDR_LO << PIN_A0);
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 0xffffec;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 7) = ((0x0000 | (address >> 16)) << 8) | (REG_ADDR_HI << PIN_A0);
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 0xffffec;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 0) = GPFSEL0_INPUT;
   *(gpio + 1) = GPFSEL1_INPUT;
   *(gpio + 2) = GPFSEL2_INPUT;
+  GPIO_FLUSH;
 
   while (*(gpio + 13) & (1 << PIN_TXN_IN_PROGRESS)) {}
 }
@@ -124,25 +320,39 @@ void ps_write_8(unsigned int address, unsigned int data) {
   *(gpio + 0) = GPFSEL0_OUTPUT;
   *(gpio + 1) = GPFSEL1_OUTPUT;
   *(gpio + 2) = GPFSEL2_OUTPUT;
+  GPIO_FLUSH;
 
   *(gpio + 7) = ((data & 0xffff) << 8) | (REG_DATA << PIN_A0);
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 0xffffec;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 7) = ((address & 0xffff) << 8) | (REG_ADDR_LO << PIN_A0);
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 0xffffec;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 7) = ((0x0100 | (address >> 16)) << 8) | (REG_ADDR_HI << PIN_A0);
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 0xffffec;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 0) = GPFSEL0_INPUT;
   *(gpio + 1) = GPFSEL1_INPUT;
   *(gpio + 2) = GPFSEL2_INPUT;
+  GPIO_FLUSH;
 
   while (*(gpio + 13) & (1 << PIN_TXN_IN_PROGRESS)) {}
 }
@@ -158,28 +368,42 @@ unsigned int ps_read_16(unsigned int address) {
   *(gpio + 0) = GPFSEL0_OUTPUT;
   *(gpio + 1) = GPFSEL1_OUTPUT;
   *(gpio + 2) = GPFSEL2_OUTPUT;
+  GPIO_FLUSH;
 
   *(gpio + 7) = ((address & 0xffff) << 8) | (REG_ADDR_LO << PIN_A0);
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 0xffffec;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 7) = ((0x0200 | (address >> 16)) << 8) | (REG_ADDR_HI << PIN_A0);
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 0xffffec;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 0) = GPFSEL0_INPUT;
   *(gpio + 1) = GPFSEL1_INPUT;
   *(gpio + 2) = GPFSEL2_INPUT;
+  GPIO_FLUSH;
 
   *(gpio + 7) = (REG_DATA << PIN_A0);
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_RD;
+  GPIO_FLUSH; GPIO_SYNC;
 
   while (*(gpio + 13) & (1 << PIN_TXN_IN_PROGRESS)) {}
+  GPIO_SYNC;
   unsigned int value = *(gpio + 13);
 
   *(gpio + 10) = 0xffffec;
+  GPIO_FLUSH; GPIO_SYNC;
 
   return (value >> 8) & 0xffff;
 }
@@ -188,28 +412,42 @@ unsigned int ps_read_8(unsigned int address) {
   *(gpio + 0) = GPFSEL0_OUTPUT;
   *(gpio + 1) = GPFSEL1_OUTPUT;
   *(gpio + 2) = GPFSEL2_OUTPUT;
+  GPIO_FLUSH;
 
   *(gpio + 7) = ((address & 0xffff) << 8) | (REG_ADDR_LO << PIN_A0);
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 0xffffec;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 7) = ((0x0300 | (address >> 16)) << 8) | (REG_ADDR_HI << PIN_A0);
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 0xffffec;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 0) = GPFSEL0_INPUT;
   *(gpio + 1) = GPFSEL1_INPUT;
   *(gpio + 2) = GPFSEL2_INPUT;
+  GPIO_FLUSH;
 
   *(gpio + 7) = (REG_DATA << PIN_A0);
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_RD;
+  GPIO_FLUSH; GPIO_SYNC;
 
   while (*(gpio + 13) & (1 << PIN_TXN_IN_PROGRESS)) {}
+  GPIO_SYNC;
   unsigned int value = *(gpio + 13);
 
   *(gpio + 10) = 0xffffec;
+  GPIO_FLUSH; GPIO_SYNC;
 
   unsigned int raw16 = (value >> 8) & 0xffff;
   if ((address & 1) == 0)
@@ -238,38 +476,53 @@ void paced_dummy_cycles(void) {
   *(gpio + 0) = GPFSEL0_OUTPUT;
   *(gpio + 1) = GPFSEL1_OUTPUT;
   *(gpio + 2) = GPFSEL2_OUTPUT;
+  GPIO_FLUSH;
 
   for (int i = 0; i < 3; i++) {
     uint32_t addr = 0x400000 + (i * 2);  // ROM range — BBU responds immediately
 
     *(gpio + 7) = ((addr & 0xffff) << 8) | (REG_ADDR_LO << PIN_A0);
+  GPIO_FLUSH; GPIO_SYNC;
     *(gpio + 7) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
     *(gpio + 10) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
     *(gpio + 10) = 0xffffec;
+  GPIO_FLUSH; GPIO_SYNC;
 
     *(gpio + 7) = ((0x0200 | (addr >> 16)) << 8) | (REG_ADDR_HI << PIN_A0);
+  GPIO_FLUSH; GPIO_SYNC;
     *(gpio + 7) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
     *(gpio + 10) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
     *(gpio + 10) = 0xffffec;
+  GPIO_FLUSH; GPIO_SYNC;
 
     *(gpio + 0) = GPFSEL0_INPUT;
     *(gpio + 1) = GPFSEL1_INPUT;
     *(gpio + 2) = GPFSEL2_INPUT;
+  GPIO_FLUSH;
 
     *(gpio + 7) = (REG_DATA << PIN_A0);
+  GPIO_FLUSH; GPIO_SYNC;
     *(gpio + 7) = 1 << PIN_RD;
+  GPIO_FLUSH; GPIO_SYNC;
 
     while (*(gpio + 13) & (1 << PIN_TXN_IN_PROGRESS)) {}
     *(gpio + 10) = 0xffffec;
+  GPIO_FLUSH; GPIO_SYNC;
 
     *(gpio + 0) = GPFSEL0_OUTPUT;
     *(gpio + 1) = GPFSEL1_OUTPUT;
     *(gpio + 2) = GPFSEL2_OUTPUT;
+  GPIO_FLUSH;
   }
 
   *(gpio + 0) = GPFSEL0_INPUT;
   *(gpio + 1) = GPFSEL1_INPUT;
   *(gpio + 2) = GPFSEL2_INPUT;
+  GPIO_FLUSH;
 }
 
 // Single dummy read cycle — minimum bus activity to let the BBU advance.
@@ -277,26 +530,39 @@ void paced_dummy_cycle_1(void) {
   *(gpio + 0) = GPFSEL0_OUTPUT;
   *(gpio + 1) = GPFSEL1_OUTPUT;
   *(gpio + 2) = GPFSEL2_OUTPUT;
+  GPIO_FLUSH;
 
   *(gpio + 7) = ((0x400000 & 0xffff) << 8) | (REG_ADDR_LO << PIN_A0);
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 0xffffec;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 7) = ((0x0200 | (0x400000 >> 16)) << 8) | (REG_ADDR_HI << PIN_A0);
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 0xffffec;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 0) = GPFSEL0_INPUT;
   *(gpio + 1) = GPFSEL1_INPUT;
   *(gpio + 2) = GPFSEL2_INPUT;
+  GPIO_FLUSH;
 
   *(gpio + 7) = (REG_DATA << PIN_A0);
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_RD;
+  GPIO_FLUSH; GPIO_SYNC;
 
   while (*(gpio + 13) & (1 << PIN_TXN_IN_PROGRESS)) {}
   *(gpio + 10) = 0xffffec;
+  GPIO_FLUSH; GPIO_SYNC;
 }
 
 #define PACED_DUMMY_CYCLES() paced_dummy_cycle_1()
@@ -305,28 +571,42 @@ unsigned int ps_read_8_paced(unsigned int address) {
   *(gpio + 0) = GPFSEL0_OUTPUT;
   *(gpio + 1) = GPFSEL1_OUTPUT;
   *(gpio + 2) = GPFSEL2_OUTPUT;
+  GPIO_FLUSH;
 
   *(gpio + 7) = ((address & 0xffff) << 8) | (REG_ADDR_LO << PIN_A0);
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 0xffffec;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 7) = ((0x0300 | (address >> 16)) << 8) | (REG_ADDR_HI << PIN_A0);
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 0xffffec;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 0) = GPFSEL0_INPUT;
   *(gpio + 1) = GPFSEL1_INPUT;
   *(gpio + 2) = GPFSEL2_INPUT;
+  GPIO_FLUSH;
 
   *(gpio + 7) = (REG_DATA << PIN_A0);
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_RD;
+  GPIO_FLUSH; GPIO_SYNC;
 
   while (*(gpio + 13) & (1 << PIN_TXN_IN_PROGRESS)) {}
+  GPIO_SYNC;
   unsigned int value = *(gpio + 13);
 
   *(gpio + 10) = 0xffffec;
+  GPIO_FLUSH; GPIO_SYNC;
 
   unsigned int raw16 = (value >> 8) & 0xffff;
 
@@ -345,28 +625,42 @@ unsigned int ps_read_8_paced_hi(unsigned int address) {
   *(gpio + 0) = GPFSEL0_OUTPUT;
   *(gpio + 1) = GPFSEL1_OUTPUT;
   *(gpio + 2) = GPFSEL2_OUTPUT;
+  GPIO_FLUSH;
 
   *(gpio + 7) = ((address & 0xffff) << 8) | (REG_ADDR_LO << PIN_A0);
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 0xffffec;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 7) = ((0x0300 | (address >> 16)) << 8) | (REG_ADDR_HI << PIN_A0);
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 0xffffec;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 0) = GPFSEL0_INPUT;
   *(gpio + 1) = GPFSEL1_INPUT;
   *(gpio + 2) = GPFSEL2_INPUT;
+  GPIO_FLUSH;
 
   *(gpio + 7) = (REG_DATA << PIN_A0);
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_RD;
+  GPIO_FLUSH; GPIO_SYNC;
 
   while (*(gpio + 13) & (1 << PIN_TXN_IN_PROGRESS)) {}
+  GPIO_SYNC;
   unsigned int value = *(gpio + 13);
 
   *(gpio + 10) = 0xffffec;
+  GPIO_FLUSH; GPIO_SYNC;
 
   unsigned int raw16 = (value >> 8) & 0xffff;
 
@@ -382,25 +676,39 @@ void ps_write_8_paced(unsigned int address, unsigned int data) {
   *(gpio + 0) = GPFSEL0_OUTPUT;
   *(gpio + 1) = GPFSEL1_OUTPUT;
   *(gpio + 2) = GPFSEL2_OUTPUT;
+  GPIO_FLUSH;
 
   *(gpio + 7) = ((data & 0xffff) << 8) | (REG_DATA << PIN_A0);
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 0xffffec;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 7) = ((address & 0xffff) << 8) | (REG_ADDR_LO << PIN_A0);
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 0xffffec;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 7) = ((0x0100 | (address >> 16)) << 8) | (REG_ADDR_HI << PIN_A0);
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 0xffffec;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 0) = GPFSEL0_INPUT;
   *(gpio + 1) = GPFSEL1_INPUT;
   *(gpio + 2) = GPFSEL2_INPUT;
+  GPIO_FLUSH;
 
   while (*(gpio + 13) & (1 << PIN_TXN_IN_PROGRESS)) {}
 
@@ -411,37 +719,54 @@ void ps_write_status_reg(unsigned int value) {
   *(gpio + 0) = GPFSEL0_OUTPUT;
   *(gpio + 1) = GPFSEL1_OUTPUT;
   *(gpio + 2) = GPFSEL2_OUTPUT;
+  GPIO_FLUSH;
 
   *(gpio + 7) = ((value & 0xffff) << 8) | (REG_STATUS << PIN_A0);
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 7) = 1 << PIN_WR;
-  *(gpio + 7) = 1 << PIN_WR; // delay
+  GPIO_FLUSH; GPIO_SYNC;
+  *(gpio + 7) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC; // delay
 #ifdef CHIP_FASTPATH
-  *(gpio + 7) = 1 << PIN_WR; // delay 210810
+  *(gpio + 7) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC; // delay 210810
 #endif
   *(gpio + 10) = 1 << PIN_WR;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 10) = 0xffffec;
+  GPIO_FLUSH; GPIO_SYNC;
 
   *(gpio + 0) = GPFSEL0_INPUT;
   *(gpio + 1) = GPFSEL1_INPUT;
   *(gpio + 2) = GPFSEL2_INPUT;
+  GPIO_FLUSH;
 }
 
 unsigned int ps_read_status_reg() {
   *(gpio + 7) = (REG_STATUS << PIN_A0);
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_RD;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_RD;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_RD;
+  GPIO_FLUSH; GPIO_SYNC;
   *(gpio + 7) = 1 << PIN_RD;
+  GPIO_FLUSH; GPIO_SYNC;
 #ifdef CHIP_FASTPATH
-  *(gpio + 7) = 1 << PIN_RD; // delay 210810
-  *(gpio + 7) = 1 << PIN_RD; // delay 210810
+  *(gpio + 7) = 1 << PIN_RD;
+  GPIO_FLUSH; GPIO_SYNC; // delay 210810
+  *(gpio + 7) = 1 << PIN_RD;
+  GPIO_FLUSH; GPIO_SYNC; // delay 210810
 #endif
 
+  /* Status read is combinational in the CPLD — no TXN involvement.
+   * Just read the data pins directly, no need to wait. */
   unsigned int value = *(gpio + 13);
-  while ((value=*(gpio + 13)) & (1 << PIN_TXN_IN_PROGRESS)) {}
-  
+
   *(gpio + 10) = 0xffffec;
+  GPIO_FLUSH; GPIO_SYNC;
 
   return (value >> 8) & 0xffff;
 }

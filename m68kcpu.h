@@ -2405,6 +2405,45 @@ static inline void m68ki_exception_1010(m68ki_cpu_core *state)
 			return;  /* handled — PC already past the A-line word */
 	}
 
+	/* Big SE: scan caller's code region on Sound Manager traps.
+	 * The snth $1005 resource may be (re)loaded with $4xxxxx ROM refs. */
+	if (REG_IR >= 0xA800 && REG_IR <= 0xA807) {
+		extern uint32_t ovl_sysrom_pos;
+		if (ovl_sysrom_pos >= 0x800000) {
+			uint32_t caller = ADDRESS_68K(REG_PPC);
+			if (caller >= 0x010000 && caller < ovl_sysrom_pos) {
+				uint32_t scan_lo = caller & 0xFFFF0000;
+				uint32_t scan_hi = scan_lo + 0x10000;
+				if (scan_hi > ovl_sysrom_pos) scan_hi = ovl_sysrom_pos;
+				static const uint16_t abs_ops[] = {
+					0x4EF9, 0x4EB9, 0x4879,
+					0x41F9, 0x43F9, 0x45F9, 0x47F9,
+					0x49F9, 0x4BF9, 0x4DF9,
+					0x21FC, 0x23FC, 0
+				};
+				int patched = 0;
+				for (uint32_t s = scan_lo; s < scan_hi - 5; s += 2) {
+					uint16_t op = m68ki_read_16(state, s);
+					int is_abs = 0;
+					for (const uint16_t *p = abs_ops; *p; p++)
+						if (op == *p) { is_abs = 1; break; }
+					if ((op & 0xF1FF) == 0x203C || (op & 0xF1FF) == 0x207C)
+						is_abs = 1;
+					if (is_abs) {
+						uint32_t val = m68ki_read_32(state, s + 2);
+						if (val >= 0x00400000 && val < 0x00440000) {
+							m68ki_write_32(state, s + 2, val + 0x400000);
+							patched++;
+						}
+					}
+				}
+				if (patched)
+					printf("[TRAP-SCAN] SndMgr $%04X: %d patches in $%06X-$%06X (caller=$%06X)\n",
+						REG_IR, patched, scan_lo, scan_hi, caller);
+			}
+		}
+	}
+
 	uint sr;
 
 	/* A-line ring buffer — disabled for performance */

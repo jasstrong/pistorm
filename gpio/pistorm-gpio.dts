@@ -1,0 +1,40 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+    compatible = "brcm,bcm2711";
+
+    fragment@0 {
+        target = <&gpio>;
+        __overlay__ {
+            pistorm_pins: pistorm_pins {
+                /* GPIO 0-23: PiStorm CPLD interface
+                 * 0: TXN_IN_PROGRESS (input, pull-up)
+                 * 1: IPL_ZERO (input, pull-up)
+                 * 2: A0 (output)
+                 * 3: A1 (output)
+                 * 4: GPCLK0 (ALT0)
+                 * 5: RESET (input/output)
+                 * 6: RD (output)
+                 * 7: WR (output)
+                 * 8-23: D0-D15 (bidirectional)
+                 *
+                 * Drive strength: 16mA (max) for clean edges
+                 * Slew: 1 = fast
+                 */
+                brcm,pins = <0 1 2 3 4 5 6 7
+                             8 9 10 11 12 13 14 15
+                             16 17 18 19 20 21 22 23>;
+                brcm,pull = <2 2 0 0 0 2 0 0
+                             2 2 2 2 2 2 2 2
+                             2 2 2 2 2 2 2 2>;
+                /* 2=pull-up: TXN, IPL, RESET, D0-D15
+                 * 0=none: A0, A1, CLK, RD, WR */
+                brcm,drive-strength-mA = <16 16 16 16 16 16 16 16
+                                          16 16 16 16 16 16 16 16
+                                          16 16 16 16 16 16 16 16>;
+                slew-rate = <1>;
+            };
+        };
+    };
+};

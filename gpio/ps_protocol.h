@@ -29,10 +29,14 @@
 #define STATUS_MASK_IPL 0xe000
 #define STATUS_SHIFT_IPL 13
 
-//#define BCM2708_PERI_BASE 0x20000000  // pi0-1
-//#define BCM2708_PERI_BASE	0xFE000000  // pi4
-#define BCM2708_PERI_BASE 0x3F000000  // pi3
+/* Peripheral base detected at runtime — see ps_detect_pi_model() */
+extern unsigned int ps_peri_base;
+#define BCM2708_PERI_BASE ps_peri_base
 #define BCM2708_PERI_SIZE 0x01000000
+
+#define PERI_BASE_PI0_1  0x20000000
+#define PERI_BASE_PI3    0x3F000000
+#define PERI_BASE_PI4    0xFE000000
 
 #define GPIO_ADDR 0x200000 /* GPIO controller */
 #define GPCLK_ADDR 0x101000
@@ -64,24 +68,52 @@
 #define GPFSEL2_OUTPUT 0x00000249
 
 #define GPFSEL_OUTPUT \
+  *(gpio + 10) = 0xFFFFEC; \
+  GPIO_FLUSH; \
   *(gpio + 0) = GPFSEL0_OUTPUT; \
   *(gpio + 1) = GPFSEL1_OUTPUT; \
-  *(gpio + 2) = GPFSEL2_OUTPUT;
+  *(gpio + 2) = GPFSEL2_OUTPUT; \
+  GPIO_FLUSH;
 
 #define GPFSEL_INPUT \
   *(gpio + 0) = GPFSEL0_INPUT; \
   *(gpio + 1) = GPFSEL1_INPUT; \
-  *(gpio + 2) = GPFSEL2_INPUT;
+  *(gpio + 2) = GPFSEL2_INPUT; \
+  GPIO_FLUSH;
+
+/* Force GPIO write to reach the peripheral before continuing.
+ * On Pi 4 (Device-nGnRE mapping), writes can be acknowledged before
+ * reaching the peripheral. A readback from any GPIO register forces
+ * all pending writes to complete. */
+#define GPIO_FLUSH do { asm volatile("dsb st" ::: "memory"); (void)(*(volatile unsigned *)(gpio + 13)); } while(0)
+
+/* Wait for 2 CPLD clock edges (low→high→low→high) on GPIO4.
+ * This ensures the CPLD has sampled our pin state on at least
+ * 2 rising edges — enough for the 2-stage synchronizer. */
+#define GPIO_SYNC do { \
+  asm volatile("dsb sy" ::: "memory"); \
+  while ((*(gpio + 13)) & (1 << PIN_CLK)) {} \
+  while (!((*(gpio + 13)) & (1 << PIN_CLK))) {} \
+  while ((*(gpio + 13)) & (1 << PIN_CLK)) {} \
+  while (!((*(gpio + 13)) & (1 << PIN_CLK))) {} \
+  asm volatile("dsb sy" ::: "memory"); \
+} while(0)
 
 #define GPIO_WRITEREG(reg, val) \
   *(gpio + 7) = (val << 8) | (reg << PIN_A0); \
+  GPIO_FLUSH; GPIO_SYNC; \
   *(gpio + 7) = 1 << PIN_WR; \
+  GPIO_FLUSH; GPIO_SYNC; \
   *(gpio + 10) = 1 << PIN_WR; \
-  *(gpio + 10) = 0xFFFFEC;
+  GPIO_FLUSH; GPIO_SYNC; \
+  *(gpio + 10) = 0xFFFFEC; \
+  GPIO_FLUSH; GPIO_SYNC;
 
 #define GPIO_PIN_RD \
   *(gpio + 7) = (REG_DATA << PIN_A0); \
-  *(gpio + 7) = 1 << PIN_RD;
+  GPIO_FLUSH; GPIO_SYNC; \
+  *(gpio + 7) = 1 << PIN_RD; \
+  GPIO_FLUSH; GPIO_SYNC;
 
 #define WAIT_TXN \
   while (*(gpio + 13) & (1 << PIN_TXN_IN_PROGRESS)) {}

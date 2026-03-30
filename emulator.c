@@ -6,19 +6,6 @@
 #include "input/input.h"
 #include "m68kcpu.h"
 
-#include "platforms/amiga/Gayle.h"
-#include "platforms/amiga/amiga-registers.h"
-#include "platforms/amiga/amiga-interrupts.h"
-#include "platforms/amiga/rtg/rtg.h"
-#include "platforms/amiga/hunk-reloc.h"
-#include "platforms/amiga/piscsi/piscsi.h"
-#include "platforms/amiga/piscsi/piscsi-enums.h"
-#include "platforms/amiga/net/pi-net.h"
-#include "platforms/amiga/net/pi-net-enums.h"
-#include "platforms/amiga/ahi/pi_ahi.h"
-#include "platforms/amiga/ahi/pi-ahi-enums.h"
-#include "platforms/amiga/pistorm-dev/pistorm-dev.h"
-#include "platforms/amiga/pistorm-dev/pistorm-dev-enums.h"
 #include "gpio/ps_protocol.h"
 #include "vnc/vnc.h"
 
@@ -53,23 +40,13 @@ extern uint32_t ovl_sysrom_pos;
 int kb_hook_enabled = 0;
 int mouse_hook_enabled = 0;
 int cpu_emulation_running = 1;
-int swap_df0_with_dfx = 0;
-int spoof_df0_id = 0;
-int move_slow_to_chip = 0;
-int force_move_slow_to_chip = 0;
-
 uint8_t mouse_dx = 0, mouse_dy = 0;
 uint8_t mouse_buttons = 0;
 uint8_t mouse_extra = 0;
 
-extern uint8_t gayle_int;
-extern uint8_t gayle_ide_enabled;
-extern uint8_t gayle_emulation_enabled;
-extern uint8_t gayle_a4k_int;
 extern volatile unsigned int *gpio;
 extern volatile uint16_t srdata;
-extern uint8_t realtime_graphics_debug, emulator_exiting;
-extern uint8_t rtg_on;
+uint8_t realtime_graphics_debug = 0, emulator_exiting = 0;
 extern uint32_t scsi_rom_low, scsi_rom_high;
 extern uint8_t noscsi_enabled;
 extern struct vnc_config vnc_cfg;
@@ -83,13 +60,9 @@ uint8_t end_signal = 0, load_new_config = 0;
 
 char disasm_buf[4096];
 
-#define KICKBASE 0xF80000
-#define KICKSIZE 0x7FFFF
-
 int mem_fd, mouse_fd = -1, keyboard_fd = -1;
 int mem_fd_gpclk;
 atomic_int irq = 0;
-int gayleirq;
 
 #ifdef DEBUG_DIAG
 // Diagnostic counters for interrupt debugging
@@ -493,8 +466,6 @@ int gestalt_trap_intercept(void) {
 }
 
 uint16_t irq_delay = 0;
-unsigned int amiga_reset=0, amiga_reset_last=0;
-unsigned int do_reset=0;
 
 void *ipl_task(void *args) {
   printf("IPL thread running\n");
@@ -504,7 +475,7 @@ void *ipl_task(void *args) {
     if (value & (1 << PIN_TXN_IN_PROGRESS))
       goto noppers;
 
-    if (!(value & (1 << PIN_IPL_ZERO)) || ipl_enabled[amiga_emulated_ipl()]) {
+    if (!(value & (1 << PIN_IPL_ZERO))) {
       if (!atomic_load(&irq)) {
         M68K_END_TIMESLICE;
         atomic_store(&irq, 1);
@@ -513,36 +484,6 @@ void *ipl_task(void *args) {
 #endif
       }
     }
-    if(do_reset==0)
-    {
-      amiga_reset=(value & (1 << PIN_RESET));
-      if(amiga_reset!=amiga_reset_last)
-      {
-        amiga_reset_last=amiga_reset;
-        if(amiga_reset==0)
-        {
-          printf("Amiga Reset is down...\n");
-          do_reset=1;
-          M68K_END_TIMESLICE;
-        }
-        else
-        {
-          printf("Amiga Reset is up...\n");
-        }
-      }
-    }
-
-    /*if (gayle_ide_enabled) {
-      if (((gayle_int & 0x80) || gayle_a4k_int) && (get_ide(0)->drive[0].intrq || get_ide(0)->drive[1].intrq)) {
-        //get_ide(0)->drive[0].intrq = 0;
-        gayleirq = 1;
-        M68K_END_TIMESLICE;
-      }
-      else
-        gayleirq = 0;
-    }*/
-    //usleep(0);
-    //NOP NOP
 noppers:
     NOP NOP NOP NOP NOP NOP NOP NOP
     //NOP NOP NOP NOP NOP NOP NOP NOP
@@ -755,6 +696,23 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			/* Call external hook to peek at CPU */
 			m68ki_instr_hook(REG_PC); /* auto-disable (see m68kcpu.h) */
 
+			/* Big SE: redirect PC from old ROM space ($4xxxxx) to new ($8xxxxx).
+			 * Code loaded from disk may reference $4xxxxx ROM addresses that
+			 * the prescan didn't catch. Rather than execute RAM, redirect. */
+			{
+				extern uint32_t ovl_sysrom_pos;
+				if (ovl_sysrom_pos >= 0x800000) {
+					uint32_t pc24 = ADDRESS_68K(REG_PC);
+					if (pc24 >= 0x400000 && pc24 < 0x440000) {
+						uint32_t new_pc = pc24 + 0x400000;
+						static int redir_count = 0;
+						if (redir_count++ < 20)
+							printf("[REDIR] PC=$%06X → $%06X\n", pc24, new_pc);
+						REG_PC = new_pc;
+					}
+				}
+			}
+
 			/* Big SE: force MemTop to 8MB after memory sizing returns.
 			 * $800048 is the first instruction after the sizing JMP.
 			 * A6 (FP) holds MemTop; low-mem $108 holds it later. */
@@ -793,15 +751,22 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 						}
 					}
 
-					/* Trigger 2: first entry into loaded code region */
+					/* Trigger 2: entry into loaded code region.
+					 * Rescan periodically — code may be reloaded. */
 					{
 						static uint8_t rgn_scanned[8];
+						static uint32_t rgn_scan_cycle = 0;
 						unsigned rgn = pc24 >> 16;
 						if (rgn >= 1 && rgn <= 7 && !rgn_scanned[rgn]) {
 							rgn_scanned[rgn] = 1;
 							scan_lo = rgn << 16;
 							scan_hi = scan_lo + 0x10000;
 							do_scan = 1;
+						}
+						/* Reset scan flags periodically so new code gets caught */
+						if (++rgn_scan_cycle >= 10000000) {
+							rgn_scan_cycle = 0;
+							for (int i = 0; i < 8; i++) rgn_scanned[i] = 0;
 						}
 					}
 
@@ -1240,28 +1205,7 @@ cpu_loop:
     }
   }
 
-  if (do_reset) {
-    cpu_pulse_reset();
-    do_reset=0;
-    usleep(1000000); // 1sec
-    rtg_on=0;
-//    while(amiga_reset==0);
-//    printf("CPU emulation reset.\n");
-  }
-
   if (mouse_hook_enabled && (mouse_extra != 0x00)) {
-    // mouse wheel events have occurred; unlike l/m/r buttons, these are queued as keypresses, so add to end of buffer
-    switch (mouse_extra) {
-      case 0xff:
-        // wheel up
-        queue_keypress(0xfe, KEYPRESS_PRESS, PLATFORM_AMIGA);
-        break;
-      case 0x01:
-        // wheel down
-        queue_keypress(0xff, KEYPRESS_PRESS, PLATFORM_AMIGA);
-        break;
-    }
-
     // dampen the scroll wheel until next while loop iteration
     mouse_extra = 0x00;
   }
@@ -1310,9 +1254,6 @@ key_loop:
 
   // if kpollrc > 0 then it contains number of events to pull, also check if POLLIN is set in revents
   if ((kpollrc <= 0) || !(kbdpoll[0].revents & POLLIN)) {
-    if (cfg->platform->id == PLATFORM_AMIGA && last_irq != 2 && get_num_kb_queued()) {
-      amiga_emulate_irq(PORTS);
-    }
     goto key_loop;
   }
 
@@ -1333,11 +1274,7 @@ key_loop:
           puts(ungrab_message);
         }
       } else {
-        if (queue_keypress(c_code, c_type, cfg->platform->id)) {
-          if (cfg->platform->id == PLATFORM_AMIGA && last_irq != 2) {
-            amiga_emulate_irq(PORTS);
-          }
-        }
+        queue_keypress(c_code, c_type, cfg->platform->id);
       }
     }
 
@@ -1481,6 +1418,8 @@ void sigint_handler(int sig_num) {
   exit(0);
 }
 
+static char cfg_filename[256] = "";
+
 int main(int argc, char *argv[]) {
   int g;
 
@@ -1509,7 +1448,7 @@ int main(int argc, char *argv[]) {
         } else {
           fclose(chk);
           load_new_config = 1;
-          set_pistorm_devcfg_filename(argv[g]);
+          strncpy(cfg_filename, argv[g], sizeof(cfg_filename) - 1);
         }
       }
     }
@@ -1531,7 +1470,6 @@ switch_config:
   usleep(1500);
 
   if (load_new_config != 0) {
-    uint8_t config_action = load_new_config - 1;
     load_new_config = 0;
     if (cfg) {
       free_config_file(cfg);
@@ -1539,15 +1477,10 @@ switch_config:
       cfg = NULL;
     }
 
-    switch(config_action) {
-      case PICFG_LOAD:
-      case PICFG_RELOAD:
-        cfg = load_config_file(get_pistorm_devcfg_filename());
-        break;
-      case PICFG_DEFAULT:
-        cfg = load_config_file("default.cfg");
-        break;
-    }
+    if (cfg_filename[0])
+      cfg = load_config_file(cfg_filename);
+    else
+      cfg = load_config_file("default.cfg");
   }
 
   if (!cfg) {
@@ -1643,8 +1576,6 @@ switch_config:
 
   if (cfg->keyboard_autoconnect)
     kb_hook_enabled = 1;
-
-  InitGayle();
 
   signal(SIGINT, sigint_handler);
 
@@ -1764,191 +1695,12 @@ unsigned int cpu_irq_ack(int level) {
 }
 
 static unsigned int target = 0;
-static uint32_t platform_res, rres;
-
-uint8_t cdtv_dmac_reg_idx_read();
-void cdtv_dmac_reg_idx_write(uint8_t value);
-uint32_t cdtv_dmac_read(uint32_t address, uint8_t type);
-void cdtv_dmac_write(uint32_t address, uint32_t value, uint8_t type);
+static uint32_t platform_res;
 
 unsigned int garbage = 0;
 
-static inline uint32_t ps_read(uint8_t type, uint32_t addr) {
-  switch (type) {
-    case OP_TYPE_BYTE:
-      return ps_read_8(addr);
-    case OP_TYPE_WORD:
-      return ps_read_16(addr);
-    case OP_TYPE_LONGWORD:
-      return ps_read_32(addr);
-  }
-  // This shouldn't actually happen.
-  return 0;
-}
-
-static inline void ps_write(uint8_t type, uint32_t addr, uint32_t val) {
-  switch (type) {
-    case OP_TYPE_BYTE:
-      ps_write_8(addr, val);
-      return;
-    case OP_TYPE_WORD:
-      ps_write_16(addr, val);
-      return;
-    case OP_TYPE_LONGWORD:
-      ps_write_32(addr, val);
-      return;
-  }
-  // This shouldn't actually happen.
-  return;
-}
-
 static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t *res) {
   switch (cfg->platform->id) {
-    case PLATFORM_AMIGA:
-      switch (addr) {
-        case INTREQR:
-          return amiga_handle_intrqr_read(res);
-          break;
-        case CIAAPRA:
-          if (mouse_hook_enabled && (mouse_buttons & 0x01)) {
-            rres = (uint32_t)ps_read(type, addr);
-            *res = (rres ^ 0x40);
-            return 1;
-          }
-          if (swap_df0_with_dfx && spoof_df0_id) {
-            // DF0 doesn't emit a drive type ID on RDY pin
-            // If swapping DF0 with DF1-3 we need to provide this ID so that DF0 continues to function.
-            rres = (uint32_t)ps_read(type, addr);
-            *res = (rres & 0xDF); // Spoof drive id for swapped DF0 by setting RDY low
-            return 1;
-          }
-          return 0;
-          break;
-        case CIAAICR:
-          if (kb_hook_enabled && get_num_kb_queued() && amiga_emulating_irq(PORTS)) {
-            *res = 0x88;
-            return 1;
-          }
-          return 0;
-          break;
-        case CIAADAT:
-          if (kb_hook_enabled && amiga_emulating_irq(PORTS)) {
-            uint8_t c = 0, t = 0;
-            pop_queued_key(&c, &t);
-            t ^= 0x01;
-            rres = ((c << 1) | t) ^ 0xFF;
-            *res = rres;
-            return 1;
-          }
-          return 0;
-          break;
-        case JOY0DAT:
-          if (mouse_hook_enabled) {
-            unsigned short result = (mouse_dy << 8) | (mouse_dx);
-            *res = (unsigned int)result;
-            return 1;
-          }
-          return 0;
-          break;
-        case INTENAR: {
-          // This code is kind of strange and should probably be reworked/revoked.
-          uint8_t enable = 1;
-          rres = (uint16_t)ps_read(type, addr);
-          uint16_t val = rres;
-          if (val & 0x0007) {
-            ipl_enabled[1] = enable;
-          }
-          if (val & 0x0008) {
-            ipl_enabled[2] = enable;
-          }
-          if (val & 0x0070) {
-            ipl_enabled[3] = enable;
-          }
-          if (val & 0x0780) {
-            ipl_enabled[4] = enable;
-          }
-          if (val & 0x1800) {
-            ipl_enabled[5] = enable;
-          }
-          if (val & 0x2000) {
-            ipl_enabled[6] = enable;
-          }
-          if (val & 0x4000) {
-            ipl_enabled[7] = enable;
-          }
-          //printf("Interrupts enabled: M:%d 0-6:%d%d%d%d%d%d\n", ipl_enabled[7], ipl_enabled[6], ipl_enabled[5], ipl_enabled[4], ipl_enabled[3], ipl_enabled[2], ipl_enabled[1]);
-          *res = rres;
-          return 1;
-          break;
-        }
-        case POTGOR:
-          if (mouse_hook_enabled) {
-            unsigned short result = (unsigned short)ps_read(type, addr);
-            // bit 1 rmb, bit 2 mmb
-            if (mouse_buttons & 0x06) {
-              *res = (unsigned int)((result ^ ((mouse_buttons & 0x02) << 9))   // move rmb to bit 10
-                                  & (result ^ ((mouse_buttons & 0x04) << 6))); // move mmb to bit 8
-              return 1;
-            }
-            *res = (unsigned int)(result & 0xfffd);
-            return 1;
-          }
-          return 0;
-          break;
-        case CIABPRB:
-          if (swap_df0_with_dfx) {
-            uint32_t result = (uint32_t)ps_read(type, addr);
-            // SEL0 = 0x80, SEL1 = 0x10, SEL2 = 0x20, SEL3 = 0x40
-            if (((result >> SEL0_BITNUM) & 1) != ((result >> (SEL0_BITNUM + swap_df0_with_dfx)) & 1)) { // If the value for SEL0/SELx differ
-              result ^= ((1 << SEL0_BITNUM) | (1 << (SEL0_BITNUM + swap_df0_with_dfx)));                // Invert both bits to swap them around
-            }
-            *res = result;
-            return 1;
-          }
-          return 0;
-          break;
-        default:
-          break;
-      }
-
-      if (move_slow_to_chip && addr >= 0x080000 && addr <= 0x0FFFFF) {
-        // A500 JP2 connects Agnus' A19 input to A23 instead of A19 by default, and decodes trapdoor memory at 0xC00000 instead of 0x080000.
-        // We can move the trapdoor to chipram simply by rewriting the address.
-        addr += 0xB80000;
-        *res = ps_read(type, addr);
-        return 1;
-      }
-
-      if (move_slow_to_chip && addr >= 0xC00000 && addr <= 0xC7FFFF) {
-        // Block accesses through to trapdoor at slow ram address, otherwise it will be detected at 0x080000 and 0xC00000.
-        *res = 0;
-        return 1;
-      }
-
-      if (addr >= cfg->custom_low && addr < cfg->custom_high) {
-        if (addr >= PISCSI_OFFSET && addr < PISCSI_UPPER) {
-          *res = handle_piscsi_read(addr, type);
-          return 1;
-        }
-        if (addr >= PINET_OFFSET && addr < PINET_UPPER) {
-          *res = handle_pinet_read(addr, type);
-          return 1;
-        }
-        if (addr >= PIGFX_RTG_BASE && addr < PIGFX_UPPER) {
-          *res = rtg_read((addr & 0x0FFFFFFF), type);
-          return 1;
-        }
-        if (addr >= PI_AHI_OFFSET && addr < PI_AHI_UPPER) {
-          *res = handle_pi_ahi_read(addr, type);
-          return 1;
-        }
-        if (custom_read_amiga(cfg, addr, &target, type) != -1) {
-          *res = target;
-          return 1;
-        }
-      }
-
-      break;
     case PLATFORM_MAC:
       /* Mac SE BBU clears OVL on first access to ROM/SCSI range */
       if (ovl && addr >= ovl_sysrom_pos && addr < ovl_sysrom_pos + 0x100000) {
@@ -2180,114 +1932,6 @@ static inline int32_t platform_write_check(uint8_t type, uint32_t addr, uint32_t
       }
       break;
     }
-    case PLATFORM_AMIGA:
-      switch (addr) {
-        case INTREQ:
-          return amiga_handle_intrq_write(val);
-          break;
-        case CIAAPRA:
-          if (ovl != (val & (1 << 0))) {
-            ovl = (val & (1 << 0));
-            m68ki_cpu.ovl = ovl;
-            printf("OVL:%x\n", ovl);
-          }
-          return 0;
-          break;
-        case SERDAT: {
-          char *serdat = (char *)&val;
-          // SERDAT word. see amiga dev docs appendix a; upper byte is control codes, and bit 0 is always 1.
-          // ignore this upper byte as it's not viewable data, only display lower byte.
-          printf("%c", serdat[0]);
-          return 0;
-          break;
-        }
-        case INTENA: {
-          // This code is kind of strange and should probably be reworked/revoked.
-          uint8_t enable = 1;
-          if (!(val & 0x8000))
-            enable = 0;
-          if (val & 0x0007) {
-            ipl_enabled[1] = enable;
-          }
-          if (val & 0x0008) {
-            ipl_enabled[2] = enable;
-          }
-          if (val & 0x0070) {
-            ipl_enabled[3] = 1;
-          }
-          if (val & 0x0780) {
-            ipl_enabled[4] = enable;
-          }
-          if (val & 0x1800) {
-            ipl_enabled[5] = enable;
-          }
-          if (val & 0x2000) {
-            ipl_enabled[6] = enable;
-          }
-          if (val & 0x4000 && enable) {
-            ipl_enabled[7] = 1;
-          }
-          //printf("Interrupts enabled: M:%d 0-6:%d%d%d%d%d%d\n", ipl_enabled[7], ipl_enabled[6], ipl_enabled[5], ipl_enabled[4], ipl_enabled[3], ipl_enabled[2], ipl_enabled[1]);
-          return 0;
-          break;
-        }
-        case CIABPRB:
-          if (swap_df0_with_dfx) {
-            if ((val & ((1 << (SEL0_BITNUM + swap_df0_with_dfx)) | 0x80)) == 0x80) {
-              // If drive selected but motor off, Amiga is reading drive ID.
-              spoof_df0_id = 1;
-            } else {
-              spoof_df0_id = 0;
-            }
-
-            if (((val >> SEL0_BITNUM) & 1) != ((val >> (SEL0_BITNUM + swap_df0_with_dfx)) & 1)) { // If the value for SEL0/SELx differ
-              val ^= ((1 << SEL0_BITNUM) | (1 << (SEL0_BITNUM + swap_df0_with_dfx)));             // Invert both bits to swap them around
-            }
-            ps_write(type,addr,val);
-            return 1;
-          }
-          return 0;
-          break;
-        default:
-          break;
-      }
-
-      if (move_slow_to_chip && addr >= 0x080000 && addr <= 0x0FFFFF) {
-        // A500 JP2 connects Agnus' A19 input to A23 instead of A19 by default, and decodes trapdoor memory at 0xC00000 instead of 0x080000.
-        // We can move the trapdoor to chipram simply by rewriting the address.
-        addr += 0xB80000;
-        ps_write(type,addr,val);
-        return 1;
-      }
-
-      if (move_slow_to_chip && addr >= 0xC00000 && addr <= 0xC7FFFF) {
-        // Block accesses through to trapdoor at slow ram address, otherwise it will be detected at 0x080000 and 0xC00000.
-        return 1;
-      }
-
-      if (addr >= cfg->custom_low && addr < cfg->custom_high) {
-        if (addr >= PISCSI_OFFSET && addr < PISCSI_UPPER) {
-          handle_piscsi_write(addr, val, type);
-          return 1;
-        }
-        if (addr >= PINET_OFFSET && addr < PINET_UPPER) {
-          handle_pinet_write(addr, val, type);
-          return 1;
-        }
-        if (addr >= PIGFX_RTG_BASE && addr < PIGFX_UPPER) {
-          rtg_write((addr & 0x0FFFFFFF), val, type);
-          return 1;
-        }
-        if (addr >= PI_AHI_OFFSET && addr < PI_AHI_UPPER) {
-          handle_pi_ahi_write(addr, val, type);
-          return 1;
-        }
-        if (custom_write_amiga(cfg, addr, val, type) != -1) {
-          return 1;
-        }
-      }
-
-      break;
     default:
       break;
   }
