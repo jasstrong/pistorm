@@ -4,6 +4,7 @@
 #include <stdarg.h>
 
 #include "softfloat/softfloat.h"
+#include "softfloat/softfloat_native.h"
 #include "m68kcpu.h"
 
 float_status status;

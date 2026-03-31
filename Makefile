@@ -36,7 +36,7 @@ ifeq ($(PLATFORM),PI3_BULLSEYE)
 	CFLAGS    = $(WARNINGS) -I. -march=armv8-a -mfloat-abi=hard -mfpu=neon-fp-armv8 -O3 -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE -D_LARGEFILE64_SOURCE -lstdc++ $(ACFLAGS)
 else ifeq ($(PLATFORM),PI4_AARCH64)
 	LFLAGS    = $(WARNINGS) -L/usr/local/lib -ldl -lstdc++ -lasound -lvncserver -lm
-	CFLAGS    = $(WARNINGS) -I. -march=armv8-a -O3 -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE -D_LARGEFILE64_SOURCE -lstdc++ $(ACFLAGS)
+	CFLAGS    = $(WARNINGS) -I. -march=armv8-a -O3 -DSOFTFLOAT_NATIVE -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE -D_LARGEFILE64_SOURCE -lstdc++ $(ACFLAGS)
 else ifeq ($(PLATFORM),PI4)
 	LFLAGS    = $(WARNINGS) -L/usr/local/lib -ldl -lstdc++ -lasound -lvncserver -lm
 	CFLAGS    = $(WARNINGS) -I. -march=armv8-a -mfloat-abi=hard -mfpu=neon-fp-armv8 -O3 -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE -D_LARGEFILE64_SOURCE -lstdc++ $(ACFLAGS)
