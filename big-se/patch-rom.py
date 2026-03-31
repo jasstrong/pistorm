@@ -19,11 +19,11 @@ def patch_rom(infile, outfile):
     patches = 0
     log = []
 
-    def patch32(off, old_base, new_base):
+    def patch32(off, old_base, new_base, size=0x100000):
         """Patch a 32-bit value at offset if it's in the target range."""
         nonlocal patches
         val = struct.unpack_from('>I', rom, off)[0]
-        if old_base <= val < old_base + 0x100000:
+        if old_base <= val < old_base + size:
             new_val = val - old_base + new_base
             struct.pack_into('>I', rom, off, new_val)
             log.append(f"  ${off+0x800000:06X} (+${off:05X}): ${val:08X} → ${new_val:08X}")
@@ -78,7 +78,11 @@ def patch_rom(infile, outfile):
             # Next 4 bytes are the absolute address
             if patch32(off + 2, 0x400000, 0x800000):
                 log[-1] = f"  {abs_opcodes[opcode]:10s} " + log[-1].split(': ', 1)[1]
-            if patch32(off + 2, 0x580000, 0x880000):
+            # SCSI+IWM: $580000-$5FFFFF → $880000-$8FFFFF
+            # This catches both SCSI ($580000) and IWM ($5FF000).
+            # IWM at $8FF000 reads from WTC RAM (harmless zeros) and
+            # the ROM's polling loops timeout via DBEQ counters.
+            if patch32(off + 2, 0x580000, 0x880000, size=0x80000):
                 log[-1] = f"  {abs_opcodes[opcode]:10s} " + log[-1].split(': ', 1)[1]
             # Video/sound buffer: $3F0000-$3FFFFF → $7F0000-$7FFFFF
             if patch32(off + 2, 0x3F0000, 0x7F0000):
@@ -88,7 +92,7 @@ def patch_rom(infile, outfile):
             # Next 4 bytes are the immediate value
             if patch32(off + 2, 0x400000, 0x800000):
                 log[-1] = f"  {moveq_imm[opcode]:10s} " + log[-1].split(': ', 1)[1]
-            if patch32(off + 2, 0x580000, 0x880000):
+            if patch32(off + 2, 0x580000, 0x880000, size=0x80000):
                 log[-1] = f"  {moveq_imm[opcode]:10s} " + log[-1].split(': ', 1)[1]
             if patch32(off + 2, 0x3F0000, 0x7F0000):
                 log[-1] = f"  {moveq_imm[opcode]:10s} " + log[-1].split(': ', 1)[1]

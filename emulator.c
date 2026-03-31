@@ -485,12 +485,7 @@ void *ipl_task(void *args) {
       }
     }
 noppers:
-    NOP NOP NOP NOP NOP NOP NOP NOP
-    //NOP NOP NOP NOP NOP NOP NOP NOP
-    //NOP NOP NOP NOP NOP NOP NOP NOP
-    /*NOP NOP NOP NOP NOP NOP NOP NOP
-    NOP NOP NOP NOP NOP NOP NOP NOP
-    NOP NOP NOP NOP NOP NOP NOP NOP*/
+    usleep(1);
   }
   return args;
 }

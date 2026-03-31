@@ -249,7 +249,6 @@ int custom_read_mac68k(struct emulator_config *cfg, unsigned int addr,
     if (ovl_sysrom_pos >= 0x800000 &&
         addr >= BIGSE_SCSI_VIRT && addr < BIGSE_SCSI_VIRT + BIGSE_SCSI_SIZE) {
         uint32_t phys = addr - BIGSE_SCSI_VIRT + BIGSE_SCSI_PHYS;
-        /* SE bus is 8/16-bit; SCSI chip is on D8-D15 with stride $10 */
         *val = ps_read_8(phys);
         (void)type;
         return 1;
