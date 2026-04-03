@@ -282,6 +282,14 @@ int custom_write_mac68k(struct emulator_config *cfg, unsigned int addr,
             }
             return 1;
         }
+        /* Block heap writes to physical video/sound buffer range.
+         * The Mac thinks $3F0000-$3FFFFF is regular heap (8MB space),
+         * but the BBU reads it for video DMA.  Video writes come
+         * through the $7F0000 path above; everything else is heap
+         * data that must NOT reach the physical display buffer. */
+        if (addr >= BIGSE_VBUF_PHYS && addr < BIGSE_VBUF_PHYS + BIGSE_VBUF_SIZE) {
+            return 1;  /* swallow — WTC buffer has it, don't corrupt CRT */
+        }
     }
     return -1;
 }
