@@ -39,8 +39,11 @@ uint32_t ovl_decode_size = 0x20000; /* 128KB OVL overlay on Mac SE */
  * Musashi fast-path cache and go through real GPIO bus cycles, so the
  * BBU sees ROM reads (instruction fetches) between SCSI driver instructions.
  */
-uint32_t scsi_rom_low  = 0x41A000;
-uint32_t scsi_rom_high = 0x41C000;
+/* SCSI driver ROM exclusion zone — offset from ROM base.
+ * Instruction fetches in this range must go through the SE bus
+ * so the BBU sees real bus cycles for DMA timing. */
+#define SCSI_ROM_OFFSET_LOW   0x1A000
+#define SCSI_ROM_OFFSET_HIGH  0x1C000
 
 /* Top of RAM that must be write-through for BBU video/sound DMA */
 #define WTC_REGION_SIZE 0x10000  /* 64KB */
@@ -144,6 +147,8 @@ void handle_ovl_mappings_mac68k(struct emulator_config *cfg) {
          * instruction fetches generate real bus cycles (needed for BBU DMA
          * timing during SCSI pseudo-DMA operations). */
         m68k_remove_range(cfg->map_data[rom_index]);
+        uint32_t scsi_rom_low  = ovl_sysrom_pos + SCSI_ROM_OFFSET_LOW;
+        uint32_t scsi_rom_high = ovl_sysrom_pos + SCSI_ROM_OFFSET_HIGH;
         if (scsi_rom_low > ovl_sysrom_pos && scsi_rom_high < ovl_sysrom_pos + cfg->map_size[rom_index]) {
             m68k_add_rom_range(ovl_sysrom_pos, scsi_rom_low, cfg->map_data[rom_index]);
             m68k_add_rom_range(scsi_rom_high, ovl_sysrom_pos + cfg->map_size[rom_index],
