@@ -139,11 +139,23 @@ void handle_ovl_mappings_mac68k(struct emulator_config *cfg) {
         /* Config offset tracks OVL for the slow-path mapped read handler */
         cfg->map_offset[rom_index] = (ovl) ? 0x0 : ovl_sysrom_pos;
         cfg->map_high[rom_index] = cfg->map_offset[rom_index] + cfg->map_size[rom_index];
-        /* Fast-path: ROM always at 0x400000 */
+        /* Fast-path: ROM at sysrom_pos, with exclusion zone for SCSI driver.
+         * The SCSI driver ROM area must fall through to the SE bus so that
+         * instruction fetches generate real bus cycles (needed for BBU DMA
+         * timing during SCSI pseudo-DMA operations). */
         m68k_remove_range(cfg->map_data[rom_index]);
-        m68k_add_rom_range(ovl_sysrom_pos, ovl_sysrom_pos + cfg->map_size[rom_index], cfg->map_data[rom_index]);
-        printf("[MAC68K] ROM at %08X (fast-path at %08X-%08X)\n",
-               cfg->map_offset[rom_index], ovl_sysrom_pos, ovl_sysrom_pos + cfg->map_size[rom_index]);
+        if (scsi_rom_low > ovl_sysrom_pos && scsi_rom_high < ovl_sysrom_pos + cfg->map_size[rom_index]) {
+            m68k_add_rom_range(ovl_sysrom_pos, scsi_rom_low, cfg->map_data[rom_index]);
+            m68k_add_rom_range(scsi_rom_high, ovl_sysrom_pos + cfg->map_size[rom_index],
+                               cfg->map_data[rom_index] + (scsi_rom_high - ovl_sysrom_pos));
+            printf("[MAC68K] ROM at %08X (fast-path split: %08X-%08X, %08X-%08X)\n",
+                   cfg->map_offset[rom_index], ovl_sysrom_pos, scsi_rom_low,
+                   scsi_rom_high, ovl_sysrom_pos + cfg->map_size[rom_index]);
+        } else {
+            m68k_add_rom_range(ovl_sysrom_pos, ovl_sysrom_pos + cfg->map_size[rom_index], cfg->map_data[rom_index]);
+            printf("[MAC68K] ROM at %08X (fast-path at %08X-%08X)\n",
+                   cfg->map_offset[rom_index], ovl_sysrom_pos, ovl_sysrom_pos + cfg->map_size[rom_index]);
+        }
     }
 
     index = get_named_mapped_item(cfg, "sysram");
