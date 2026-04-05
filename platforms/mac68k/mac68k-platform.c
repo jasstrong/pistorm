@@ -266,7 +266,13 @@ int custom_read_mac68k(struct emulator_config *cfg, unsigned int addr,
     if (ovl_sysrom_pos >= 0x800000 &&
         addr >= BIGSE_SCSI_VIRT && addr < BIGSE_SCSI_VIRT + BIGSE_SCSI_SIZE) {
         uint32_t phys = addr - BIGSE_SCSI_VIRT + BIGSE_SCSI_PHYS;
-        *val = ps_read_8(phys);
+        if (phys >= 0x5FF000) {
+            /* IWM needs paced IO — BBU state machine must advance
+             * between accesses for the handshake to complete. */
+            *val = ps_read_8_paced(phys);
+        } else {
+            *val = ps_read_8(phys);
+        }
         (void)type;
         return 1;
     }
@@ -277,10 +283,14 @@ int custom_write_mac68k(struct emulator_config *cfg, unsigned int addr,
                         unsigned int val, unsigned char type) {
     if (cfg) {}
     if (ovl_sysrom_pos >= 0x800000) {
-        /* SCSI remap */
+        /* SCSI + IWM remap */
         if (addr >= BIGSE_SCSI_VIRT && addr < BIGSE_SCSI_VIRT + BIGSE_SCSI_SIZE) {
             uint32_t phys = addr - BIGSE_SCSI_VIRT + BIGSE_SCSI_PHYS;
-            ps_write_8(phys, val);
+            if (phys >= 0x5FF000) {
+                ps_write_8_paced(phys, val);
+            } else {
+                ps_write_8(phys, val);
+            }
             (void)type;
             return 1;
         }
