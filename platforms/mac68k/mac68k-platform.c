@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <time.h>
 #include "platforms/platforms.h"
 #include "platforms/shared/rtc.h"
 #include "gpio/ps_protocol.h"
@@ -33,6 +34,7 @@ extern unsigned int ovl;
 
 uint32_t ovl_sysrom_pos = 0x400000;
 uint32_t ovl_decode_size = 0x20000; /* 128KB OVL overlay on Mac SE */
+static uint32_t bigse_vbuf_virt = 0x7F0000;  /* video buffer virt addr, set by OVL handler */
 
 /*
  * SCSI driver ROM exclusion zone: addresses in this range bypass the
@@ -206,6 +208,11 @@ void handle_ovl_mappings_mac68k(struct emulator_config *cfg) {
             /* OVL off: RAM at 0x000000 */
             uint32_t ram_end = cfg->map_size[index];
             uint32_t wtc_start = ram_end - WTC_REGION_SIZE;
+            /* Set video buffer virtual address — 24-bit masked, because
+             * custom_write sees addresses after slow-path 24-bit mask.
+             * big-se (8MB): $7F0000.  huge-se (32MB): $01FF0000 → $FF0000. */
+            if (ovl_sysrom_pos >= 0x800000)
+                bigse_vbuf_virt = wtc_start & 0x00FFFFFF;
             ram_range_ptr = cfg->map_data[index];
             cfg->map_offset[index] = 0x0;
             cfg->map_high[index] = cfg->map_size[index];
@@ -249,26 +256,77 @@ void shutdown_platform_mac68k(struct emulator_config *cfg) {
     printf("[MAC68K] Platform shutdown completed.\n");
 }
 
-/* Big SE: remap SCSI from $880000 to $580000 on the SE bus */
+/* Big SE: remap SCSI ($580000) and IWM ($5FF000) from virtual $88xxxx/$8FFxxx.
+ * Range must NOT cover $81A000-$81FFFF — those are ROM exclusion zone reads
+ * that alias through 24-bit masking and must reach the SE bus as ROM, not SCSI. */
 #define BIGSE_SCSI_VIRT  0x880000
 #define BIGSE_SCSI_SIZE  0x080000
 #define BIGSE_SCSI_PHYS  0x580000
 
-/* Big SE: video buffer remap — top 64K of 8MB ($7F0000) → top 64K of
- * physical 4MB ($3F0000) so the BBU reads correct pixel data for the CRT. */
-#define BIGSE_VBUF_VIRT  0x7F0000
+/* Big/Huge SE: video buffer remap — see bigse_vbuf_virt declared above */
 #define BIGSE_VBUF_SIZE  0x010000
 #define BIGSE_VBUF_PHYS  0x3F0000
 
 int custom_read_mac68k(struct emulator_config *cfg, unsigned int addr,
                        unsigned int *val, unsigned char type) {
     if (cfg) {}
+    /* SCSI/IWM I/O handler.
+     * Big SE:  ROM uses $880000+ → remap to $580000+ on SE bus.
+     * Huge SE: ROM uses $40580000+ → slow-path masks to $580000+ → direct.
+     * Both cases: phys ends up as $580000-$5FFFFF. */
+    /* Huge SE: ROM exclusion zone reads land here after 24-bit masking.
+     * $4081Axxx → masked $81Axxx. On big-se, handle_mapped_read catches
+     * these (ROM at $800000). On huge-se (ROM at $40800000), they fall
+     * through — serve from ROM buffer directly. */
+    if (ovl_sysrom_pos >= 0x40000000) {
+        uint32_t rom_masked = ovl_sysrom_pos & 0x00FFFFFF;  /* $800000 for $40800000 */
+        if (addr >= rom_masked && addr < rom_masked + 0x80000) {
+            /* Read from ROM buffer */
+            extern struct emulator_config *cfg;
+            int32_t rom_idx = get_named_mapped_item(cfg, "sysrom");
+            if (rom_idx >= 0) {
+                uint32_t off = addr - rom_masked;
+                unsigned char *rom_data = cfg->map_data[rom_idx];
+                if (type == 0) *val = rom_data[off];
+                else if (type == 1) *val = (rom_data[off] << 8) | rom_data[off+1];
+                else *val = (rom_data[off] << 24) | (rom_data[off+1] << 16) |
+                            (rom_data[off+2] << 8) | rom_data[off+3];
+                return 1;
+            }
+        }
+    }
+
+    uint32_t phys = 0;
     if (ovl_sysrom_pos >= 0x800000 &&
         addr >= BIGSE_SCSI_VIRT && addr < BIGSE_SCSI_VIRT + BIGSE_SCSI_SIZE) {
-        uint32_t phys = addr - BIGSE_SCSI_VIRT + BIGSE_SCSI_PHYS;
+        phys = addr - BIGSE_SCSI_VIRT + BIGSE_SCSI_PHYS;
+    } else if (ovl_sysrom_pos >= 0x40000000 &&
+               addr >= 0x580000 && addr < 0x600000) {
+        phys = addr;
+    }
+    if (phys) {
         if (phys >= 0x5FF000) {
             /* IWM needs paced IO — BBU state machine must advance
              * between accesses for the handshake to complete. */
+            static uint32_t iwm_poll_count = 0;
+            static uint32_t iwm_last_addr = 0;
+            static uint64_t iwm_total_reads = 0;
+            iwm_total_reads++;
+            if (phys == iwm_last_addr) {
+                if (++iwm_poll_count > 500000 && iwm_total_reads > 5000000) {
+                    /* IWM polling loop stuck with interrupts masked.
+                     * Unmask interrupts so VBL keeps firing — the
+                     * loop will eventually time out on its own. */
+                    unsigned int sr = m68k_get_reg(NULL, M68K_REG_SR);
+                    if (sr & 0x0700) {
+                        m68k_set_reg(NULL, M68K_REG_SR, sr & ~0x0700);
+                        iwm_poll_count = 0;
+                    }
+                }
+            } else {
+                iwm_poll_count = 0;
+                iwm_last_addr = phys;
+            }
             *val = ps_read_8_paced(phys);
         } else {
             *val = ps_read_8(phys);
@@ -283,21 +341,24 @@ int custom_write_mac68k(struct emulator_config *cfg, unsigned int addr,
                         unsigned int val, unsigned char type) {
     if (cfg) {}
     if (ovl_sysrom_pos >= 0x800000) {
-        /* SCSI + IWM remap */
-        if (addr >= BIGSE_SCSI_VIRT && addr < BIGSE_SCSI_VIRT + BIGSE_SCSI_SIZE) {
-            uint32_t phys = addr - BIGSE_SCSI_VIRT + BIGSE_SCSI_PHYS;
-            if (phys >= 0x5FF000) {
+        /* SCSI + IWM write handler (same logic as custom_read) */
+        uint32_t phys = 0;
+        if (addr >= BIGSE_SCSI_VIRT && addr < BIGSE_SCSI_VIRT + BIGSE_SCSI_SIZE)
+            phys = addr - BIGSE_SCSI_VIRT + BIGSE_SCSI_PHYS;
+        else if (ovl_sysrom_pos >= 0x40000000 && addr >= 0x580000 && addr < 0x600000)
+            phys = addr;
+        if (phys) {
+            if (phys >= 0x5FF000)
                 ps_write_8_paced(phys, val);
-            } else {
+            else
                 ps_write_8(phys, val);
-            }
             (void)type;
             return 1;
         }
         /* Video buffer remap — WTC already wrote to Pi RAM buffer;
          * now send the write to the physical SE bus for the BBU/CRT. */
-        if (addr >= BIGSE_VBUF_VIRT && addr < BIGSE_VBUF_VIRT + BIGSE_VBUF_SIZE) {
-            uint32_t phys = addr - BIGSE_VBUF_VIRT + BIGSE_VBUF_PHYS;
+        if (addr >= bigse_vbuf_virt && addr < bigse_vbuf_virt + BIGSE_VBUF_SIZE) {
+            uint32_t phys = addr - bigse_vbuf_virt + BIGSE_VBUF_PHYS;
             /* type: 0=byte, 1=word, 2=longword (enum map_op_types) */
             if (type >= 2) {  /* longword */
                 ps_write_16(phys, val >> 16);

@@ -448,6 +448,12 @@ int gestalt_trap_intercept(void) {
     if (is_040) result = 3;
     else if (is_030) result = 2;
     else return 0;
+  } else if (selector == 0x61646472) {  // 'addr' (gestaltAddressingModeAttr)
+    if (cpu_type == M68K_CPU_TYPE_68030)
+      result = 0x07;  /* gestalt32BitAddressing | gestalt32BitSysZone | gestalt32BitCapable */
+    else if (is_030)
+      result = 0x00;  /* 24-bit mode */
+    else return 0;
   } else if (selector == 0x63707574) {  // 'cput' (gestaltNativeCPUtype)
     if (is_040) result = 0x104;
     else if (is_030) result = 0x103;
@@ -691,22 +697,107 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			/* Call external hook to peek at CPU */
 			m68ki_instr_hook(REG_PC); /* auto-disable (see m68kcpu.h) */
 
+			/* OVL off: when PC enters ROM range. The slow-path OVL check
+			 * doesn't fire for fast-path ROM reads. On big-se this works
+			 * because the SCSI exclusion zone forces slow-path reads, but
+			 * on huge-se the sizing skip means ROM code reaches the stack
+			 * before any exclusion-zone fetch. */
+			if (state->ovl && REG_PC >= ovl_sysrom_pos &&
+			    REG_PC < ovl_sysrom_pos + 0x80000) {
+				ovl = 0;
+				state->ovl = 0;
+				printf("[MAC] OVL off (PC=$%08X in ROM range)\n", REG_PC);
+				handle_ovl_mappings_mac68k(cfg);
+			}
+
+			/* Early boot trace — print last 50 instructions before sad mac */
+			{
+				static uint32_t boot_ring[64];
+				static int boot_idx = 0;
+				static int boot_done = 0;
+				if (!boot_done) {
+					boot_ring[boot_idx & 63] = REG_PC;
+					boot_idx++;
+					/* Detect entry to sad mac handler (ROM offset $2000-$2400) */
+					uint32_t rom_off = REG_PC - ovl_sysrom_pos;
+					if (rom_off >= 0x2000 && rom_off < 0x2400 && boot_idx > 100) {
+						printf("[BOOT] Sad mac entered at PC=$%08X after %d instructions\n",
+						       REG_PC, boot_idx);
+						printf("[BOOT] Last 50 PCs before sad mac:\n");
+						for (int i = 50; i > 0; i--) {
+							int idx = (boot_idx - i) & 63;
+							printf("  $%08X\n", boot_ring[idx]);
+						}
+						printf("[BOOT] D0-D7: %08X %08X %08X %08X %08X %08X %08X %08X\n",
+						       REG_DA[0], REG_DA[1], REG_DA[2], REG_DA[3],
+						       REG_DA[4], REG_DA[5], REG_DA[6], REG_DA[7]);
+						printf("[BOOT] A0-A7: %08X %08X %08X %08X %08X %08X %08X %08X\n",
+						       REG_DA[8], REG_DA[9], REG_DA[10], REG_DA[11],
+						       REG_DA[12], REG_DA[13], REG_DA[14], REG_DA[15]);
+						boot_done = 1;
+					}
+				}
+			}
+
 			/* Big SE: redirect PC from old ROM space ($4xxxxx) to new ($8xxxxx).
 			 * Code loaded from disk may reference $4xxxxx ROM addresses that
 			 * the prescan didn't catch. Only redirect if the RAM at that
 			 * address looks like ROM content (not like normal RAM data). */
 
-			/* Big SE: force MemTop to 8MB after memory sizing returns.
-			 * $800048 is the first instruction after the sizing JMP.
-			 * A6 (FP) holds MemTop; low-mem $108 holds it later. */
+			/* Big/Huge SE: force MemTop after memory sizing returns.
+			 * The sizing routine ends with a JMP; the next instruction
+			 * is at sysrom_pos+$48. A6 holds MemTop from sizing. */
 			{
 				extern uint32_t ovl_sysrom_pos;
 				static int memtop_done = 0;
+				uint32_t memtop_pc = ovl_sysrom_pos + 0x48;
 				if (!memtop_done && ovl_sysrom_pos >= 0x800000 &&
-				    ADDRESS_68K(REG_PC) == 0x800048) {
+				    REG_PC == memtop_pc) {
 					uint32_t old = REG_DA[14];
-					REG_DA[14] = 0x800000;
-					printf("[BIG-SE] MemTop forced: A6=$%06X → $800000\n", old);
+					int32_t ram_idx = get_named_mapped_item(cfg, "sysram");
+					uint32_t memtop = (ram_idx >= 0) ? cfg->map_size[ram_idx] : 0x800000;
+					REG_DA[14] = memtop;
+					printf("[HUGE-SE] MemTop forced: A6=$%08X → $%08X\n", old, memtop);
+
+					/* Huge SE: set up PMMU for 32-bit addressing.
+					 * Identity-map the entire 4GB space via 16 root entries.
+					 * TC: E=1, IS=0, TIA=4 → 16 entries of 256MB each.
+					 * The emulator's slow-path 24-bit masking handles the
+					 * actual address translation for I/O and 24-bit dirty code. */
+					if (cpu_type == M68K_CPU_TYPE_68030) {
+						uint32_t tbl = (memtop - 0x100) & ~0xF;
+						printf("[HUGE-SE] PMMU root table at $%08X\n", tbl);
+
+						/* 16 identity-mapped early-termination page descriptors.
+						 * Each covers 256MB. DT=01 (page descriptor).
+						 * Entry N: physical base = N × $10000000 */
+						for (int i = 0; i < 16; i++) {
+							uint32_t desc = ((uint32_t)i << 28) | 0x01;
+							/* I/O segments get cache-inhibit */
+							if (i >= 4 && i != 0)
+								desc |= 0x40;
+							m68k_write_memory_32(tbl + i * 4, desc);
+						}
+
+						/* Low-memory MMU globals */
+						m68k_write_memory_8(0x0CB1, 4);     /* MMUType = 68030 */
+						m68k_write_memory_32(0x0CB4, tbl);   /* MMU24Info */
+						m68k_write_memory_32(0x0CB8, tbl);   /* MMU32Info */
+						m68k_write_memory_8(0x0B73, 1);      /* 32-bit mode */
+
+						/* TC: E=1, IS=0, TIA=4
+						 * 1000 0000 0000 0100 0000 0000 0000 0000
+						 * = $80040000 */
+						m68ki_cpu.mmu_crp_limit = 0x7FFF0000;
+						m68ki_cpu.mmu_crp_aptr = tbl;
+						m68ki_cpu.mmu_srp_limit = 0x7FFF0000;
+						m68ki_cpu.mmu_srp_aptr = tbl;
+						m68ki_cpu.mmu_tc = 0x80040000;
+
+						printf("[HUGE-SE] PMMU enabled: TC=$%08X CRP=$%08X\n",
+						       m68ki_cpu.mmu_tc, m68ki_cpu.mmu_crp_aptr);
+					}
+
 					memtop_done = 1;
 				}
 			}
@@ -725,7 +816,7 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 					uint32_t scan_lo = 0, scan_hi = 0;
 
 					/* Trigger 1: Device Manager dispatch */
-					if (pc24 == 0x81A424) {
+					if (pc24 == ovl_sysrom_pos + 0x1A424) {
 						uint32_t a0 = ADDRESS_68K(REG_DA[8]);
 						if (a0 >= 0x010000 && a0 < 0x080000) {
 							scan_lo = a0 & 0xFF0000;
@@ -1352,11 +1443,11 @@ void sigint_handler(int sig_num) {
     printf("PC trace (oldest → newest):\n ");
     for (int i = 0; i < 32; i++) {
       int idx = (state->pc_trace_idx + i) & 31;
-      printf(" %06X", state->pc_trace[idx] & 0xFFFFFF);
+      printf(" %08X", state->pc_trace[idx]);
       if ((i & 7) == 7 && i < 31) printf("\n ");
     }
     printf("\n");
-    printf("Current PC: %06X  SR: %04X\n",
+    printf("Current PC: %08X  SR: %04X\n",
            m68k_get_reg(NULL, M68K_REG_PC) & 0xFFFFFF,
            m68k_get_reg(NULL, M68K_REG_SR));
     printf("D0=%08X D1=%08X D2=%08X D3=%08X\n",
@@ -1934,6 +2025,10 @@ void m68k_write_memory_8(unsigned int address, unsigned int value) {
   // 68000 has 24-bit address bus — mask upper 8 bits
   address &= 0x00FFFFFF;
 
+  if (address >= 0x51E0 && address <= 0x51F0)
+    printf("[WR8-WATCH] $%06X ← $%02X  PC=$%08X\n",
+           address, value & 0xFF, m68k_get_reg(NULL, M68K_REG_PC));
+
   if (address >= 0x580000 && address <= 0x5FFFFF) {
 #ifdef DEBUG_DIAG
     wr8_scsi++;
@@ -2144,6 +2239,12 @@ void m68k_write_memory_16(unsigned int address, unsigned int value) {
 void m68k_write_memory_32(unsigned int address, unsigned int value) {
   // 68000 has 24-bit address bus — mask upper 8 bits
   address &= 0x00FFFFFF;
+
+  /* Debug: catch writes near $51EC */
+  if (address >= 0x51E0 && address <= 0x51F0) {
+    printf("[WR32-WATCH] $%06X ← $%08X  PC=$%08X\n",
+           address, value, m68k_get_reg(NULL, M68K_REG_PC));
+  }
 
   /* Big SE: catch decompressor writing $004xxxxx values to RAM */
   { extern uint32_t ovl_sysrom_pos;
