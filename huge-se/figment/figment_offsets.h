@@ -1,0 +1,43 @@
+/* Auto-generated — do not edit */
+#define FIGMENT_TRAP_COUNT 38
+static const struct { uint8_t trap_num; uint32_t offset; } figment_trap_table[] = {
+    { 0x19, 0x40844240 }, /* fig_InitZone */
+    { 0x1A, 0x4084427A }, /* fig_GetZone */
+    { 0x1B, 0x40844286 }, /* fig_SetZone */
+    { 0x1C, 0x4084436C }, /* fig_FreeMem */
+    { 0x1D, 0x40844378 }, /* fig_MaxMem */
+    { 0x1E, 0x4084431A }, /* fig_NewPtr */
+    { 0x1F, 0x40844332 }, /* fig_DisposePtr */
+    { 0x20, 0x4084434A }, /* fig_SetPtrSize */
+    { 0x21, 0x4084433E }, /* fig_GetPtrSize */
+    { 0x22, 0x40844292 }, /* fig_NewHandle */
+    { 0x23, 0x408442BE }, /* fig_DisposeHandle */
+    { 0x24, 0x408442D6 }, /* fig_SetHandleSize */
+    { 0x25, 0x408442CA }, /* fig_GetHandleSize */
+    { 0x26, 0x408442E4 }, /* fig_HandleZone */
+    { 0x27, 0x4084430C }, /* fig_ReallocHandle */
+    { 0x28, 0x408442F8 }, /* fig_RecoverHandle */
+    { 0x29, 0x408443C0 }, /* fig_HLock */
+    { 0x2A, 0x408443CC }, /* fig_HUnlock */
+    { 0x2B, 0x408443B4 }, /* fig_EmptyHandle */
+    { 0x2C, 0x40844476 }, /* fig_InitApplZone */
+    { 0x2D, 0x4084425E }, /* fig_SetApplLimit */
+    { 0x36, 0x40844272 }, /* fig_MoreMasters */
+    { 0x40, 0x40844398 }, /* fig_ReserveMem */
+    { 0x48, 0x40844358 }, /* fig_PtrZone */
+    { 0x49, 0x408443D8 }, /* fig_HPurge */
+    { 0x4A, 0x408443E4 }, /* fig_HNoPurge */
+    { 0x4B, 0x408443F0 }, /* fig_SetGrowZone */
+    { 0x4C, 0x4084438A }, /* fig_CompactMem */
+    { 0x4D, 0x408443A6 }, /* fig_PurgeMem */
+    { 0x61, 0x40844414 }, /* fig_MaxBlock */
+    { 0x62, 0x40844420 }, /* fig_PurgeSpace */
+    { 0x63, 0x4084426A }, /* fig_MaxApplZone */
+    { 0x64, 0x408443FC }, /* fig_MoveHHi */
+    { 0x65, 0x40844432 }, /* fig_StackSpace */
+    { 0x67, 0x40844444 }, /* fig_HSetRBit */
+    { 0x68, 0x40844450 }, /* fig_HClrRBit */
+    { 0x69, 0x4084445C }, /* fig_HGetState */
+    { 0x6A, 0x40844468 }, /* fig_HSetState */
+    { 0, 0 }  /* sentinel */
+};

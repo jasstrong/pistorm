@@ -1265,30 +1265,74 @@ static inline uint m68ki_read_imm_32(m68ki_cpu_core *state)
 	cache->offset = state->write_data[i];
 
 // M68KI_READ_8_FC
-static inline uint m68ki_read_8_fc(m68ki_cpu_core *state, uint address, uint fc)
+static __attribute__((noinline)) uint m68ki_read_8_fc(m68ki_cpu_core *state, uint address, uint fc)
 {
 	(void)fc;
+	(void)0; /* VIA trace removed - see return trace below */
 	m68ki_set_fc(fc); /* auto-disable (see m68kcpu.h) */
 	state->mmu_tmp_fc = fc;
 	state->mmu_tmp_rw = 1;
 	state->mmu_tmp_sz = M68K_SZ_BYTE;
 
 #if M68K_EMULATE_PMMU
-	if (PMMU_ENABLED)
+	if (PMMU_ENABLED) {
+	    uint pre_pmmu = address;
 	    address = pmmu_translate_addr(state,address,1);
+	    /* Trace VIA reads: catch any address whose 24-bit portion is VIA */
+	    {
+	        uint32_t pre24 = pre_pmmu & 0x00FFFFFF;
+	        if (pre24 >= 0xEFE000 && pre24 <= 0xEFFFFF) {
+	            static int pmmu_via_dbg = 0;
+	            if (pmmu_via_dbg++ < 10)
+	                printf("[PMMU-VIA] pre=$%08X post=$%08X PC=$%08X\n",
+	                       pre_pmmu, address, REG_PC);
+	        }
+	    }
+	}
 #endif
 
 	/* 68000/010/EC020: mask to 24-bit before fast-path range checks */
 	address = ADDRESS_68K(address);
 
+	/* VIA IFR poll trace — track which path VIA reads take */
+	{
+		static int via_rd8_dbg = 0;
+		uint32_t masked24 = address & 0x00FFFFFF;
+		if (masked24 >= 0xEFE000 && masked24 <= 0xEFFFFF && via_rd8_dbg < 10) {
+			via_rd8_dbg++;
+			printf("[VIA-RD8] #%d addr=$%08X (masked=$%06X) PC=$%08X\n",
+			       via_rd8_dbg, address, masked24, REG_PC);
+		}
+	}
+
 	address_translation_cache *cache = &state->fc_read_translation_cache;
 	if(cache->offset && address >= cache->lower && address < cache->upper)
 	{
+		{
+			uint32_t masked24 = address & 0x00FFFFFF;
+			if (masked24 >= 0xEFE000 && masked24 <= 0xEFFFFF) {
+				static int ch_via = 0;
+				if (ch_via++ < 5)
+					printf("[VIA-CACHE] addr=$%08X range=%08X-%08X val=$%02X\n",
+					       address, cache->lower, cache->upper,
+					       cache->offset[address - cache->lower]);
+			}
+		}
 		return cache->offset[address - cache->lower];
 	}
 
 	for (int i = 0; i < state->read_ranges; i++) {
 		if(address >= state->read_addr[i] && address < state->read_upper[i]) {
+			{
+				uint32_t masked24 = address & 0x00FFFFFF;
+				if (masked24 >= 0xEFE000 && masked24 <= 0xEFFFFF) {
+					static int rh_via = 0;
+					if (rh_via++ < 5)
+						printf("[VIA-RANGE] addr=$%08X range[%d]=%08X-%08X val=$%02X\n",
+						       address, i, state->read_addr[i], state->read_upper[i],
+						       state->read_data[i][address - state->read_addr[i]]);
+				}
+			}
 			SET_FC_TRANSLATION_CACHE_VALUES
 			return state->read_data[i][address - state->read_addr[i]];
 		}
@@ -1300,7 +1344,17 @@ static inline uint m68ki_read_8_fc(m68ki_cpu_core *state, uint address, uint fc)
 	}
 #endif
 
-	return m68k_read_memory_8(ADDRESS_68K(address));
+	{
+		uint val = m68k_read_memory_8(ADDRESS_68K(address));
+		/* Debug: VIA reads during dispatch */
+		if (address >= 0x40EF0000 && address <= 0x40EFFFFF &&
+		    REG_PC >= 0x40802B30 && REG_PC <= 0x40802B50) {
+			static volatile int dv = 0;
+			if (dv++ < 10)
+				printf("[VIA-VAL] PC=$%08X addr=$%08X val=$%02X\n", REG_PC, address, val);
+		}
+		return val;
+	}
 }
 
 // M68KI_READ_16_FC
@@ -1354,10 +1408,13 @@ static inline uint m68ki_read_32_fc(m68ki_cpu_core *state, uint address, uint fc
 	state->mmu_tmp_sz = M68K_SZ_LONG;
 	m68ki_check_address_error_010_less(state, address, MODE_READ, fc); /* auto-disable (see m68kcpu.h) */
 
+	uint orig_addr = address;
 #if M68K_EMULATE_PMMU
 	if (PMMU_ENABLED)
 	    address = pmmu_translate_addr(state,address,1);
 #endif
+
+	(void)orig_addr;
 
 	/* 68000/010/EC020: mask to 24-bit before fast-path range checks */
 	address = ADDRESS_68K(address);
@@ -1448,6 +1505,16 @@ static inline void m68ki_write_8_fc(m68ki_cpu_core *state, uint address, uint fc
 // M68KI_WRITE_16_FC
 static inline void m68ki_write_16_fc(m68ki_cpu_core *state, uint address, uint fc, uint value)
 {
+	/* DSErrCode watchpoint (16-bit) */
+	if ((address & 0x00FFFFFF) == 0x0AF0 && value != 0) {
+		printf("[DSERR16-WR] $%04X ← $%04X  PC=$%08X  SP=$%08X\n",
+			address & 0xFFFF, value & 0xFFFF, REG_PPC, REG_DA[15]);
+		/* Dump the stack to find the BSR chain */
+		printf("  Stack: ");
+		for (int i = 0; i < 8; i++)
+			printf("$%08X ", m68ki_read_32(state, (REG_DA[15] + i*4) & 0x00FFFFFF));
+		printf("\n");
+	}
 	/* Big SE: proactive instruction fixup on 16-bit write.
 	 * When writing to RAM, check if we just completed a $004xxxxx
 	 * operand after a known opcode. If so, patch both halves. */
@@ -1549,7 +1616,41 @@ static inline void m68ki_write_32_fc(m68ki_cpu_core *state, uint address, uint f
 	/* 68000/010/EC020: mask to 24-bit before fast-path range checks */
 	address = ADDRESS_68K(address);
 
-	/* Big SE: no write-time fixup — using proactive scan instead. */
+	/* Watch for writes to A-line vector ($028) */
+	if ((address & 0x00FFFFFF) == 0x0028) {
+		extern int figment_enabled;
+		if (figment_enabled) {
+			printf("[ALINE-VEC-WR] $028 ← $%08X  PC=$%08X\n", value, REG_PPC);
+		}
+	}
+
+	/* Figment trap table: no longer intercepted here.
+	 * Trap addresses are baked into the ROM by patch-rom.py. */
+
+	/* Debug: catch writes to UTableBase ($011C) */
+	{
+		uint32_t ba = address & 0x00FFFFFF;
+		if (ba == 0x011C) {
+			static int utbl_log = 0;
+			if (utbl_log++ < 10)
+				printf("[UTBL-WR] $011C ← $%08X  PC=$%08X\n", value, REG_PPC);
+		}
+		/* Catch the specific RM corruption write (ROM address in free block tags) */
+		if (ba == 0x273C && (value & 0xFF000000) == 0x40000000) {
+			printf("[CORRUPT] $273C ← $%08X  PC=$%08X  SP=$%08X  A6=$%08X\n",
+			       value, REG_PPC, REG_DA[15], REG_DA[14]);
+		}
+	}
+
+	/* ScrnBase watchpoint — catch any write to $0824 */
+	if ((address & 0x00FFFFFF) == 0x0824) {
+		printf("[SCRNBASE-WR] $%08X ← $%08X  PC=$%08X\n", address, value, REG_PPC);
+	}
+	/* DSErrCode watchpoint — catch _SysError */
+	if ((address & 0x00FFFFFF) == 0x0AF0) {
+		printf("[DSERR-WR] $%08X ← $%08X  PC=$%08X  SP=$%08X\n",
+			address, value, REG_PPC, REG_DA[15]);
+	}
 
 	address_translation_cache *cache = &state->fc_write_translation_cache;
 	if(cache->offset && address >= cache->lower && address < cache->upper)
@@ -2277,6 +2378,10 @@ m68ki_stack_frame_0111(m68ki_cpu_core *state, uint sr, uint vector, uint pc, uin
  */
 static inline void m68ki_exception_trap(m68ki_cpu_core *state, uint vector)
 {
+	if (vector == EXCEPTION_ZERO_DIVIDE) {
+		printf("[ZERO-DIV] PC=$%08X  IR=$%04X  D0=$%08X D1=$%08X\n",
+			REG_PPC, REG_IR, REG_DA[0], REG_DA[1]);
+	}
 	uint sr = m68ki_init_exception(state);
 
 	if(CPU_TYPE_IS_010_LESS(CPU_TYPE))
@@ -2398,11 +2503,97 @@ extern int unimp_trap_addr_valid;
 
 static inline void m68ki_exception_1010(m68ki_cpu_core *state)
 {
+	{
+		static int aline_log = 0;
+		if (aline_log < 3)
+			printf("[ALINE-DBG] trap=$%04X PC=$%08X  #%d\n", REG_IR, REG_PPC, ++aline_log);
+	}
+
+	/* PTCH dispatch trace: ROM+$4394 = JSR (A1) for System patches */
+	if ((REG_PPC & 0x00FFFFFF) == 0x804394 || (REG_PPC & 0x00FFFFFF) == 0x004394) {
+		printf("[PTCH-JSR] PC=$%08X A1=$%08X A0=$%08X  dispatching to patch code\n",
+			REG_PPC, REG_DA[9], REG_DA[8]);
+	}
+
+	/* _SysError ($A9C9) trace */
+	if (REG_IR == 0xA9C9) {
+		printf("[SYSERROR] D0=%d (0x%04X)  callerPC=$%08X  SP=$%08X\n",
+			(int)(int16_t)(REG_DA[0] & 0xFFFF), REG_DA[0] & 0xFFFF,
+			REG_PPC, REG_DA[15]);
+	}
+	/* PC watchpoint: MOVEQ #12,D0 at the two error-12 locations */
+	{
+		uint32_t pc24 = REG_PPC & 0x00FFFFFF;
+		if ((pc24 == 0x80ECCC || pc24 == 0x80ECF4 || pc24 == 0x00ECCC || pc24 == 0x00ECF4)
+		    && REG_IR == 0x700C) {
+			printf("[ERR12-PC] PC=$%08X  D0=$%08X  A0=$%08X A4=$%08X SP=$%08X\n",
+				REG_PPC, REG_DA[0], REG_DA[8], REG_DA[12], REG_DA[15]);
+		}
+	}
+
 	/* Gestalt trap ($A1AD) intercept — report 68030/FPU/MMU to System */
 	if (REG_IR == 0xA1AD) {
 		extern int gestalt_trap_intercept(void);
 		if (gestalt_trap_intercept())
 			return;  /* handled — PC already past the A-line word */
+	}
+
+	/* Debug print trap ($A0FE) — Figment calls this to print to emulator console.
+	 * A0 = pointer to null-terminated string, D0 = optional 32-bit value */
+	if (REG_IR == 0xA0FE) {
+		extern int figment_enabled;
+		if (figment_enabled) {
+			uint32_t str_addr = REG_DA[8];  /* A0 */
+			uint32_t val = REG_DA[0];       /* D0 */
+			char buf[128];
+			int i;
+			for (i = 0; i < 127; i++) {
+				buf[i] = m68k_read_memory_8(str_addr + i);
+				if (!buf[i]) break;
+			}
+			buf[i] = 0;
+			printf("[FIGMENT] %s $%08X\n", buf, val);
+			return;
+		}
+	}
+
+	/* _StripAddress ($A055) — identity in 32-bit mode.
+	 * With IS=0 PMMU, all 32 bits are significant. $40xxxxxx is the
+	 * real virtual address for ROM — stripping would turn it into RAM. */
+	if (REG_IR == 0xA055) {
+		extern int figment_enabled;
+		if (figment_enabled) {
+			static int strip_log = 0;
+			if (strip_log++ < 30)
+				printf("[STRIP] D0=$%08X  PC=$%08X\n", REG_DA[0], REG_PPC);
+			return;
+		}
+	}
+
+	/* _SwapMMUMode ($A05D) — no-op for now.
+	 * The ROM's version tries to switch PMMU modes. We handle PMMU
+	 * ourselves. Return the current mode in D0 without changing anything. */
+	if (REG_IR == 0xA05D) {
+		extern int figment_enabled;
+		if (figment_enabled) {
+			/* D0 has requested mode (0=24-bit, 1=32-bit).
+			 * Return previous mode in D0. We're always in our PMMU mode. */
+			REG_DA[0] = 1;  /* report 32-bit mode */
+			return;
+		}
+	}
+
+	/* MODE32 pseudovirt trap ($A0FF) — switch to 32-bit addressing */
+	if (REG_IR == 0xA0FF) {
+		extern int mode32_enabled;
+		if (mode32_enabled) {
+			extern int mode32_trap_handler(m68ki_cpu_core *state);
+			printf("[TRAP-A0FF] PC=$%08X D0=$%08X\n", REG_PC, REG_DA[0]);
+			if (mode32_trap_handler(state))
+				return;
+		} else {
+			return;  /* swallow trap silently */
+		}
 	}
 
 	/* Big SE: scan caller's code region on Sound Manager traps.
@@ -2440,6 +2631,48 @@ static inline void m68ki_exception_1010(m68ki_cpu_core *state)
 				if (patched)
 					printf("[TRAP-SCAN] SndMgr $%04X: %d patches in $%06X-$%06X (caller=$%06X)\n",
 						REG_IR, patched, scan_lo, scan_hi, caller);
+			}
+		}
+	}
+
+	/* SuperMario RM Toolbox trap fix: The SE ROM's A-line dispatcher discards
+	 * the return PC for non-auto-pop Toolbox traps (MOVE.L (SP)+,(SP) at $2D08).
+	 * SuperMario RM's StdEntry/StdExit expects the return PC on the stack.
+	 * Fix: intercept RM Toolbox traps here, push return PC, JMP to handler. */
+	{
+		extern int figment_enabled;
+		uint16_t trap = REG_IR;
+		if (figment_enabled && (trap & 0x0800)) {
+			/* Toolbox trap (bit 11 set). Check if it's an RM trap. */
+			uint16_t trap_idx = trap & 0x01FF;
+			uint32_t handler = m68ki_read_32(state, 0x0E00 + trap_idx * 4);
+			static int tb_log = 0;
+			if (tb_log < 3) {
+				printf("[TB-TRAP] $%04X idx=$%03X handler=$%08X figment=%d\n",
+					trap, trap_idx, handler, figment_enabled);
+				tb_log++;
+			}
+			/* RM handlers are in the mirror half at $40848000+ */
+			if (handler >= 0x40848000 && handler < 0x40860000) {
+				static int rm_trap_log = 0;
+				if (rm_trap_log++ < 50) {
+					printf("[RM-TRAP] $%04X → $%08X  retPC=$%08X",
+						trap, handler, REG_PC);
+					/* For GetResource ($A9A0), show type+ID from stack */
+					if (trap == 0xA9A0) {
+						uint32_t sp = REG_DA[15];
+						uint32_t type = m68ki_read_32(state, sp + 4);
+						uint16_t id = m68ki_read_16(state, sp + 8);
+						printf("  type='%c%c%c%c' id=%d",
+							(type>>24)&0xFF, (type>>16)&0xFF,
+							(type>>8)&0xFF, type&0xFF, (int16_t)id);
+					}
+					printf("\n");
+				}
+				uint32_t return_pc = REG_PC;
+				m68ki_push_32(state, return_pc);
+				m68ki_jump(state, handler);
+				return;
 			}
 		}
 	}
@@ -2799,6 +3032,15 @@ static inline void m68ki_exception_interrupt(m68ki_cpu_core *state, uint int_lev
 
 	/* Set the interrupt mask to the level of the one being serviced */
 	FLAG_INT_MASK = int_level<<8;
+
+	/* Debug: count interrupts */
+	{ static uint32_t int_count = 0;
+	  if (++int_count <= 5 || (int_count % 100000) == 0) {
+	    printf("[INT] #%u level=%u vec=%u PC=$%08X pmmu=%d tc=$%08X\n",
+	           int_count, int_level, vector, REG_PC,
+	           state->pmmu_enabled, state->mmu_tc);
+	  }
+	}
 
 	/* Get the new PC */
 	new_pc = m68ki_read_data_32(state, (vector << 2) + REG_VBR);

@@ -60,6 +60,28 @@ uint8_t end_signal = 0, load_new_config = 0;
 
 char disasm_buf[4096];
 
+/* PC trace: write every instruction's PC to a binary file for diffing.
+ * Enable with PC_TRACE=<filename> env var.  Optional PC_TRACE_LIMIT=N
+ * (default 10M instructions = 40MB). */
+static uint32_t *pc_trace_buf = NULL;
+static uint32_t pc_trace_count = 0;
+static uint32_t pc_trace_limit = 0;
+static const char *pc_trace_path = NULL;
+
+static void pc_trace_flush(void) {
+    if (!pc_trace_buf || !pc_trace_count) return;
+    FILE *fp = fopen(pc_trace_path, "wb");
+    if (fp) {
+        fwrite(pc_trace_buf, 4, pc_trace_count, fp);
+        fclose(fp);
+        printf("[PC-TRACE] Wrote %u PCs to %s (%u MB)\n",
+               pc_trace_count, pc_trace_path,
+               (pc_trace_count * 4) >> 20);
+    }
+    free(pc_trace_buf);
+    pc_trace_buf = NULL;
+}
+
 int mem_fd, mouse_fd = -1, keyboard_fd = -1;
 int mem_fd_gpclk;
 atomic_int irq = 0;
@@ -449,9 +471,10 @@ int gestalt_trap_intercept(void) {
     else if (is_030) result = 2;
     else return 0;
   } else if (selector == 0x61646472) {  // 'addr' (gestaltAddressingModeAttr)
-    if (cpu_type == M68K_CPU_TYPE_68030)
-      result = 0x07;  /* gestalt32BitAddressing | gestalt32BitSysZone | gestalt32BitCapable */
-    else if (is_030)
+    if (cpu_type == M68K_CPU_TYPE_68030) {
+      extern int mode32_active;
+      result = mode32_active ? 0x07 : 0x04;
+    } else if (is_030)
       result = 0x00;  /* 24-bit mode */
     else return 0;
   } else if (selector == 0x63707574) {  // 'cput' (gestaltNativeCPUtype)
@@ -470,6 +493,208 @@ int gestalt_trap_intercept(void) {
   m68k_set_reg(NULL, M68K_REG_A0, result);
   return 1;
 }
+
+int mode32_active = 0;
+int mode32_enabled = 0;  /* set by config: setvar mode32 1 */
+volatile int mode32_trigger = 0;  /* set by SIGUSR1 */
+int figment_enabled = 0;  /* set when Figment is embedded in ROM */
+
+/* Figment trap table: maps OS trap number → binary offset of fig_XXX glue.
+ * Auto-generated from figment.elf symbols. */
+#define FIGMENT_ROM_OFF 0x40000  /* in the mirror half of 512K ROM */
+#include "huge-se/figment/figment_offsets.h"
+
+/* Figment trap lookup — no longer used for write interception (traps are
+ * now baked into the ROM by patch-rom.py), but kept for diagnostics. */
+uint32_t figment_lookup(uint32_t trap_addr) {
+    if (!figment_enabled) return 0;
+    uint32_t trap_num = (trap_addr - 0x0400) >> 2;
+    if (trap_num > 0xFF) return 0;
+    for (int i = 0; figment_trap_table[i].trap_num || figment_trap_table[i].offset; i++) {
+        if (figment_trap_table[i].trap_num == trap_num) {
+            return figment_trap_table[i].offset;
+        }
+    }
+    return 0;
+}
+
+/* MODE32 pseudovirt trap — switch from IS=8 (24-bit) to IS=0 (32-bit).
+ * Called from m68ki_exception_1010 when the 68k code executes DC.W $A0FF.
+ * Atomically swaps PMMU tables, relocates WTC, updates globals. */
+int mode32_trap_handler(m68ki_cpu_core *state) {
+    uint32_t selector = REG_DA[0];
+    if (selector != 0x4D333200)  /* 'M32\0' */
+        return 0;
+
+    if (mode32_active) {
+        printf("[MODE32] Already active, ignoring\n");
+        REG_DA[0] = 0;
+        return 1;  /* PC already past A-line word */
+    }
+
+    printf("[MODE32] Switching to 32-bit addressing...\n");
+
+    /* --- 1. Build IS=0 PMMU table --- */
+    /* Two-level PMMU table: TIA=8 (256 entries) + TIB=4 (16 entries for $40)
+     * TC = $80F08450: E=1, PS=15, IS=0, TIA=8, TIB=4, TIC=5, TID=0
+     * Check: 0+8+4+5+0+15 = 32 ✓
+     *
+     * Level 1 (TIA=8): 256 entries, each 16MB. Full dirty byte stripping.
+     *   $00: identity RAM (first 16MB)
+     *   $01: identity RAM (second 16MB)
+     *   $40: DT=2 → level 2 (per-megabyte I/O separation)
+     *   all others: DT=1, base=$00000000 (dirty alias)
+     *
+     * Level 2 for $40 (TIB=4): 16 entries, each 1MB.
+     *   0-7: $40000000-$407FFFFF → $00000000-$007FFFFF (strip $40)
+     *     8: $40800000-$408FFFFF → $40800000 (ROM+SCSI, no CI)
+     *   9-F: $40900000-$40FFFFFF → I/O identity (CI) */
+    uint32_t level1_addr = 0x01010000;  /* 1KB */
+    uint32_t level2_addr = 0x01010400;  /* 64 bytes */
+    uint32_t level1[256];
+    uint32_t level2[16];
+
+    int32_t ri = get_named_mapped_item(cfg, "sysram");
+    if (ri < 0 || !cfg->map_data[ri]) {
+        printf("[MODE32] ERROR: no sysram\n");
+        REG_DA[0] = -1;
+        return 1;
+    }
+    unsigned char *ram = cfg->map_data[ri];
+
+    /* Level 1: all dirty aliases except $00, $01, $40 */
+    for (int i = 0; i < 256; i++)
+        level1[i] = 0x00000019;  /* DT=1, base=$00000000 */
+    level1[0x00] = 0x00000019;   /* RAM first 16MB (identity) */
+    level1[0x01] = 0x01000019;   /* RAM second 16MB (identity) */
+    level1[0x40] = (level2_addr & 0xFFFFFFFC) | 0x02;  /* DT=2 → level 2 */
+
+    /* Level 2: per-megabyte split of $40xxxxxx */
+    for (int i = 0; i < 8; i++)
+        level2[i] = ((uint32_t)i << 20) | 0x19;        /* strip $40 → RAM */
+    level2[8] = 0x40800019;                              /* ROM+SCSI, no CI */
+    for (int i = 9; i <= 15; i++)
+        level2[i] = (0x40000000 | ((uint32_t)i << 20)) | 0x59;  /* I/O, CI */
+
+    /* Write tables to RAM buffer */
+    for (int i = 0; i < 256; i++) {
+        uint32_t off = level1_addr + i * 4;
+        ram[off+0] = (level1[i] >> 24); ram[off+1] = (level1[i] >> 16);
+        ram[off+2] = (level1[i] >> 8);  ram[off+3] = level1[i];
+    }
+    for (int i = 0; i < 16; i++) {
+        uint32_t off = level2_addr + i * 4;
+        ram[off+0] = (level2[i] >> 24); ram[off+1] = (level2[i] >> 16);
+        ram[off+2] = (level2[i] >> 8);  ram[off+3] = level2[i];
+    }
+
+    printf("[MODE32] Two-level IS=0 table:\n");
+    printf("  L1 at $%08X: [$00]=RAM [$01]=RAM [$40]→L2 [else]=dirty alias\n", level1_addr);
+    printf("  L2 at $%08X: [0-7]=strip $40 [8]=ROM+SCSI [9-F]=I/O(CI)\n", level2_addr);
+
+    /* --- 2. Swap PMMU registers --- */
+    state->mmu_tc = 0x80F08450;  /* IS=0, TIA=8, TIB=4, TIC=5, PS=15 */
+    state->mmu_crp_aptr = level1_addr;
+    state->mmu_srp_aptr = level1_addr;
+    /* CRP/SRP limit stays $7FFF0002 */
+
+    /* --- 3. Flush all caches --- */
+    state->code_translation_cache.lower = 0;
+    state->code_translation_cache.upper = 0;
+    state->fc_read_translation_cache.lower = 0;
+    state->fc_read_translation_cache.upper = 0;
+    state->fc_write_translation_cache.lower = 0;
+    state->fc_write_translation_cache.upper = 0;
+    /* Flush ATC */
+    for (int i = 0; i < MMU_ATC_ENTRIES; i++) {
+        state->mmu_atc_tag[i] = 0x8000;  /* invalid */
+        state->mmu_atc_data[i] = 0;
+    }
+
+    /* --- 4. Relocate WTC from $7F0000 to $01FF0000 --- */
+    memcpy(ram + 0x01FF0000, ram + 0x7F0000, 0x10000);
+
+    /* Update globals that point into old WTC region */
+    uint32_t old_scrnbase = (ram[0x824]<<24)|(ram[0x825]<<16)|(ram[0x826]<<8)|ram[0x827];
+    uint32_t old_soundbase = (ram[0x266]<<24)|(ram[0x267]<<16)|(ram[0x268]<<8)|ram[0x269];
+    uint32_t reloc_off = 0x01FF0000 - 0x7F0000;
+
+    uint32_t new_scrnbase = old_scrnbase + reloc_off;
+    ram[0x824] = (new_scrnbase >> 24); ram[0x825] = (new_scrnbase >> 16);
+    ram[0x826] = (new_scrnbase >> 8);  ram[0x827] = new_scrnbase;
+
+    if (old_soundbase >= 0x7F0000 && old_soundbase < 0x800000) {
+        uint32_t new_soundbase = old_soundbase + reloc_off;
+        ram[0x266] = (new_soundbase >> 24); ram[0x267] = (new_soundbase >> 16);
+        ram[0x268] = (new_soundbase >> 8);  ram[0x269] = new_soundbase;
+        printf("[MODE32] SoundBase: $%08X → $%08X\n", old_soundbase, new_soundbase);
+    }
+
+    /* Expand fast-path ranges in place */
+    {
+        m68ki_cpu_core *cpu = &m68ki_cpu;
+
+        for (int i = 0; i < cpu->write_ranges; i++) {
+            if (cpu->write_addr[i] == 0 && !cpu->write_through[i]) {
+                cpu->write_upper[i] = 0x01FF0000;
+                break;
+            }
+        }
+        for (int i = 0; i < cpu->read_ranges; i++) {
+            if (cpu->read_addr[i] == 0 && cpu->read_upper[i] <= 0x800000) {
+                cpu->read_upper[i] = 0x01FF0000;
+                break;
+            }
+        }
+        for (int i = 0; i < cpu->write_ranges; i++) {
+            if (cpu->write_through[i]) {
+                cpu->write_addr[i] = 0x01FF0000;
+                cpu->write_upper[i] = 0x02000000;
+                cpu->write_data[i] = ram + 0x01FF0000;
+                break;
+            }
+        }
+        for (int i = 0; i < cpu->read_ranges; i++) {
+            if (cpu->read_addr[i] >= 0x7F0000 && cpu->read_upper[i] <= 0x800000) {
+                cpu->read_addr[i] = 0x01FF0000;
+                cpu->read_upper[i] = 0x02000000;
+                cpu->read_data[i] = ram + 0x01FF0000;
+                break;
+            }
+        }
+
+        cpu->code_translation_cache.lower = 0;
+        cpu->code_translation_cache.upper = 0;
+        cpu->fc_read_translation_cache.lower = 0;
+        cpu->fc_read_translation_cache.upper = 0;
+        cpu->fc_write_translation_cache.lower = 0;
+        cpu->fc_write_translation_cache.upper = 0;
+    }
+
+    {
+        extern uint32_t bigse_vbuf_virt;
+        bigse_vbuf_virt = 0xFF0000;
+    }
+
+    /* MMU globals */
+    ram[0x0CB4] = (level1_addr >> 24); ram[0x0CB5] = (level1_addr >> 16);
+    ram[0x0CB6] = (level1_addr >> 8);  ram[0x0CB7] = level1_addr;
+    /* $CB8 = MMUTblSize (not a second pointer!) */
+    uint32_t tbl_size = 256 * 4 + 16 * 4;  /* L1 + L2 */
+    ram[0x0CB8] = (tbl_size >> 24); ram[0x0CB9] = (tbl_size >> 16);
+    ram[0x0CBA] = (tbl_size >> 8);  ram[0x0CBB] = tbl_size;
+
+    printf("[MODE32] ScrnBase: $%08X → $%08X\n", old_scrnbase, new_scrnbase);
+    printf("[MODE32] WTC: $7F0000 → $01FF0000, RAM: $0-$01FF0000\n");
+    printf("[MODE32] TC=$%08X CRP=($7FFF0002,$%08X)\n",
+           state->mmu_tc, level1_addr);
+
+    /* Return success to 68k — PC already past the A-line word */
+    REG_DA[0] = 0;
+    return 1;
+}
+
+/* Update Gestalt 'addr' when mode32 active */
 
 uint16_t irq_delay = 0;
 
@@ -697,13 +922,189 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			/* Call external hook to peek at CPU */
 			m68ki_instr_hook(REG_PC); /* auto-disable (see m68kcpu.h) */
 
+			/* PC trace for big-se vs huge-se comparison */
+			if (pc_trace_buf && pc_trace_count < pc_trace_limit)
+				pc_trace_buf[pc_trace_count++] = REG_PC;
+
+			/* Debug: trace T2 load and disk subroutines */
+			{
+			  uint32_t rom_off = REG_PC - ovl_sysrom_pos;
+			  if (rom_off == 0x1AA20) {
+			    static int t2_dbg = 0;
+			    if (t2_dbg++ < 3)
+			      printf("[T2-LOAD] called! D0=$%08X\n", REG_DA[0]);
+			  }
+			  if (rom_off == 0x3370) {
+			    static int sub_dbg = 0;
+			    if (sub_dbg++ < 5)
+			    {
+			      { uint8_t orb = ps_read_8(0xEFE1FE);
+			        printf("[DISK] $0CF8=$%08X ORB=$%02X\n",
+			               m68ki_read_32(state, 0x0CF8), orb);
+			      }
+			    }
+			  }
+			  if (rom_off == 0x3588) {
+			    static int sr_dbg = 0;
+			    if (sr_dbg++ < 5)
+			      printf("[SR-HANDLER] entered! #%d\n", sr_dbg);
+			  }
+			  /* Stuck loop diagnostic: ROM+$1A54A polling IWM */
+			  if (rom_off == 0x1A54A) {
+			    static int iwm_stuck = 0;
+			    if (iwm_stuck++ % 100000 == 0) {
+			      uint32_t ticks = m68ki_read_32(state, 0x16A);
+			      uint8_t iwm_q6l = ps_read_8(0x5FF040);
+			      printf("[IWM-STUCK] #%d Ticks=$%08X IWM_Q6L=$%02X D0=$%08X D1=$%08X\n",
+			             iwm_stuck, ticks, iwm_q6l,
+			             REG_DA[0], REG_DA[1]);
+			    }
+			  }
+			  /* Catch jumps into WTC region after MODE32 relocation */
+			  if (mode32_active && REG_PC >= 0x01FF0000 && REG_PC < 0x02000000) {
+			    static int wtc_jump = 0;
+			    if (wtc_jump++ < 3)
+			      printf("[WTC-JUMP] PC=$%08X from PPC=$%08X  A0=$%08X A1=$%08X SP=$%08X\n",
+			             REG_PC, REG_PPC, REG_DA[8], REG_DA[9], REG_DA[15]);
+			  }
+			  /* Keyboard SR callback: ROM+$368A is JMP (A0) where A0 was
+			   * loaded from the driver's completion routine pointer. If the
+			   * keyboard driver hasn't initialized yet, A0 is NULL → crash.
+			   * Redirect to an RTS in ROM so the interrupt returns cleanly. */
+			  if (rom_off == 0x368A && REG_DA[8+0] == 0) {
+			    static int kbd_null = 0;
+			    if (kbd_null++ < 5)
+			      printf("[KBD-NULL] JMP (A0=0) at ROM+$368A → redirecting to RTS\n");
+			    /* ROM+$3680 is an RTS right before this code block */
+			    REG_DA[8+0] = ovl_sysrom_pos + 0x3680;
+			  }
+			  if (rom_off == 0x2A0E) {
+			    /* MOVEQ #-1,D0 before BTST #1,$1A00(A5) poll loop — polls VIA IFR for CA1/VBL */
+			    uint32_t a5 = REG_DA[8+5];
+			    uint32_t addr = a5 + 0x1A00;
+			    uint8_t val_pmmu = m68ki_read_8_fc(state, addr, FLAG_S | 5);
+			    uint8_t val_bus = ps_read_8(0xEFFBFE);  /* direct SE bus: VIA IFR */
+			    printf("[SND-POLL] ROM+$02A0E: A5=$%08X  target=$%08X  pmmu=$%02X  bus=$%02X  bit1_p=%d  bit1_b=%d\n",
+			           a5, addr, val_pmmu, val_bus, (val_pmmu >> 1) & 1, (val_bus >> 1) & 1);
+			  }
+			  /* Trace what PMMU translates VIA IFR to */
+			  if (rom_off == 0x2B3A) {  /* MOVE.B ($1A00,A1), D0 — IFR read */
+			    static int ifr_dbg = 0;
+			    if (ifr_dbg++ < 5) {
+			      uint32_t virt = REG_DA[9] + 0x1A00;  /* A1 + $1A00 */
+			      uint32_t phys = pmmu_translate_addr(&m68ki_cpu, virt, 1);
+			      printf("[IFR-XLAT] virt=$%08X → phys=$%08X\n", virt, phys);
+			    }
+			  }
+			  if (rom_off == 0x0048) {
+			    static int dump_done = 0;
+			    if (!dump_done) {
+			      printf("[LOWMEM] Dump at +$0048 (after sizing):\n");
+			      for (int k = 0; k < 0x400; k += 16) {
+			        printf("  $%04X:", k);
+			        for (int j = 0; j < 16; j += 4)
+			          printf(" %08X", m68ki_read_32(state, k + j));
+			        printf("\n");
+			      }
+			      printf("[LOWMEM] Registers: D6=$%08X D7=$%08X A6=$%08X SP=$%08X\n",
+			             REG_DA[6], REG_DA[7], REG_DA[14], REG_DA[15]);
+			      dump_done = 1;
+			    }
+			  }
+			}
+			{ static int iwm_dbg = 0;
+			  uint32_t rom_off = REG_PC - ovl_sysrom_pos;
+			  if (rom_off == 0x3370 && iwm_dbg < 10) {
+			    uint32_t vec64 = m68ki_read_32(state, 0x64);
+			    uint32_t stub = ovl_sysrom_pos + 0x1B62;
+			    printf("[DISK] vec$64=$%08X (%s) $01D4=$%08X\n",
+			           vec64,
+			           (vec64 == stub) ? "BOOT STUB!" : "real handler",
+			           m68ki_read_32(state, 0x01D4));
+			    printf("[DISK] Lvl1DT: CA2=$%08X CA1=$%08X SR=$%08X CB2=$%08X CB1=$%08X T2=$%08X T1=$%08X IRQ=$%08X\n",
+			           m68ki_read_32(state, 0x0192),
+			           m68ki_read_32(state, 0x0196),
+			           m68ki_read_32(state, 0x019A),
+			           m68ki_read_32(state, 0x019E),
+			           m68ki_read_32(state, 0x01A2),
+			           m68ki_read_32(state, 0x01A6),
+			           m68ki_read_32(state, 0x01AA),
+			           m68ki_read_32(state, 0x01AE));
+			  }
+			}
+			{
+			  uint32_t rom_off = REG_PC - ovl_sysrom_pos;
+			  if (rom_off == 0xDA1C) {  /* _NewPtr $A51E call */
+			    static int np_dbg = 0;
+			    if (np_dbg++ < 3) {
+			      uint32_t tz = m68ki_read_32(state, 0x0118);
+			      printf("[DA08-NEWPTR] before: D0=$%08X A0=$%08X TheZone=$%08X\n",
+			             REG_DA[0], REG_DA[8], tz);
+			      printf("[DA08-NEWPTR] zone header at $%08X:\n", tz);
+			      for (int k = 0; k < 56; k += 4)
+			        printf("  +$%02X: $%08X\n", k, m68ki_read_32(state, tz + k));
+			    }
+			  }
+			  if (rom_off == 0xDA1E) {  /* instruction after _NewPtr */
+			    static int np2_dbg = 0;
+			    if (np2_dbg++ < 3) {
+			      printf("[DA08-NEWPTR] after:  D0=$%08X A0=$%08X (err=%s)\n",
+			             REG_DA[0], REG_DA[8],
+			             (REG_DA[0] & 0xFFFF) ? "YES" : "no");
+			    }
+			  }
+			  /* Trace: is .Sony driver code ever reached? */
+			  if (rom_off >= 0x346F2 && rom_off < 0x36C94) {
+			    static int sony_pc = 0;
+			    if (sony_pc++ < 5)
+			      printf("[SONY-PC] PC=$%08X (driver+$%04X)\n",
+			             REG_PC, rom_off - 0x34684);
+			  }
+			  /* .Sony driver dispatch trace */
+			  if (rom_off == 0x4332) {
+			    static int poll_dbg = 0;
+			    if (poll_dbg++ < 3) {
+			      uint32_t a0 = REG_DA[8];
+			      int16_t ioResult = (int16_t)m68ki_read_16(state, a0 + 0x10);
+			      uint32_t utbase = m68ki_read_32(state, 0x011C);
+			      /* .Sony = unit -5, table entry at UTableBase + (-5 - (-1)) * 4
+			       * Actually unit table is indexed by -(refnum+1)/4.
+			       * .Sony refnum = -5. Index = (-(-5)-1)/4 = 4/4 = 1.
+			       * But table[0] = refnum -1, table[1] = refnum -2, ...
+			       * table entry = UTableBase + (-(refnum+1)) * 4 ?
+			       * Actually: index = ~refnum >> 1 & 0xFF? Let me just dump first entries. */
+			      printf("[POLL] ioResult=%d  D0=$%08X  D1=$%04X\n",
+			             ioResult, REG_DA[0], REG_DA[1] & 0xFFFF);
+			      printf("  UTableBase=$%08X  entries:\n", utbase);
+			      for (int j = 0; j < 8; j++)
+			        printf("    [%d] $%08X\n", j, m68ki_read_32(state, utbase + j * 4));
+			      printf("  ioParam: name=$%08X refnum=$%04X\n",
+			             m68ki_read_32(state, a0 + 0x12),
+			             m68ki_read_16(state, a0 + 0x18) & 0xFFFF);
+			    }
+			  }
+			  if (rom_off == 0xA41A) {
+			    static int iz_dbg = 0;
+			    if (iz_dbg++ < 5) {
+			      uint32_t a0 = REG_DA[8];
+			      printf("[INITZONE] A0=$%08X startPtr=$%08X limitPtr=$%08X\n",
+			             a0, m68ki_read_32(state, a0),
+			             m68ki_read_32(state, a0 + 4));
+			    }
+			  }
+			}
+
 			/* OVL off: when PC enters ROM range. The slow-path OVL check
 			 * doesn't fire for fast-path ROM reads. On big-se this works
 			 * because the SCSI exclusion zone forces slow-path reads, but
 			 * on huge-se the sizing skip means ROM code reaches the stack
-			 * before any exclusion-zone fetch. */
-			if (state->ovl && REG_PC >= ovl_sysrom_pos &&
-			    REG_PC < ovl_sysrom_pos + 0x80000) {
+			 * before any exclusion-zone fetch.
+			 * With PMMU active (huge-se), REG_PC is virtual ($800048),
+			 * not physical ($40800048). Check both ranges. */
+			if (state->ovl &&
+			    ((REG_PC >= ovl_sysrom_pos && REG_PC < ovl_sysrom_pos + 0x80000) ||
+			     (ovl_sysrom_pos >= 0x40000000 &&
+			      REG_PC >= 0x800000 && REG_PC < 0x880000))) {
 				ovl = 0;
 				state->ovl = 0;
 				printf("[MAC] OVL off (PC=$%08X in ROM range)\n", REG_PC);
@@ -718,8 +1119,11 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 				if (!boot_done) {
 					boot_ring[boot_idx & 63] = REG_PC;
 					boot_idx++;
-					/* Detect entry to sad mac handler (ROM offset $2000-$2400) */
+					/* Detect entry to sad mac handler (ROM offset $2000-$2400).
+					 * With PMMU (huge-se), PC is virtual ($8xxxxx), not physical. */
 					uint32_t rom_off = REG_PC - ovl_sysrom_pos;
+					if (ovl_sysrom_pos >= 0x40000000 && REG_PC >= 0x800000)
+						rom_off = REG_PC - 0x800000;
 					if (rom_off >= 0x2000 && rom_off < 0x2400 && boot_idx > 100) {
 						printf("[BOOT] Sad mac entered at PC=$%08X after %d instructions\n",
 						       REG_PC, boot_idx);
@@ -751,51 +1155,130 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 				extern uint32_t ovl_sysrom_pos;
 				static int memtop_done = 0;
 				uint32_t memtop_pc = ovl_sysrom_pos + 0x48;
+				/* Huge SE: big-se ROM executes at virtual $800048 even
+				 * though sysrom_pos is $40800000.  Check both. */
+				uint32_t memtop_pc_virt = (ovl_sysrom_pos >= 0x40000000) ?
+				    (0x800000 + 0x48) : 0;
 				if (!memtop_done && ovl_sysrom_pos >= 0x800000 &&
-				    REG_PC == memtop_pc) {
+				    (REG_PC == memtop_pc || REG_PC == memtop_pc_virt)) {
 					uint32_t old = REG_DA[14];
 					int32_t ram_idx = get_named_mapped_item(cfg, "sysram");
-					uint32_t memtop = (ram_idx >= 0) ? cfg->map_size[ram_idx] : 0x800000;
-					REG_DA[14] = memtop;
-					printf("[HUGE-SE] MemTop forced: A6=$%08X → $%08X\n", old, memtop);
+					uint32_t ram_size = (ram_idx >= 0) ? cfg->map_size[ram_idx] : 0x800000;
+					int is_huge_se = (ovl_sysrom_pos >= 0x40000000);
 
-					/* Huge SE: set up PMMU for 32-bit addressing.
-					 * Identity-map the entire 4GB space via 16 root entries.
-					 * TC: E=1, IS=0, TIA=4 → 16 entries of 256MB each.
-					 * The emulator's slow-path 24-bit masking handles the
-					 * actual address translation for I/O and 24-bit dirty code. */
-					if (cpu_type == M68K_CPU_TYPE_68030) {
-						uint32_t tbl = (memtop - 0x100) & ~0xF;
+					/* Huge SE: PMMU provides 24-bit virtual space over 32-bit
+					 * physical.  Boot with 8MB visible — MODE32 will expand.
+					 * Big SE: use actual RAM size. */
+					uint32_t memtop = is_huge_se ? 0x800000 : ram_size;
+					REG_DA[14] = memtop;
+					printf("[%s] MemTop forced: A6=$%08X → $%08X\n",
+					       is_huge_se ? "HUGE-SE" : "BIG-SE", old, memtop);
+
+					/* Huge SE: set up Mac II-style PMMU for 24-bit boot.
+					 *
+					 * TC = $80F84500 (identical to Mac II ROM):
+					 *   E=1, PS=15(32KB), IS=8, TIA=4, TIB=5
+					 *   IS=8 strips the high byte of all virtual addresses,
+					 *   giving 24-bit dirty pointer compatibility for free.
+					 *
+					 * Root table: 16 early-termination page descriptors (1MB each).
+					 * Descriptor format from Mac II ROM at +$50:
+					 *   RAM:  phys_base | $19  (DT=01, M, U)
+					 *   I/O:  phys_base | $59  (DT=01, CI, M, U)
+					 *
+					 * Entry 7 maps $700000 → $01F00000 (not identity) so that
+					 * video at virtual $7F0000 hits physical $01FF0000 in the
+					 * WTC region at the top of 32MB RAM.
+					 *
+					 * CRP = ($7FFF0002, tbl) — Mac II format:
+					 *   limit=$7FFF, DT=2 (valid 4-byte descriptors). */
+					if (is_huge_se && cpu_type == M68K_CPU_TYPE_68030) {
+						/* PMMU root table in RAM at $6FFF00 (in entry 6, identity-mapped).
+						 * Written directly to RAM buffer. The PMMU walker reads via
+						 * m68k_read_memory_32 (slow path, 24-bit masked). We add a
+						 * check in the slow path so the walker can read from the
+						 * RAM buffer instead of going to the SE bus. */
+						uint32_t tbl = 0x01000040; /* 16MB into 32MB RAM buffer — above all
+						                            * 24-bit handler ranges ($800000 ROM alias,
+						                            * $880000 SCSI remap). Walker reads via
+						                            * m68k_read_memory_32 → wtcram buffer. */
 						printf("[HUGE-SE] PMMU root table at $%08X\n", tbl);
 
-						/* 16 identity-mapped early-termination page descriptors.
-						 * Each covers 256MB. DT=01 (page descriptor).
-						 * Entry N: physical base = N × $10000000 */
-						for (int i = 0; i < 16; i++) {
-							uint32_t desc = ((uint32_t)i << 28) | 0x01;
-							/* I/O segments get cache-inhibit */
-							if (i >= 4 && i != 0)
-								desc |= 0x40;
-							m68k_write_memory_32(tbl + i * 4, desc);
+						/* Mac II-style root table: 16 × 4-byte page descriptors.
+						 *  0-6: identity RAM    ($00x00019)
+						 *    7: video remap      ($01F00019) — maps $7Fxxxx → WTC
+						 *    8: ROM + SCSI remap ($40800019)
+						 * 9-15: I/O              ($40x00059, CI) */
+						const uint32_t pmmu_table[16] = {
+							0x00000019, 0x00100019, 0x00200019, 0x00300019,  /* 0-3: RAM */
+							0x00400019, 0x00500019, 0x00600019, 0x00700019,  /* 4-7: RAM (all identity) */
+							0x40800019,                                       /* 8: ROM + SCSI remap */
+							0x40900059, 0x40A00059, 0x40B00059,              /* 9-11: SCC (CI) */
+							0x40C00059, 0x40D00059, 0x40E00059, 0x40F00059,  /* 12-15: I/O (CI) */
+						};
+						/* Write directly to RAM buffer */
+						int32_t ri0 = get_named_mapped_item(cfg, "sysram");
+						if (ri0 >= 0 && cfg->map_data[ri0]) {
+							unsigned char *ram = cfg->map_data[ri0];
+							for (int i = 0; i < 16; i++) {
+								uint32_t d = pmmu_table[i];
+								uint32_t off = tbl + i * 4;
+								ram[off+0] = (d >> 24) & 0xFF;
+								ram[off+1] = (d >> 16) & 0xFF;
+								ram[off+2] = (d >> 8)  & 0xFF;
+								ram[off+3] =  d        & 0xFF;
+							}
 						}
 
-						/* Low-memory MMU globals */
-						m68k_write_memory_8(0x0CB1, 4);     /* MMUType = 68030 */
-						m68k_write_memory_32(0x0CB4, tbl);   /* MMU24Info */
-						m68k_write_memory_32(0x0CB8, tbl);   /* MMU32Info */
-						m68k_write_memory_8(0x0B73, 1);      /* 32-bit mode */
+						printf("[HUGE-SE] PMMU table (Mac II style):\n");
+						for (int i = 0; i < 16; i++) {
+							printf("  [%2d] $%06X → $%08X %s\n", i,
+							       i * 0x100000,
+							       pmmu_table[i] & 0xFFF00000,
+							       (pmmu_table[i] & 0x40) ? "CI" : "");
+						}
 
-						/* TC: E=1, IS=0, TIA=4
-						 * 1000 0000 0000 0100 0000 0000 0000 0000
-						 * = $80040000 */
-						m68ki_cpu.mmu_crp_limit = 0x7FFF0000;
+						/* Low-memory MMU globals (24-bit mode for boot).
+						 * Write directly to RAM buffer — m68k_write_memory
+						 * goes to SE bus via slow path, not local buffer. */
+						{
+							int32_t ri = get_named_mapped_item(cfg, "sysram");
+							if (ri >= 0 && cfg->map_data[ri]) {
+								unsigned char *r = cfg->map_data[ri];
+								r[0x0CB1] = 4;       /* MMUType = 68030 */
+								r[0x0B73] = 0;       /* 24-bit mode */
+								r[0x0CB4] = (tbl >> 24); r[0x0CB5] = (tbl >> 16);
+								r[0x0CB6] = (tbl >> 8);  r[0x0CB7] = tbl;
+								r[0x0CB8] = (tbl >> 24); r[0x0CB9] = (tbl >> 16);
+								r[0x0CBA] = (tbl >> 8);  r[0x0CBB] = tbl;
+							}
+						}
+
+						/* TC = $80F84500 (Mac II value):
+						 *   E=1, PS=15, IS=8, TIA=4, TIB=5
+						 *   Sum: 15+8+4+5+0+0 = 32, bit 23 = 1 (valid) */
+						m68ki_cpu.mmu_crp_limit = 0x7FFF0002; /* DT=2: 4-byte descriptors */
 						m68ki_cpu.mmu_crp_aptr = tbl;
-						m68ki_cpu.mmu_srp_limit = 0x7FFF0000;
+						m68ki_cpu.mmu_srp_limit = 0x7FFF0002;
 						m68ki_cpu.mmu_srp_aptr = tbl;
-						m68ki_cpu.mmu_tc = 0x80040000;
+						m68ki_cpu.mmu_tt0 = 0;  /* disable transparent translation */
+						m68ki_cpu.mmu_tt1 = 0;
+						m68ki_cpu.mmu_tc = 0x80F84500;
+						m68ki_cpu.pmmu_enabled = 1;
+						/* Flush ATC and fast-path translation caches */
+						for (int j = 0; j < MMU_ATC_ENTRIES; j++)
+							m68ki_cpu.mmu_atc_tag[j] = 0;
+						m68ki_cpu.mmu_atc_rr = 0;
+						m68ki_cpu.fc_read_translation_cache.lower = 0;
+						m68ki_cpu.fc_read_translation_cache.upper = 0;
+						m68ki_cpu.fc_write_translation_cache.lower = 0;
+						m68ki_cpu.fc_write_translation_cache.upper = 0;
+						m68ki_cpu.code_translation_cache.lower = 0;
+						m68ki_cpu.code_translation_cache.upper = 0;
 
-						printf("[HUGE-SE] PMMU enabled: TC=$%08X CRP=$%08X\n",
-						       m68ki_cpu.mmu_tc, m68ki_cpu.mmu_crp_aptr);
+						printf("[HUGE-SE] PMMU enabled: TC=$%08X CRP=($%08X,$%08X)\n",
+						       m68ki_cpu.mmu_tc, m68ki_cpu.mmu_crp_limit,
+						       m68ki_cpu.mmu_crp_aptr);
 					}
 
 					memtop_done = 1;
@@ -815,8 +1298,12 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 					int do_scan = 0;
 					uint32_t scan_lo = 0, scan_hi = 0;
 
-					/* Trigger 1: Device Manager dispatch */
-					if (pc24 == ovl_sysrom_pos + 0x1A424) {
+					/* Trigger 1: Device Manager dispatch.
+				 * With PMMU (huge-se), pc24 is virtual ($800000 base). */
+					uint32_t dm_phys = ovl_sysrom_pos + 0x1A424;
+					uint32_t dm_virt = (ovl_sysrom_pos >= 0x40000000) ?
+					    (0x800000 + 0x1A424) : 0;
+					if (pc24 == dm_phys || pc24 == dm_virt) {
 						uint32_t a0 = ADDRESS_68K(REG_DA[8]);
 						if (a0 >= 0x010000 && a0 < 0x080000) {
 							scan_lo = a0 & 0xFF0000;
@@ -957,6 +1444,15 @@ cpu_loop:
 		else
 			m68k_execute_bef(state, loop_cycles);
     }
+  }
+
+  /* SIGUSR1 trigger for MODE32 switch */
+  if (mode32_trigger && !mode32_active) {
+    mode32_trigger = 0;
+    m68ki_cpu_core *st = &m68ki_cpu;
+    st->dar[0] = 0x4D333200;
+    printf("[MODE32-USR1] Triggering MODE32 switch\n");
+    mode32_trap_handler(st);
   }
 
   /* PC logging disabled — Pi 4 bus verified solid */
@@ -1434,6 +1930,11 @@ void stop_cpu_emulation(uint8_t disasm_cur) {
   do_disasm = 0;
 }
 
+void sigusr1_handler(int sig_num) {
+  (void)sig_num;
+  mode32_trigger = 1;
+}
+
 void sigint_handler(int sig_num) {
   printf("Received sigint %d, exiting.\n", sig_num);
 
@@ -1491,6 +1992,7 @@ void sigint_handler(int sig_num) {
          via_ifr_bits[6]);
 #endif
 
+  pc_trace_flush();
   exit(0);
 }
 
@@ -1653,7 +2155,24 @@ switch_config:
   if (cfg->keyboard_autoconnect)
     kb_hook_enabled = 1;
 
+  /* PC trace init: PC_TRACE=file.bin PC_TRACE_LIMIT=N (default 10M) */
+  pc_trace_path = getenv("PC_TRACE");
+  if (pc_trace_path) {
+    const char *lim_str = getenv("PC_TRACE_LIMIT");
+    pc_trace_limit = lim_str ? (uint32_t)atol(lim_str) : 10000000;
+    pc_trace_buf = malloc(pc_trace_limit * sizeof(uint32_t));
+    if (pc_trace_buf) {
+      printf("[PC-TRACE] Recording up to %u instructions to %s\n",
+             pc_trace_limit, pc_trace_path);
+    } else {
+      printf("[PC-TRACE] Failed to allocate %u MB buffer\n",
+             (pc_trace_limit * 4) >> 20);
+      pc_trace_limit = 0;
+    }
+  }
+
   signal(SIGINT, sigint_handler);
+  signal(SIGUSR1, sigusr1_handler);
 
   ps_reset_state_machine();
   ps_pulse_reset();
@@ -1776,18 +2295,22 @@ static uint32_t platform_res;
 unsigned int garbage = 0;
 
 static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t *res) {
+  /* Custom I/O handlers use 24-bit SE bus addresses; mapped buffers use
+   * full 32-bit so 32MB RAM doesn't shadow I/O (see huge-se VIA fix). */
+  uint32_t bus24 = addr & 0x00FFFFFF;
   switch (cfg->platform->id) {
     case PLATFORM_MAC:
       /* Mac SE BBU clears OVL on first access to ROM/SCSI range */
-      if (ovl && addr >= ovl_sysrom_pos && addr < ovl_sysrom_pos + 0x100000) {
+      if (ovl && bus24 >= (ovl_sysrom_pos & 0x00FFFFFF) &&
+          bus24 < (ovl_sysrom_pos & 0x00FFFFFF) + 0x100000) {
         ovl = 0;
         m68ki_cpu.ovl = 0;
-        printf("[MAC] OVL off (read from ROM/SCSI range %08X).\n", addr);
+        printf("[MAC] OVL off (read from ROM/SCSI range %08X).\n", bus24);
         handle_ovl_mappings_mac68k(cfg);
       }
-      /* Custom read handler (Big SE SCSI remap, etc.) */
+      /* Custom read handler (Big SE SCSI remap, etc.) — uses 24-bit addr */
       if (cfg->platform->custom_read &&
-          cfg->platform->custom_read(cfg, addr, &target, type) != -1) {
+          cfg->platform->custom_read(cfg, bus24, &target, type) != -1) {
         *res = target;
         return 1;
       }
@@ -1811,39 +2334,42 @@ unsigned int m68k_read_memory_8(unsigned int address) {
   rd8_total++;
 #endif
 
-  // 68000 has 24-bit address bus — mask upper 8 bits
-  address &= 0x00FFFFFF;
+  /* Use full 32-bit address for buffer/range checks so that 32MB RAM
+   * ($00000000-$01FFFFFF) doesn't shadow I/O addresses like VIA ($EFxxxx).
+   * With PMMU, physical VIA is $40EFxxxx which correctly misses the RAM range.
+   * Mask to 24-bit only for the SE bus I/O path below. */
+  uint32_t bus_addr = address & 0x00FFFFFF;
 
   if (platform_read_check(OP_TYPE_BYTE, address, &platform_res)) {
     return platform_res;
   }
 
 #ifdef DEBUG_DIAG
-  if (address >= 0x800000) rd8_hi++;
-  if (address >= 0xDFE1FF && address <= 0xDFFFFF) rd8_iwm++;
-  if (address >= 0xEFE1FE && address <= 0xEFFFFF) rd8_via++;
-  if (address >= 0x580000 && address <= 0x5FFFFF)
+  if (bus_addr >= 0x800000) rd8_hi++;
+  if (bus_addr >= 0xDFE1FF && bus_addr <= 0xDFFFFF) rd8_iwm++;
+  if (bus_addr >= 0xEFE1FE && bus_addr <= 0xEFFFFF) rd8_via++;
+  if (bus_addr >= 0x580000 && bus_addr <= 0x5FFFFF)
     rd8_scsi++;
 #endif
 
   // noscsi bypass: return 0 for all SCSI reads without hitting GPIO
-  if (noscsi_enabled && address >= 0x580000 && address <= 0x5FFFFF) {
+  if (noscsi_enabled && bus_addr >= 0x580000 && bus_addr <= 0x5FFFFF) {
     return 0;
   }
 
-  { int _sd = slowio_get_delay(address); if (_sd) slowio_delay(_sd); }
+  { int _sd = slowio_get_delay(bus_addr); if (_sd) slowio_delay(_sd); }
 
   unsigned int val;
-  int paced = is_pacedio(address);
+  int paced = is_pacedio(bus_addr);
   if (paced) {
 #ifdef DEBUG_DIAG
     pacedio_hit_count++;
 #endif
-    val = (unsigned int)ps_read_8_paced((uint32_t)address);
+    val = (unsigned int)ps_read_8_paced(bus_addr);
     for (int _i = 1; _i < paced; _i++)
       paced_dummy_cycle_1();
   } else {
-    val = (unsigned int)ps_read_8((uint32_t)address);
+    val = (unsigned int)ps_read_8(bus_addr);
   }
 
 #ifdef DEBUG_DIAG
@@ -1935,44 +2461,52 @@ unsigned int m68k_read_memory_8(unsigned int address) {
 }
 
 unsigned int m68k_read_memory_16(unsigned int address) {
-  // 68000 has 24-bit address bus — mask upper 8 bits
-  address &= 0x00FFFFFF;
+  uint32_t bus_addr = address & 0x00FFFFFF;
 
   if (platform_read_check(OP_TYPE_WORD, address, &platform_res)) {
     return platform_res;
   }
 
-  { int _sd = slowio_get_delay(address); if (_sd) slowio_delay(_sd); }
+  { int _sd = slowio_get_delay(bus_addr); if (_sd) slowio_delay(_sd); }
 
   uint32_t result16;
-  if (address & 0x01) {
-    result16 = ((ps_read_8(address) << 8) | ps_read_8(address + 1));
+  if (bus_addr & 0x01) {
+    result16 = ((ps_read_8(bus_addr) << 8) | ps_read_8(bus_addr + 1));
   } else {
-    result16 = (unsigned int)ps_read_16((uint32_t)address);
+    result16 = (unsigned int)ps_read_16(bus_addr);
   }
 
   return result16;
 }
 
 unsigned int m68k_read_memory_32(unsigned int address) {
-  // 68000 has 24-bit address bus — mask upper 8 bits
-  address &= 0x00FFFFFF;
+  uint32_t bus_addr = address & 0x00FFFFFF;
 
   if (platform_read_check(OP_TYPE_LONGWORD, address, &platform_res)) {
     return platform_res;
   }
 
-  { int _sd = slowio_get_delay(address); if (_sd) slowio_delay(_sd); }
+  /* Check fast-path RAM/ROM buffers before hitting SE bus.
+   * Needed for PMMU table walks which call this slow-path function
+   * but need to read from the local RAM buffer. */
+  for (int i = 0; i < m68ki_cpu.read_ranges; i++) {
+    if (address >= m68ki_cpu.read_addr[i] && address < m68ki_cpu.read_upper[i]) {
+      unsigned char *p = m68ki_cpu.read_data[i] + (address - m68ki_cpu.read_addr[i]);
+      return (p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
+    }
+  }
+
+  { int _sd = slowio_get_delay(bus_addr); if (_sd) slowio_delay(_sd); }
 
   uint32_t result32;
-  if (address & 0x01) {
-    uint32_t c = ps_read_8(address);
-    c |= (be16toh(ps_read_16(address+1)) << 8);
-    c |= (ps_read_8(address + 3) << 24);
+  if (bus_addr & 0x01) {
+    uint32_t c = ps_read_8(bus_addr);
+    c |= (be16toh(ps_read_16(bus_addr+1)) << 8);
+    c |= (ps_read_8(bus_addr + 3) << 24);
     result32 = htobe32(c);
   } else {
-    uint16_t a = ps_read_16(address);
-    uint16_t b = ps_read_16(address + 2);
+    uint16_t a = ps_read_16(bus_addr);
+    uint16_t b = ps_read_16(bus_addr + 2);
     result32 = (a << 16) | b;
   }
 
@@ -1980,30 +2514,25 @@ unsigned int m68k_read_memory_32(unsigned int address) {
 }
 
 static inline int32_t platform_write_check(uint8_t type, uint32_t addr, uint32_t val) {
+  uint32_t bus24 = addr & 0x00FFFFFF;
   switch (cfg->platform->id) {
     case PLATFORM_MAC: {
       /* Debug: log first writes to VIA range */
       static int via_dbg = 0;
-      if (addr >= 0xE00000 && addr <= 0xEFFFFF && via_dbg < 20) {
-        printf("[MAC-VIA] write addr=%08X val=%02X type=%d\n", addr, val, type);
+      if (bus24 >= 0xE00000 && bus24 <= 0xEFFFFF && via_dbg < 20) {
+        printf("[MAC-VIA] write addr=%08X val=%02X type=%d\n", bus24, val, type);
         via_dbg++;
       }
-      /* Mac SE BBU clears OVL on the first access to the ROM/SCSI
-       * address range ($400000-$5FFFFF).  "Designing Cards and Drivers
-       * for Macintosh II and Macintosh SE" (1987), p12-6:
-       * "Following the first normal ROM access or SCSI access
-       *  ($40 0000 through $5F FFFF), RAM appears at $00 0000."
-       * OVL is only re-asserted by a hardware reset.
-       */
-      if (ovl && addr >= ovl_sysrom_pos && addr < ovl_sysrom_pos + 0x100000) {
+      if (ovl && bus24 >= (ovl_sysrom_pos & 0x00FFFFFF) &&
+          bus24 < (ovl_sysrom_pos & 0x00FFFFFF) + 0x100000) {
         ovl = 0;
         m68ki_cpu.ovl = 0;
-        printf("[MAC] OVL off (write to ROM/SCSI range %08X).\n", addr);
+        printf("[MAC] OVL off (write to ROM/SCSI range %08X).\n", bus24);
         handle_ovl_mappings_mac68k(cfg);
       }
-      /* Custom write handler (Big SE SCSI remap, etc.) */
+      /* Custom write handler — uses 24-bit addr for I/O range matching */
       if (cfg->platform->custom_write &&
-          cfg->platform->custom_write(cfg, addr, val, type) != -1) {
+          cfg->platform->custom_write(cfg, bus24, val, type) != -1) {
         return 1;
       }
       break;
@@ -2022,8 +2551,23 @@ static inline int32_t platform_write_check(uint8_t type, uint32_t addr, uint32_t
 }
 
 void m68k_write_memory_8(unsigned int address, unsigned int value) {
-  // 68000 has 24-bit address bus — mask upper 8 bits
-  address &= 0x00FFFFFF;
+  uint32_t bus_addr = address & 0x00FFFFFF;
+
+  /* Trace VIA writes (skip first 20 = early init) */
+  if (bus_addr >= 0xEFE000 && bus_addr <= 0xEFFFFF) {
+    static int vw = 0;
+    if (vw >= 20 && vw < 50) {
+      int reg = (bus_addr - 0xEFE1FE) / 0x200;
+      static const char *regnames[] = {
+        "ORB","ORA","DDRB","DDRA","T1CL","T1CH","T1LL","T1LH",
+        "T2CL","T2CH","SR","ACR","PCR","IFR","IER","ORA-NH"};
+      printf("[VIA-WR] %s($%06X)=$%02X PC=$%08X\n",
+             (reg >= 0 && reg < 16) ? regnames[reg] : "??",
+             bus_addr, value & 0xFF,
+             m68k_get_reg(NULL, M68K_REG_PC));
+    }
+    vw++;
+  }
 
   if (address >= 0x51E0 && address <= 0x51F0)
     printf("[WR8-WATCH] $%06X ← $%02X  PC=$%08X\n",
@@ -2077,10 +2621,10 @@ void m68k_write_memory_8(unsigned int address, unsigned int value) {
   if (platform_write_check(OP_TYPE_BYTE, address, value))
     return;
 
-  { int _sd = slowio_get_delay(address); if (_sd) slowio_delay(_sd); }
+  { int _sd = slowio_get_delay(bus_addr); if (_sd) slowio_delay(_sd); }
 
   // noscsi bypass: swallow all SCSI writes without hitting GPIO
-  if (noscsi_enabled && address >= 0x580000 && address <= 0x5FFFFF) {
+  if (noscsi_enabled && bus_addr >= 0x580000 && bus_addr <= 0x5FFFFF) {
     return;
   }
 
@@ -2088,17 +2632,17 @@ void m68k_write_memory_8(unsigned int address, unsigned int value) {
   // to odd addresses, putting data on D0-D7. The BBU steers D0-D7→D8-D15
   // when the CPLD generates properly timed bus cycles. Byte replication in
   // ps_write_8 ensures D8-D15 also has the correct value.
-  if (address >= 0x580000 && address <= 0x5FFFFF) {
-    int paced = is_pacedio(address);
+  if (bus_addr >= 0x580000 && bus_addr <= 0x5FFFFF) {
+    int paced = is_pacedio(bus_addr);
 #ifdef DEBUG_DIAG
     if (paced) pacedio_hit_count++;
 #endif
     if (paced) {
-      ps_write_8_paced((uint32_t)address, value);
+      ps_write_8_paced(bus_addr, value);
       for (int _i = 1; _i < paced; _i++)
         paced_dummy_cycle_1();
     } else {
-      ps_write_8((uint32_t)address, value);
+      ps_write_8(bus_addr, value);
     }
     return;
   }
@@ -2160,28 +2704,27 @@ void m68k_write_memory_8(unsigned int address, unsigned int value) {
 #endif
 
   {
-    int paced = is_pacedio(address);
+    int paced = is_pacedio(bus_addr);
     if (paced) {
 #ifdef DEBUG_DIAG
       pacedio_hit_count++;
 #endif
-      ps_write_8_paced((uint32_t)address, value);
+      ps_write_8_paced(bus_addr, value);
       for (int _i = 1; _i < paced; _i++)
         paced_dummy_cycle_1();
     } else {
-      ps_write_8((uint32_t)address, value);
+      ps_write_8(bus_addr, value);
     }
   }
   return;
 }
 
 void m68k_write_memory_16(unsigned int address, unsigned int value) {
-  // 68000 has 24-bit address bus — mask upper 8 bits
-  address &= 0x00FFFFFF;
+  uint32_t bus_addr = address & 0x00FFFFFF;
 
   /* Big SE: catch decompressor writing $0040 high word (potential $004xxxxx) */
   { extern uint32_t ovl_sysrom_pos;
-    if (ovl_sysrom_pos >= 0x800000 && address < 0x400000 &&
+    if (ovl_sysrom_pos >= 0x800000 && bus_addr < 0x400000 &&
         value == 0x0040) {
       static int decomp16_log = 0;
       if (decomp16_log++ < 10)
@@ -2194,7 +2737,7 @@ void m68k_write_memory_16(unsigned int address, unsigned int value) {
     return;
 
 #ifdef DEBUG_MAC_IO
-  if (address == 0x142) {
+  if (bus_addr == 0x142) {
     printf("[DSKERR] W16 val=%04X pc=%08X d0=%08X a1=%08X sp=%08X\n",
            value, m68k_get_reg(NULL, M68K_REG_PC),
            m68k_get_reg(NULL, M68K_REG_D0),
@@ -2224,21 +2767,31 @@ void m68k_write_memory_16(unsigned int address, unsigned int value) {
   }
 #endif
 
-  { int _sd = slowio_get_delay(address); if (_sd) slowio_delay(_sd); }
+  { int _sd = slowio_get_delay(bus_addr); if (_sd) slowio_delay(_sd); }
 
-  if (address & 0x01) {
-    ps_write_8((uint32_t)address, value & 0xFF);
-    ps_write_8((uint32_t)address + 1, (value >> 8) & 0xFF);
+  if (bus_addr & 0x01) {
+    ps_write_8(bus_addr, value & 0xFF);
+    ps_write_8(bus_addr + 1, (value >> 8) & 0xFF);
     return;
   }
 
-  ps_write_16((uint32_t)address, value);
+  ps_write_16(bus_addr, value);
   return;
 }
 
 void m68k_write_memory_32(unsigned int address, unsigned int value) {
-  // 68000 has 24-bit address bus — mask upper 8 bits
-  address &= 0x00FFFFFF;
+  uint32_t bus_addr = address & 0x00FFFFFF;
+
+  /* Figment trap table: no longer intercepted here.
+   * Trap addresses are baked into the ROM by patch-rom.py. */
+
+  /* Debug: catch writes to UTableBase ($011C) */
+  if (bus_addr == 0x011C) {
+    static int utbl_log = 0;
+    if (utbl_log++ < 10)
+      printf("[UTBL-WR] $011C ← $%08X  PC=$%08X\n",
+             value, m68k_get_reg(NULL, M68K_REG_PC));
+  }
 
   /* Debug: catch writes near $51EC */
   if (address >= 0x51E0 && address <= 0x51F0) {
@@ -2276,16 +2829,16 @@ void m68k_write_memory_32(unsigned int address, unsigned int value) {
   }
 #endif
 
-  { int _sd = slowio_get_delay(address); if (_sd) slowio_delay(_sd); }
+  { int _sd = slowio_get_delay(bus_addr); if (_sd) slowio_delay(_sd); }
 
-  if (address & 0x01) {
-    ps_write_8((uint32_t)address, value & 0xFF);
-    ps_write_16((uint32_t)address + 1, htobe16(((value >> 8) & 0xFFFF)));
-    ps_write_8((uint32_t)address + 3, (value >> 24));
+  if (bus_addr & 0x01) {
+    ps_write_8(bus_addr, value & 0xFF);
+    ps_write_16(bus_addr + 1, htobe16(((value >> 8) & 0xFFFF)));
+    ps_write_8(bus_addr + 3, (value >> 24));
     return;
   }
 
-  ps_write_16((uint32_t)address, value >> 16);
-  ps_write_16((uint32_t)address + 2, value);
+  ps_write_16(bus_addr, value >> 16);
+  ps_write_16(bus_addr + 2, value);
   return;
 }

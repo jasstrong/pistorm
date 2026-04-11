@@ -138,7 +138,9 @@ void pmmu_atc_add(m68ki_cpu_core *state, uint32 logical, uint32 physical, int fc
 	// get page size (i.e. # of bits to ignore); is 10 for Apollo
 	int ps = (state->mmu_tc >> 20) & 0xf;
 	uint32 atc_tag = M68K_MMU_ATC_VALID | ((fc & 7) << 24) | ((logical >> ps) << (ps - 8));
-	uint32 atc_data = (physical >> ps) << (ps - 8);
+	/* Store physical page base directly — the old (physical >> ps) << (ps-8)
+	 * format truncates addresses above 24 bits when ps > 8. */
+	uint32 atc_data = physical >> ps;
 
 	if (state->mmu_tmp_sr & (M68K_MMU_SR_BUS_ERROR|M68K_MMU_SR_INVALID|M68K_MMU_SR_SUPERVISOR_ONLY))
 	{
@@ -307,7 +309,7 @@ uint16 pmmu_atc_lookup(m68ki_cpu_core *state, uint32 addr_in, int fc, uint16 rw,
 		{
 			state->mmu_tmp_sr |= M68K_MMU_SR_BUS_ERROR|M68K_MMU_SR_INVALID;
 		}
-		*addr_out = (atc_data << 8) | (addr_in & ~(((uint32)~0) << ps));
+		*addr_out = (atc_data << ps) | (addr_in & ~(((uint32)~0) << ps));
 		MMULOG(("%s: addr_in=%08x, addr_out=%08x, MMU SR %04x\n",
 				__func__, addr_in, *addr_out, state->mmu_tmp_sr));
 		return 1;
@@ -359,6 +361,9 @@ void update_descriptor(m68ki_cpu_core *state, uint32 tptr, int type, uint32 entr
 	// FIXME: Silence unused variable warning
 	if (state) {}
 
+	/* Only page descriptors (DT=1) have M and U bits.
+	 * Table pointer descriptors (DT=2, DT=3) use ALL bits 31:2 for the
+	 * address — setting M/U would corrupt the pointer. */
 	if (type == M68K_MMU_DF_DT_PAGE && !rw &&
 			!(entry & M68K_MMU_DF_MODIFIED) &&
 			!(entry & M68K_MMU_DF_WP))
@@ -366,7 +371,7 @@ void update_descriptor(m68ki_cpu_core *state, uint32 tptr, int type, uint32 entr
 		MMULOG(("%s: set M+U at %08x\n", __func__, tptr));
 		m68k_write_memory_32(tptr, entry | M68K_MMU_DF_USED | M68K_MMU_DF_MODIFIED);
 	}
-	else if (type != M68K_MMU_DF_DT_INVALID && !(entry & M68K_MMU_DF_USED))
+	else if (type == M68K_MMU_DF_DT_PAGE && !(entry & M68K_MMU_DF_USED))
 	{
 		MMULOG(("%s: set U at %08x\n", __func__, tptr));
 		m68k_write_memory_32(tptr, entry | M68K_MMU_DF_USED);
@@ -458,6 +463,10 @@ uint16 pmmu_walk_tables(m68ki_cpu_core *state, uint32 addr_in, int type, uint32 
 			case M68K_MMU_DF_DT_PAGE:   // page descriptor, will cause direct mapping
 				if (!ptest)
 				{
+					/* CI (Cache Inhibit) = bit 6 of page descriptor.
+					 * Use bit 14 of mmu_tmp_sr to pass CI to caller. */
+					if (table & 0x40)
+						state->mmu_tmp_sr |= 0x4000;
 					table &= ((uint32)~0) << pagesize;
 					*addr_out = table + (addr_in >> pageshift);
 				}
@@ -609,8 +618,8 @@ uint32 pmmu_translate_addr_with_fc(m68ki_cpu_core *state, uint32 addr_in, uint8 
 
 	if (!pmmu_walk_tables(state, addr_in, type, tbl_addr, fc, limit, rw, &addr_out, ptest))
 	{
-		MMULOG(("%s: addr_in=%08x, type=%x, tbl_addr=%x, fc=%d, limit=%x, rw=%x, addr_out=%x, ptest=%d\n",
-				__func__, addr_in, type, tbl_addr, fc, limit, rw, addr_out, ptest));
+		printf("[PMMU] Table walk FAILED: addr_in=%08x type=%x tbl=%08x fc=%d rw=%d PC=%08x\n",
+		       addr_in, type, tbl_addr, fc, rw, state->ppc);
 		fatalerror("Table walk did not resolve\n");
 	}
 
@@ -632,8 +641,9 @@ uint32 pmmu_translate_addr_with_fc(m68ki_cpu_core *state, uint32 addr_in, uint8 
 
 	// it seems like at least the 68030 sets the M bit in the MMU SR
 	// if the root descriptor is of PAGE type, so do a logical and
-	// between RW and the root type
-	if (!m_side_effects_disabled)
+	// between RW and the root type.
+	// Skip ATC for CI (Cache Inhibit) pages — bit 14 of mmu_tmp_sr set by walk.
+	if (!m_side_effects_disabled && !(state->mmu_tmp_sr & 0x4000))
 	{
 		pmmu_atc_add(state, addr_in, addr_out, fc, rw && type != 1);
 	}
@@ -1020,6 +1030,7 @@ void m68851_pmove_get(m68ki_cpu_core *state, uint32 ea, uint16 modes)
 		break;
 	case 0x10:  // translation control register
 		WRITE_EA_32(state, ea, state->mmu_tc);
+		printf("[PMOVE-RD-TC] PC=$%08X: reading TC=$%08X\n", state->ppc, state->mmu_tc);
 		MMULOG(("PMMU: pc=%x PMOVE from mmu_tc=%08x\n", state->ppc, state->mmu_tc));
 		break;
 
@@ -1083,7 +1094,13 @@ void m68851_pmove_put(m68ki_cpu_core *state, uint32 ea, uint16 modes)
 		switch ((modes >> 10) & 7)
 		{
 		case 0: // translation control register
-			state->mmu_tc = READ_EA_32(state, ea);
+			{
+				uint32 old_tc = state->mmu_tc;
+				state->mmu_tc = READ_EA_32(state, ea);
+				if (old_tc != state->mmu_tc)
+					printf("[PMOVE-TC] PC=$%08X: TC $%08X → $%08X\n",
+					       state->ppc, old_tc, state->mmu_tc);
+			}
 			MMULOG(("PMMU: TC = %08x\n", state->mmu_tc));
 
 			if (state->mmu_tc & 0x80000000)
@@ -1136,8 +1153,14 @@ void m68851_pmove_put(m68ki_cpu_core *state, uint32 ea, uint16 modes)
 
 		case 3: // CPU root pointer
 			temp64 = READ_EA_64(state, ea);
-			state->mmu_crp_limit = (temp64 >> 32) & 0xffffffff;
-			state->mmu_crp_aptr = temp64 & 0xffffffff;
+			{
+				uint32 old_crp = state->mmu_crp_aptr;
+				state->mmu_crp_limit = (temp64 >> 32) & 0xffffffff;
+				state->mmu_crp_aptr = temp64 & 0xffffffff;
+				if (old_crp != state->mmu_crp_aptr)
+					printf("[PMOVE-CRP] PC=$%08X: CRP $%08X → $%08X\n",
+					       state->ppc, old_crp, state->mmu_crp_aptr);
+			}
 			MMULOG(("PMMU: CRP limit = %08x aptr = %08x\n", state->mmu_crp_limit, state->mmu_crp_aptr));
 			// CRP type 0 is not allowed
 			if ((state->mmu_crp_limit & 3) == 0)

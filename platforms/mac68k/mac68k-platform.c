@@ -34,7 +34,7 @@ extern unsigned int ovl;
 
 uint32_t ovl_sysrom_pos = 0x400000;
 uint32_t ovl_decode_size = 0x20000; /* 128KB OVL overlay on Mac SE */
-static uint32_t bigse_vbuf_virt = 0x7F0000;  /* video buffer virt addr, set by OVL handler */
+uint32_t bigse_vbuf_virt = 0x7F0000;  /* video buffer virt addr, set by OVL handler */
 
 /*
  * SCSI driver ROM exclusion zone: addresses in this range bypass the
@@ -116,6 +116,18 @@ void setvar_mac68k(struct emulator_config *cfg, char *var, char *val) {
         vnc_cfg.port = (val && strlen(val)) ? (int)get_int(val) : 5900;
         printf("[MAC68K] VNC server enabled on port %d\n", vnc_cfg.port);
     }
+
+    if (CHKVAR("mode32")) {
+        extern int mode32_enabled;
+        mode32_enabled = 1;
+        printf("[MAC68K] MODE32 trap enabled\n");
+    }
+
+    if (CHKVAR("figment")) {
+        extern int figment_enabled;
+        figment_enabled = 1;
+        printf("[MAC68K] Figment MM trap intercept enabled\n");
+    }
 }
 
 
@@ -144,25 +156,14 @@ void handle_ovl_mappings_mac68k(struct emulator_config *cfg) {
         /* Config offset tracks OVL for the slow-path mapped read handler */
         cfg->map_offset[rom_index] = (ovl) ? 0x0 : ovl_sysrom_pos;
         cfg->map_high[rom_index] = cfg->map_offset[rom_index] + cfg->map_size[rom_index];
-        /* Fast-path: ROM at sysrom_pos, with exclusion zone for SCSI driver.
-         * The SCSI driver ROM area must fall through to the SE bus so that
-         * instruction fetches generate real bus cycles (needed for BBU DMA
-         * timing during SCSI pseudo-DMA operations). */
+        /* Fast-path: ROM at sysrom_pos (read-only).
+         * Writes to ROM range are caught by custom_write and applied to
+         * the buffer — needed for the MM code at $AC6E which does CLR.L
+         * to a ROM address and expects the next read to see zero. */
         m68k_remove_range(cfg->map_data[rom_index]);
-        uint32_t scsi_rom_low  = ovl_sysrom_pos + SCSI_ROM_OFFSET_LOW;
-        uint32_t scsi_rom_high = ovl_sysrom_pos + SCSI_ROM_OFFSET_HIGH;
-        if (scsi_rom_low > ovl_sysrom_pos && scsi_rom_high < ovl_sysrom_pos + cfg->map_size[rom_index]) {
-            m68k_add_rom_range(ovl_sysrom_pos, scsi_rom_low, cfg->map_data[rom_index]);
-            m68k_add_rom_range(scsi_rom_high, ovl_sysrom_pos + cfg->map_size[rom_index],
-                               cfg->map_data[rom_index] + (scsi_rom_high - ovl_sysrom_pos));
-            printf("[MAC68K] ROM at %08X (fast-path split: %08X-%08X, %08X-%08X)\n",
-                   cfg->map_offset[rom_index], ovl_sysrom_pos, scsi_rom_low,
-                   scsi_rom_high, ovl_sysrom_pos + cfg->map_size[rom_index]);
-        } else {
-            m68k_add_rom_range(ovl_sysrom_pos, ovl_sysrom_pos + cfg->map_size[rom_index], cfg->map_data[rom_index]);
-            printf("[MAC68K] ROM at %08X (fast-path at %08X-%08X)\n",
-                   cfg->map_offset[rom_index], ovl_sysrom_pos, ovl_sysrom_pos + cfg->map_size[rom_index]);
-        }
+        m68k_add_rom_range(ovl_sysrom_pos, ovl_sysrom_pos + cfg->map_size[rom_index], cfg->map_data[rom_index]);
+        printf("[MAC68K] ROM at %08X (fast-path at %08X-%08X)\n",
+               cfg->map_offset[rom_index], ovl_sysrom_pos, ovl_sysrom_pos + cfg->map_size[rom_index]);
     }
 
     index = get_named_mapped_item(cfg, "sysram");
@@ -186,15 +187,19 @@ void handle_ovl_mappings_mac68k(struct emulator_config *cfg) {
              * suppress write-through GPIO writes. */
             uint32_t ram_start = ovl_decode_size;
             uint32_t ram_end = cfg->map_size[index];
+
             if (ram_start < ram_end) {
                 uint32_t wtc_start = ram_end - WTC_REGION_SIZE;
+                /* Huge SE: WTC at $7F0000 during 24-bit boot */
+                if (ovl_sysrom_pos >= 0x40000000)
+                    wtc_start = 0x7F0000;
                 if (wtc_start > ram_start) {
                     ram_range_ptr = cfg->map_data[index] + ram_start;
                     m68k_add_ram_range(ram_start, wtc_start, ram_range_ptr);
                     ram_wtc_ptr = cfg->map_data[index] + wtc_start;
-                    m68k_add_ram_range_wtc(wtc_start, ram_end, ram_wtc_ptr);
+                    m68k_add_ram_range_wtc(wtc_start, wtc_start + WTC_REGION_SIZE, ram_wtc_ptr);
                     printf("[MAC68K] RAM at %08X-%08X fast, %08X-%08X wtc (OVL covers 0-%08X)\n",
-                           ram_start, wtc_start, wtc_start, ram_end, ovl_decode_size);
+                           ram_start, wtc_start, wtc_start, wtc_start + WTC_REGION_SIZE, ovl_decode_size);
                 } else {
                     ram_range_ptr = cfg->map_data[index] + ram_start;
                     m68k_add_ram_range_wtc(ram_start, ram_end, ram_range_ptr);
@@ -208,19 +213,29 @@ void handle_ovl_mappings_mac68k(struct emulator_config *cfg) {
             /* OVL off: RAM at 0x000000 */
             uint32_t ram_end = cfg->map_size[index];
             uint32_t wtc_start = ram_end - WTC_REGION_SIZE;
+
+            /* Huge SE: WTC at $7F0000 (top of visible 8MB), not $01FF0000
+             * (top of 32MB).  PMMU identity-maps everything — no entry 7
+             * remap.  MODE32 will move WTC to $01FF0000 via pseudovirt trap. */
+            if (ovl_sysrom_pos >= 0x40000000)
+                wtc_start = 0x7F0000;
+
             /* Set video buffer virtual address — 24-bit masked, because
-             * custom_write sees addresses after slow-path 24-bit mask.
-             * big-se (8MB): $7F0000.  huge-se (32MB): $01FF0000 → $FF0000. */
+             * custom_write sees addresses after slow-path 24-bit mask. */
             if (ovl_sysrom_pos >= 0x800000)
                 bigse_vbuf_virt = wtc_start & 0x00FFFFFF;
+
             ram_range_ptr = cfg->map_data[index];
             cfg->map_offset[index] = 0x0;
             cfg->map_high[index] = cfg->map_size[index];
             m68k_add_ram_range(0x0, wtc_start, cfg->map_data[index]);
             ram_wtc_ptr = cfg->map_data[index] + wtc_start;
-            m68k_add_ram_range_wtc(wtc_start, ram_end, ram_wtc_ptr);
+            m68k_add_ram_range_wtc(wtc_start, wtc_start + WTC_REGION_SIZE, ram_wtc_ptr);
+            /* RAM above $800000 is not visible to CPU in 24-bit mode
+             * (PMMU entries 8+ map to $40xxxxxx I/O/ROM).
+             * Do NOT add a fast-path range — it would shadow the ROM alias. */
             printf("[MAC68K] RAM at 00000000-%08X fast, %08X-%08X wtc\n",
-                   wtc_start, wtc_start, ram_end);
+                   wtc_start, wtc_start, wtc_start + WTC_REGION_SIZE);
         }
     }
 
@@ -312,20 +327,9 @@ int custom_read_mac68k(struct emulator_config *cfg, unsigned int addr,
             static uint32_t iwm_last_addr = 0;
             static uint64_t iwm_total_reads = 0;
             iwm_total_reads++;
-            if (phys == iwm_last_addr) {
-                if (++iwm_poll_count > 500000 && iwm_total_reads > 5000000) {
-                    /* IWM polling loop stuck with interrupts masked.
-                     * Unmask interrupts so VBL keeps firing — the
-                     * loop will eventually time out on its own. */
-                    unsigned int sr = m68k_get_reg(NULL, M68K_REG_SR);
-                    if (sr & 0x0700) {
-                        m68k_set_reg(NULL, M68K_REG_SR, sr & ~0x0700);
-                        iwm_poll_count = 0;
-                    }
-                }
-            } else {
-                iwm_poll_count = 0;
-                iwm_last_addr = phys;
+            { static uint32_t iwm_rd = 0;
+              if (++iwm_rd <= 10)
+                printf("[IWM-RD] addr=$%06X val=$%02X #%u\n", phys, *val, iwm_rd);
             }
             *val = ps_read_8_paced(phys);
         } else {
@@ -348,9 +352,12 @@ int custom_write_mac68k(struct emulator_config *cfg, unsigned int addr,
         else if (ovl_sysrom_pos >= 0x40000000 && addr >= 0x580000 && addr < 0x600000)
             phys = addr;
         if (phys) {
-            if (phys >= 0x5FF000)
+            if (phys >= 0x5FF000) {
+                static uint32_t iwm_wr = 0;
+                if (++iwm_wr <= 10)
+                    printf("[IWM-WR] addr=$%06X val=$%02X #%u PC=$%08X\n", phys, val & 0xFF, iwm_wr, m68k_get_reg(NULL, M68K_REG_PC));
                 ps_write_8_paced(phys, val);
-            else
+            } else
                 ps_write_8(phys, val);
             (void)type;
             return 1;
@@ -377,6 +384,33 @@ int custom_write_mac68k(struct emulator_config *cfg, unsigned int addr,
          * data that must NOT reach the physical display buffer. */
         if (addr >= BIGSE_VBUF_PHYS && addr < BIGSE_VBUF_PHYS + BIGSE_VBUF_SIZE) {
             return 1;  /* swallow — WTC buffer has it, don't corrupt CRT */
+        }
+        /* ROM write handler: apply writes to the ROM buffer.
+         * ROM is read-only in the fast-path, but the SE ROM's MM code
+         * does CLR.L to ROM addresses and expects reads to reflect the
+         * change.  On real hardware, the BBU aliases these to RAM. */
+        {
+            uint32_t rom_masked = ovl_sysrom_pos & 0x00FFFFFF;
+            if (addr >= rom_masked && addr < rom_masked + 0x80000) {
+                extern struct emulator_config *cfg;
+                int32_t ri = get_named_mapped_item(cfg, "sysrom");
+                if (ri >= 0 && cfg->map_data[ri]) {
+                    uint32_t off = addr - rom_masked;
+                    unsigned char *rom_data = cfg->map_data[ri];
+                    if (type == 0) {
+                        rom_data[off] = val & 0xFF;
+                    } else if (type == 1) {
+                        rom_data[off]   = (val >> 8) & 0xFF;
+                        rom_data[off+1] = val & 0xFF;
+                    } else {
+                        rom_data[off]   = (val >> 24) & 0xFF;
+                        rom_data[off+1] = (val >> 16) & 0xFF;
+                        rom_data[off+2] = (val >> 8)  & 0xFF;
+                        rom_data[off+3] = val & 0xFF;
+                    }
+                    return 1;
+                }
+            }
         }
     }
     return -1;

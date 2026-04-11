@@ -1,0 +1,49 @@
+/* Auto-generated — do not edit */
+#define RESMGR_TRAP_COUNT 45
+static const struct { uint16_t trap_num; uint32_t offset; } resmgr_trap_table[] = {
+    { 0x080D, 0x40848F3A }, /* Count1Resources */
+    { 0x080E, 0x40848F68 }, /* Get1IndResource */
+    { 0x080F, 0x40849050 }, /* Get1IndType */
+    { 0x0810, 0x4084907C }, /* Unique1ID */
+    { 0x081B, 0x4084882E }, /* HCreateResFile */
+    { 0x081C, 0x40848FFC }, /* Count1Types */
+    { 0x081F, 0x408490C8 }, /* Get1Resource */
+    { 0x0820, 0x4084919C }, /* Get1NamedResource */
+    { 0x0821, 0x4084A3A0 }, /* MaxSizeRsrc */
+    { 0x0992, 0x40849DCA }, /* DetachResource */
+    { 0x0993, 0x40849EC0 }, /* SetResPurge */
+    { 0x0994, 0x40849EF6 }, /* CurResFile */
+    { 0x0995, 0x4084813E }, /* InitResources */
+    { 0x0996, 0x40848722 }, /* RsrcZoneInit */
+    { 0x0997, 0x4084890E }, /* OpenResFile */
+    { 0x0998, 0x408489B8 }, /* UseResFile */
+    { 0x0999, 0x40848AC2 }, /* UpdateResFile */
+    { 0x099A, 0x40848E6E }, /* CloseResFile */
+    { 0x099B, 0x40849EEA }, /* SetResLoad */
+    { 0x099C, 0x40848F3E }, /* CountResources */
+    { 0x099D, 0x40848F6C }, /* GetIndResource */
+    { 0x099E, 0x40849000 }, /* CountTypes */
+    { 0x099F, 0x40849054 }, /* GetIndType */
+    { 0x09A0, 0x408490D0 }, /* GetResource */
+    { 0x09A1, 0x408491A0 }, /* GetNamedResource */
+    { 0x09A2, 0x40849D2E }, /* LoadResource */
+    { 0x09A3, 0x40849D94 }, /* ReleaseResource */
+    { 0x09A4, 0x40849E86 }, /* HomeResFile */
+    { 0x09A5, 0x4084A37A }, /* SizeResource */
+    { 0x09A6, 0x40849F28 }, /* GetResAttrs */
+    { 0x09A7, 0x40849F40 }, /* SetResAttrs */
+    { 0x09A8, 0x40849F7E }, /* GetResInfo */
+    { 0x09A9, 0x40849FD2 }, /* SetResInfo */
+    { 0x09AA, 0x40849DF2 }, /* ChangedResource */
+    { 0x09AB, 0x4084A02C }, /* AddResource */
+    { 0x09AC, 0x40849F0A }, /* AddReference */
+    { 0x09AD, 0x4084A146 }, /* RmveResource */
+    { 0x09AE, 0x40849F1C }, /* RmveReference */
+    { 0x09AF, 0x40849F00 }, /* ResError */
+    { 0x09B0, 0x40849E3E }, /* WriteResource */
+    { 0x09B1, 0x40848892 }, /* CreateResFile */
+    { 0x09C1, 0x40849080 }, /* UniqueID */
+    { 0x09C4, 0x4084896A }, /* OpenRFPerm */
+    { 0x09F6, 0x408489E8 }, /* GetResFileAttrs */
+    { 0x09F7, 0x408489F6 }, /* SetResFileAttrs */
+};
