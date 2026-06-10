@@ -2205,6 +2205,15 @@ switch_config:
     printf("[MAIN] Keyboard thread created successfully\n");
   }
 
+  // optional GDB remote stub — set GDB_PORT env to enable (e.g. 2159)
+  {
+    const char *gp = getenv("GDB_PORT");
+    if (gp && *gp) {
+      extern int gdbstub_init(int port);
+      gdbstub_init(atoi(gp));
+    }
+  }
+
   // create cpu task
   err = pthread_create(&cpu_tid, NULL, &cpu_task, NULL);
   if (err != 0)

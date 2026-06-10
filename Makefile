@@ -2,6 +2,7 @@ EXENAME          = emulator
 
 MAINFILES        = emulator.c \
 	memory_mapped.c \
+	gdbstub.c \
 	config_file/config_file.c \
 	config_file/rominfo.c \
 	input/input.c \

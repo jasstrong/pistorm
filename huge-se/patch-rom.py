@@ -562,10 +562,18 @@ def patch_rom(infile, outfile):
         out[SCSIDRV_ROM_OFF:SCSIDRV_ROM_OFF + len(scsidrv)] = scsidrv
 
         drv_vaddr = 0x40800000 + SCSIDRV_ROM_OFF
+        # DBG string lives just before the shim; A0 points at it for $A0FE.
+        dbg_str = b"SCSIHD shim ran\x00"
+        dbg_off = SCSIDRV_SHIM_OFF - 0x20
+        out[dbg_off:dbg_off + len(dbg_str)] = dbg_str
+        dbg_vaddr = 0x40800000 + dbg_off
         # Copy-shim — replaces SCSIBoot's `bsr SRead;bne` with a2 = dest
-        # buffer (preserved): movem.l d0/a0-a1,-(sp); movea.l a2,a1;
-        # lea drv,a0; move.w #words-1,d0; (a0)+→(a1)+; dbra; restore; rts.
-        shim = struct.pack('>HH', 0x48E7, 0x80C0)   # movem.l d0/a0-a1,-(sp)
+        # buffer (preserved): [dbg: lea str,a0; $A0FE] movem.l d0/a0-a1,-(sp);
+        # movea.l a2,a1; lea drv,a0; move.w #words-1,d0; (a0)+→(a1)+; dbra;
+        # restore; rts.
+        shim = struct.pack('>HI', 0x41F9, dbg_vaddr) # lea dbg.l,a0
+        shim += struct.pack('>H', 0xA0FE)            # debug trap (A0=str)
+        shim += struct.pack('>HH', 0x48E7, 0x80C0)   # movem.l d0/a0-a1,-(sp)
         shim += struct.pack('>H', 0x224A)            # movea.l a2,a1
         shim += struct.pack('>HI', 0x41F9, drv_vaddr)# lea drv.l,a0
         shim += struct.pack('>HH', 0x303C, len(scsidrv) // 2 - 1)  # move.w #n,d0

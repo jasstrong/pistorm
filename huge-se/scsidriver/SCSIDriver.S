@@ -92,6 +92,20 @@
 drv_install:
     movem.l %d1-%d7/%a0-%a6,-(%sp)
 
+    /* DBG: movem pushed d1..d7/a0..a6 (14 longs); saved A0 is at 28(sp).
+     * $A0FE trap reads A0=string,D0=value and doesn't modify regs. */
+    move.l  28(%sp),%d0         /* d0 = saved A0 = partition entry ptr */
+    lea     dbg_enter(%pc),%a0
+    .short  0xA0FE
+    movea.l 28(%sp),%a1
+    move.l  pmPartBlkCnt(%a1),%d0
+    lea     dbg_blkcnt(%pc),%a0
+    .short  0xA0FE
+    move.l  %d5,%d0
+    lea     dbg_d5(%pc),%a0
+    .short  0xA0FE
+    movea.l 28(%sp),%a0         /* restore A0 = partition entry */
+
     move.w  %d5,%d3
     and.w   #7,%d3              /* d3 = SCSI ID */
 
@@ -183,6 +197,15 @@ install_fail:
     movem.l (%sp)+,%d1-%d7/%a0-%a6
     moveq   #-1,%d0
     rts
+
+/* ---- debug strings (figment $A0FE trap: A0=string, D0=value) ---- */
+    .even
+dbg_enter:  .asciz "SCSIHD install A0="
+    .even
+dbg_blkcnt: .asciz "SCSIHD partBlkCnt="
+    .even
+dbg_d5:     .asciz "SCSIHD D5(ID)="
+    .even
 
 /* ======================================================================
  * DRVR header — Device Manager entry offsets are relative to this point.
