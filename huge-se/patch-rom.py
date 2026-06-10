@@ -387,6 +387,35 @@ def patch_rom(infile, outfile):
     # enough space for the Figment zone header + RM allocations.
     resmap_relocated = None
 
+    # === 5h. ROM-resident SCSI disk driver (".SCSIHD") — first-half code patches ===
+    # Replace the on-disk Apple_Driver code with our own.  SCSIBoot's
+    # driver-load SRead at $40DE is swapped for a shim that copies the
+    # ROM-embedded driver image into the freshly _NewPtr'd sysheap buffer.
+    # Everything downstream (CallDriver jsr (a3), DM dispatch) is stock —
+    # our image simply IS "the loaded driver".  The driver does all I/O
+    # via _SCSIDispatch, so no hardware addresses exist outside the
+    # (already remapped) ROM SCSI Manager.  New-style 'PM' maps only.
+    #
+    # The driver image + copy-shim live in the MIRROR half and are embedded
+    # after mirroring (below); here we only patch first-half SCSIBoot code,
+    # which must happen before the checksum.  SCSIDRV_SHIM_OFF/_ROM_OFF are
+    # mirror offsets (>= $40000), referenced as virtual $4080xxxx.
+    SCSIDRV_ROM_OFF = 0x5E000
+    SCSIDRV_SHIM_OFF = 0x5DF00
+    scsidrv_path = os.path.join(os.path.dirname(__file__), 'scsidriver', 'SCSIDriver.bin')
+    embed_scsidrv = os.path.exists(scsidrv_path)
+    if embed_scsidrv:
+        # Patch SCSIBoot driver-load: $40DE `bsr SRead` + $40E2 `bne` (6 bytes)
+        # -> jsr shim.l (shim copies our image into a2's buffer, then rts).
+        assert rom[0x40DE:0x40E0] == b'\x61\x00', "SCSIBoot load site mismatch"
+        rom[0x40DE:0x40E4] = struct.pack('>HI', 0x4EB9, 0x40800000 + SCSIDRV_SHIM_OFF)
+
+        # Checksum bypass: $416A `beq.s CkSumOK` -> `bra.s` (disk driver's
+        # boot_cksum can't match our bytes; result intentionally ignored).
+        assert rom[0x416A] == 0x67, "cksum branch site mismatch"
+        rom[0x416A] = 0x60
+        patches += 2
+
     print(f"\n=== Total patches: {patches} ===")
 
     # === 6. Patch ROM $0762 with JMP to Figment trap installer ===
@@ -517,6 +546,36 @@ def patch_rom(infile, outfile):
               f"({len(combo_blob)} bytes, ends ${COMBO_ROM_OFF + len(combo_blob):05X}) ===")
     else:
         print(f"=== WARNING: Combo resources don't fit at ${COMBO_ROM_OFF:05X} ===")
+
+    # Embed .SCSIHD driver image + copy-shim in mirror half (after combo).
+    # SCSIDRV_SHIM_OFF/_ROM_OFF set in section 5h; the first-half SCSIBoot
+    # patch jumps to virtual $40800000+SHIM_OFF.  Verify no overlap with
+    # the combo blob, then write image then shim.
+    if embed_scsidrv:
+        scsidrv = open(scsidrv_path, 'rb').read()
+        if len(scsidrv) & 1:
+            scsidrv += b'\0'
+        combo_end = COMBO_ROM_OFF + (len(combo_blob) if combo_blob else 0)
+        assert SCSIDRV_SHIM_OFF >= combo_end, "shim overlaps combo blob"
+        assert SCSIDRV_ROM_OFF + len(scsidrv) <= len(out), "driver overflows ROM"
+
+        out[SCSIDRV_ROM_OFF:SCSIDRV_ROM_OFF + len(scsidrv)] = scsidrv
+
+        drv_vaddr = 0x40800000 + SCSIDRV_ROM_OFF
+        # Copy-shim — replaces SCSIBoot's `bsr SRead;bne` with a2 = dest
+        # buffer (preserved): movem.l d0/a0-a1,-(sp); movea.l a2,a1;
+        # lea drv,a0; move.w #words-1,d0; (a0)+→(a1)+; dbra; restore; rts.
+        shim = struct.pack('>HH', 0x48E7, 0x80C0)   # movem.l d0/a0-a1,-(sp)
+        shim += struct.pack('>H', 0x224A)            # movea.l a2,a1
+        shim += struct.pack('>HI', 0x41F9, drv_vaddr)# lea drv.l,a0
+        shim += struct.pack('>HH', 0x303C, len(scsidrv) // 2 - 1)  # move.w #n,d0
+        shim += struct.pack('>H', 0x32D8)            # move.w (a0)+,(a1)+
+        shim += struct.pack('>HH', 0x51C8, 0xFFFC)   # dbra d0,-4
+        shim += struct.pack('>HH', 0x4CDF, 0x0301)   # movem.l (sp)+,d0/a0-a1
+        shim += struct.pack('>H', 0x4E75)            # rts
+        out[SCSIDRV_SHIM_OFF:SCSIDRV_SHIM_OFF + len(shim)] = shim
+        print(f"=== .SCSIHD driver embedded at ROM+${SCSIDRV_ROM_OFF:05X} "
+              f"({len(scsidrv)} bytes), shim at +${SCSIDRV_SHIM_OFF:05X} ===")
 
     open(outfile, 'wb').write(out)
     print(f"Written to {outfile}")
