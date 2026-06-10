@@ -465,10 +465,17 @@ def patch_rom(infile, outfile):
                 installer_rom_off += 1
             installer_vaddr = 0x40800000 + installer_rom_off
 
-            # Build 68k installer: set A-line vector, write trap table, RTS
-            data_offset = 36
-            lea_disp = data_offset - 12
+            # Build 68k installer: clear addr 0, set A-line vector, write trap table, RTS
+            data_offset = 40
+            lea_disp = data_offset - 16
             code = bytearray()
+            # Clear address 0: the $1D10 vector-table copy leaves vector-0
+            # (reset SSP = $2000) at address 0.  The File Manager FCB search
+            # at $932E does MOVEA.L A3,A4 (A4=0); MOVE.L (A4),A4 — i.e. it
+            # dereferences address 0 as a nil list head.  With $2000 there the
+            # nil-terminated walk never ends and boot wedges.  Vector 0 is only
+            # read at physical reset, so zeroing it at runtime is safe.
+            code += struct.pack('>HH', 0x42B8, 0x0000)  # CLR.L $0000.W
             code += struct.pack('>HH', 0x21C8, 0x0028)  # MOVE.L A0,$0028
             code += struct.pack('>H', 0x2F08)            # MOVE.L A0,-(SP)
             code += struct.pack('>H', 0x2F09)            # MOVE.L A1,-(SP)
@@ -484,7 +491,7 @@ def patch_rom(infile, outfile):
             code += struct.pack('>H', 0x225F)            # MOVEA.L (SP)+,A1
             code += struct.pack('>H', 0x205F)            # MOVEA.L (SP)+,A0
             code += struct.pack('>H', 0x4E75)            # RTS
-            assert len(code) == 36
+            assert len(code) == 40
             for tb_off, ta in trap_entries:
                 code += struct.pack('>H', tb_off)
                 code += struct.pack('>I', ta)
