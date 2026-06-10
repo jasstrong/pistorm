@@ -145,6 +145,12 @@ drv_install:
     moveq   #pvSize+DQESize,%d0
     .short  0xA51E+0x200        /* _NewPtr ,Sys,Clear = A71E */
     bne     install_fail
+    /* figment's _NewPtr does NOT preserve A3 (it returns the new ptr in
+     * both A0 and A3).  Reload the DCE pointer from the handle (A4, which
+     * _NewPtr does preserve) before writing dCtlStorage, or the store
+     * lands in the private block and the DCE's dCtlStorage stays nil —
+     * Prime then derefs a nil storage ptr and reads garbage blocks. */
+    movea.l (%a4),%a3           /* a3 = DCE ptr again */
     /* a0 = private block; DQE at a0+pvSize */
     move.w  %d3,pvScsiID(%a0)
     move.l  %d4,pvPartStart(%a0)
