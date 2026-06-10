@@ -138,7 +138,12 @@ drv_install:
 
     lea     drvr_header(%pc),%a1
     move.l  %a1,dCtlDriver(%a3)
-    move.w  #0x0F00,dCtlFlags(%a3)   /* read+write+ctl+status enable; dRAMBased CLEAR (pointer) */
+    /* dCtlFlags: dReadEnable|dWritEnable|dCtlEnable|dStatEnable ($0F00)
+     * | dRAMBased ($0040) — dCtlDriver is a POINTER (driver copied to RAM),
+     *   NOT a handle; without this the Device Manager double-derefs it as a
+     *   handle into garbage and never dispatches Open/Prime/Status.
+     * | dOpened ($0020) — driver is open (our Open is a no-op). */
+    move.w  #0x0F60,dCtlFlags(%a3)
     move.w  %d7,dCtlRefNum(%a3)
 
     /* ---- private block + DQE: _NewPtr ,SYS ,CLEAR ---- */
