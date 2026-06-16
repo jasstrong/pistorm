@@ -558,6 +558,17 @@ def patch_rom(infile, outfile):
     else:
         print(f"=== WARNING: boot32.bin not found ({boot32_path}) ===")
 
+    # === Born-32 32-bit-clean: Lo3Bytes ($031A) = $FFFFFFFF ===
+    # ROM $07CA does `move.l #$00FFFFFF, $031A` (Lo3Bytes, the 24-bit address
+    # mask).  Throughout the ROM, `and.l Lo3Bytes,An` strips pointers to 24 bits
+    # — e.g. the DCE install ($4080306A) turns the .Sony driver ptr $40855406
+    # into $00855406 (RAM zeros) → wild jump.  In born-32 every pointer is a real
+    # 32-bit address, so make the mask a no-op.  One byte: $00FFFFFF -> $FFFFFFFF.
+    assert rom[0x07CA:0x07D2] == bytes.fromhex('21FC00FFFFFF031A'), "Lo3Bytes init site mismatch"
+    rom[0x07CC] = 0xFF
+    patches += 1
+    print("=== Lo3Bytes init patched to $FFFFFFFF (32-bit clean) ===")
+
     # Fix checksum (AFTER all first-half patches, before mirroring)
     checksum = 0
     # ROM version at $08 left as $0276 — System file needs it to find patches.

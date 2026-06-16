@@ -935,6 +935,14 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			/* Debug: trace T2 load and disk subroutines */
 			{
 			  uint32_t rom_off = REG_PC - ovl_sysrom_pos;
+					  /* born-32: repair a stripped ROM driver pointer at the .DRVR dispatcher.
+					   * ROM-based drivers (.Sony etc.) live in the ROM mirror at $408xxxxx, but
+					   * the DCE dCtlDriver gets stored 24-bit-masked ($008xxxxx), so the dispatch
+					   * jumps into low RAM (zeros) and wild-jumps.  Restore the $40 ROM high byte
+					   * before the jump-table read at $40802F1E. */
+					  if (rom_off == 0x2F1E && (REG_DA[10] & 0x00F80000) == 0x00800000) {
+					    REG_DA[10] |= 0x40000000;
+					  }
 			  if (rom_off == 0x1AA20) {
 			    static int t2_dbg = 0;
 			    if (t2_dbg++ < 3)
