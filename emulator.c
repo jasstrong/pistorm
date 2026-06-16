@@ -498,6 +498,12 @@ int mode32_active = 0;
 int mode32_enabled = 0;  /* set by config: setvar mode32 1 */
 volatile int mode32_trigger = 0;  /* set by SIGUSR1 */
 int figment_enabled = 0;  /* set when Figment is embedded in ROM */
+int figment_verbose = 0;  /* set from HUGESE_VERBOSE env; gates debug printfs only */
+int dbg_codewin = 1;            /* log writes into the $17600-$17E00 crash window */
+unsigned int dbg_codewin_n = 0; /* shared cap counter for CODEWR logs */
+uint32_t g_last_getres_type = 0; uint32_t g_last_getres_id = 0; uint32_t g_last_getres_pc = 0;
+int suppress_rom_patches = 0;   /* HUGESE_NOPATCH: force GetResource('ptch'/'PTCH') -> nil
+                                 * so the OS doesn't patch our already-modified ROM */
 
 /* Figment trap table: maps OS trap number → binary offset of fig_XXX glue.
  * Auto-generated from figment.elf symbols. */
@@ -1166,106 +1172,71 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 					uint32_t ram_size = (ram_idx >= 0) ? cfg->map_size[ram_idx] : 0x800000;
 					int is_huge_se = (ovl_sysrom_pos >= 0x40000000);
 
-					/* Huge SE: PMMU provides 24-bit virtual space over 32-bit
-					 * physical.  Boot with 8MB visible — MODE32 will expand.
+					/* Huge SE: born-32-bit. Full 32MB visible, IS=0 PMMU.
 					 * Big SE: use actual RAM size. */
-					uint32_t memtop = is_huge_se ? 0x800000 : ram_size;
+					uint32_t memtop = is_huge_se ? 0x02000000 : ram_size;
 					REG_DA[14] = memtop;
 					printf("[%s] MemTop forced: A6=$%08X → $%08X\n",
 					       is_huge_se ? "HUGE-SE" : "BIG-SE", old, memtop);
 
-					/* Huge SE: set up Mac II-style PMMU for 24-bit boot.
+					/* Huge SE: born-32-bit (IS=0) PMMU set up at the $48 seam.
+					 * No 24-bit window — the SE ROM runs full 32-bit from here on,
+					 * so high I/O ($40xxxxxx) and RAM coexist without the high-byte
+					 * strip that collapsed them in IS=8.  Ported from
+					 * mode32_trap_handler (minus the WTC relocation, which a born-32
+					 * boot doesn't need).
 					 *
-					 * TC = $80F84500 (identical to Mac II ROM):
-					 *   E=1, PS=15(32KB), IS=8, TIA=4, TIB=5
-					 *   IS=8 strips the high byte of all virtual addresses,
-					 *   giving 24-bit dirty pointer compatibility for free.
-					 *
-					 * Root table: 16 early-termination page descriptors (1MB each).
-					 * Descriptor format from Mac II ROM at +$50:
-					 *   RAM:  phys_base | $19  (DT=01, M, U)
-					 *   I/O:  phys_base | $59  (DT=01, CI, M, U)
-					 *
-					 * Entry 7 maps $700000 → $01F00000 (not identity) so that
-					 * video at virtual $7F0000 hits physical $01FF0000 in the
-					 * WTC region at the top of 32MB RAM.
-					 *
-					 * CRP = ($7FFF0002, tbl) — Mac II format:
-					 *   limit=$7FFF, DT=2 (valid 4-byte descriptors). */
+					 *   TC = $80F08450: E=1, PS=15(32KB), IS=0, TIA=8, TIB=4, TIC=5
+					 *   L1 (256 × 16MB): [$00]=RAM0-16M [$01]=RAM16-32M
+					 *                    [$40]→L2  [else]=dirty alias to $0
+					 *   L2 for $40 (16 × 1MB): [0-7]=strip $40 → RAM
+					 *                          [8]=ROM+SCSI ($40800000, no CI)
+					 *                          [9-F]=I/O ($409-$40F, CI) */
 					if (is_huge_se && cpu_type == M68K_CPU_TYPE_68030) {
-						/* PMMU root table in RAM at $6FFF00 (in entry 6, identity-mapped).
-						 * Written directly to RAM buffer. The PMMU walker reads via
-						 * m68k_read_memory_32 (slow path, 24-bit masked). We add a
-						 * check in the slow path so the walker can read from the
-						 * RAM buffer instead of going to the SE bus. */
-						uint32_t tbl = 0x01000040; /* 16MB into 32MB RAM buffer — above all
-						                            * 24-bit handler ranges ($800000 ROM alias,
-						                            * $880000 SCSI remap). Walker reads via
-						                            * m68k_read_memory_32 → wtcram buffer. */
-						printf("[HUGE-SE] PMMU root table at $%08X\n", tbl);
+						uint32_t level1_addr = 0x01010000;  /* 16MB+64K into RAM */
+						uint32_t level2_addr = 0x01010400;
+						uint32_t level1[256], level2[16];
+						for (int i = 0; i < 256; i++) level1[i] = 0x00000019;
+						level1[0x00] = 0x00000019;   /* RAM 0-16MB identity */
+						level1[0x01] = 0x01000019;   /* RAM 16-32MB identity */
+						level1[0x40] = (level2_addr & 0xFFFFFFFC) | 0x02;  /* → L2 */
+						for (int i = 0; i < 8; i++)
+							level2[i] = ((uint32_t)i << 20) | 0x19;        /* strip $40 → RAM */
+						level2[8] = 0x40800019;                             /* ROM + SCSI, no CI */
+						for (int i = 9; i <= 15; i++)
+							level2[i] = (0x40000000 | ((uint32_t)i << 20)) | 0x59;  /* I/O, CI */
 
-						/* Mac II-style root table: 16 × 4-byte page descriptors.
-						 *  0-6: identity RAM    ($00x00019)
-						 *    7: video remap      ($01F00019) — maps $7Fxxxx → WTC
-						 *    8: ROM + SCSI remap ($40800019)
-						 * 9-15: I/O              ($40x00059, CI) */
-						const uint32_t pmmu_table[16] = {
-							0x00000019, 0x00100019, 0x00200019, 0x00300019,  /* 0-3: RAM */
-							0x00400019, 0x00500019, 0x00600019, 0x00700019,  /* 4-7: RAM (all identity) */
-							0x40800019,                                       /* 8: ROM + SCSI remap */
-							0x40900059, 0x40A00059, 0x40B00059,              /* 9-11: SCC (CI) */
-							0x40C00059, 0x40D00059, 0x40E00059, 0x40F00059,  /* 12-15: I/O (CI) */
-						};
-						/* Write directly to RAM buffer */
 						int32_t ri0 = get_named_mapped_item(cfg, "sysram");
 						if (ri0 >= 0 && cfg->map_data[ri0]) {
 							unsigned char *ram = cfg->map_data[ri0];
+							for (int i = 0; i < 256; i++) {
+								uint32_t off = level1_addr + i * 4, d = level1[i];
+								ram[off]=(d>>24); ram[off+1]=(d>>16); ram[off+2]=(d>>8); ram[off+3]=d;
+							}
 							for (int i = 0; i < 16; i++) {
-								uint32_t d = pmmu_table[i];
-								uint32_t off = tbl + i * 4;
-								ram[off+0] = (d >> 24) & 0xFF;
-								ram[off+1] = (d >> 16) & 0xFF;
-								ram[off+2] = (d >> 8)  & 0xFF;
-								ram[off+3] =  d        & 0xFF;
+								uint32_t off = level2_addr + i * 4, d = level2[i];
+								ram[off]=(d>>24); ram[off+1]=(d>>16); ram[off+2]=(d>>8); ram[off+3]=d;
 							}
+							/* low-memory MMU globals */
+							ram[0x0CB1] = 4;       /* MMUType = 68030 */
+							ram[0x0B73] = 0;       /* (mode flag; MODE32 leaves 0) */
+							ram[0x0CB4]=(level1_addr>>24); ram[0x0CB5]=(level1_addr>>16);
+							ram[0x0CB6]=(level1_addr>>8);  ram[0x0CB7]=level1_addr;
+							uint32_t tbl_size = 256*4 + 16*4;
+							ram[0x0CB8]=(tbl_size>>24); ram[0x0CB9]=(tbl_size>>16);
+							ram[0x0CBA]=(tbl_size>>8);  ram[0x0CBB]=tbl_size;
 						}
+						printf("[HUGE-SE] IS=0 PMMU: L1@$%08X L2@$%08X TC=$80F08450 MemTop=$02000000\n",
+						       level1_addr, level2_addr);
 
-						printf("[HUGE-SE] PMMU table (Mac II style):\n");
-						for (int i = 0; i < 16; i++) {
-							printf("  [%2d] $%06X → $%08X %s\n", i,
-							       i * 0x100000,
-							       pmmu_table[i] & 0xFFF00000,
-							       (pmmu_table[i] & 0x40) ? "CI" : "");
-						}
-
-						/* Low-memory MMU globals (24-bit mode for boot).
-						 * Write directly to RAM buffer — m68k_write_memory
-						 * goes to SE bus via slow path, not local buffer. */
-						{
-							int32_t ri = get_named_mapped_item(cfg, "sysram");
-							if (ri >= 0 && cfg->map_data[ri]) {
-								unsigned char *r = cfg->map_data[ri];
-								r[0x0CB1] = 4;       /* MMUType = 68030 */
-								r[0x0B73] = 0;       /* 24-bit mode */
-								r[0x0CB4] = (tbl >> 24); r[0x0CB5] = (tbl >> 16);
-								r[0x0CB6] = (tbl >> 8);  r[0x0CB7] = tbl;
-								r[0x0CB8] = (tbl >> 24); r[0x0CB9] = (tbl >> 16);
-								r[0x0CBA] = (tbl >> 8);  r[0x0CBB] = tbl;
-							}
-						}
-
-						/* TC = $80F84500 (Mac II value):
-						 *   E=1, PS=15, IS=8, TIA=4, TIB=5
-						 *   Sum: 15+8+4+5+0+0 = 32, bit 23 = 1 (valid) */
-						m68ki_cpu.mmu_crp_limit = 0x7FFF0002; /* DT=2: 4-byte descriptors */
-						m68ki_cpu.mmu_crp_aptr = tbl;
+						m68ki_cpu.mmu_crp_limit = 0x7FFF0002;
+						m68ki_cpu.mmu_crp_aptr = level1_addr;
 						m68ki_cpu.mmu_srp_limit = 0x7FFF0002;
-						m68ki_cpu.mmu_srp_aptr = tbl;
-						m68ki_cpu.mmu_tt0 = 0;  /* disable transparent translation */
+						m68ki_cpu.mmu_srp_aptr = level1_addr;
+						m68ki_cpu.mmu_tt0 = 0;
 						m68ki_cpu.mmu_tt1 = 0;
-						m68ki_cpu.mmu_tc = 0x80F84500;
+						m68ki_cpu.mmu_tc = 0x80F08450;   /* IS=0 — full 32-bit */
 						m68ki_cpu.pmmu_enabled = 1;
-						/* Flush ATC and fast-path translation caches */
 						for (int j = 0; j < MMU_ATC_ENTRIES; j++)
 							m68ki_cpu.mmu_atc_tag[j] = 0;
 						m68ki_cpu.mmu_atc_rr = 0;
@@ -1276,7 +1247,7 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 						m68ki_cpu.code_translation_cache.lower = 0;
 						m68ki_cpu.code_translation_cache.upper = 0;
 
-						printf("[HUGE-SE] PMMU enabled: TC=$%08X CRP=($%08X,$%08X)\n",
+						printf("[HUGE-SE] IS=0 PMMU enabled: TC=$%08X CRP=($%08X,$%08X)\n",
 						       m68ki_cpu.mmu_tc, m68ki_cpu.mmu_crp_limit,
 						       m68ki_cpu.mmu_crp_aptr);
 					}
@@ -1582,7 +1553,14 @@ cpu_loop:
     }
 
     static unsigned long hb_cnt = 0;
-    if ((hb_cnt++ & 0xFFFFF) == 0) {
+    static struct timespec hb_last = {0, 0};
+    int hb_fire = 0;
+    if ((hb_cnt++ & 0xFFF) == 0) {
+      struct timespec hb_now; clock_gettime(CLOCK_MONOTONIC, &hb_now);
+      double hb_el = (hb_now.tv_sec - hb_last.tv_sec) + (hb_now.tv_nsec - hb_last.tv_nsec) / 1e9;
+      if (hb_last.tv_sec == 0 || hb_el >= 2.0) { hb_fire = 1; hb_last = hb_now; }
+    }
+    if (hb_fire) {
       uint32_t hb_pc = m68k_get_reg(NULL, M68K_REG_PC);
       // Read Ticks from fast-path buffer (not GPIO slow path!)
       uint32_t ticks = 0;
@@ -1948,6 +1926,7 @@ void sigint_handler(int sig_num) {
       if ((i & 7) == 7 && i < 31) printf("\n ");
     }
     printf("\n");
+    aline_ring_dump();  /* last toolbox A-traps before the crash/stop */
     printf("Current PC: %08X  SR: %04X\n",
            m68k_get_reg(NULL, M68K_REG_PC) & 0xFFFFFF,
            m68k_get_reg(NULL, M68K_REG_SR));
@@ -2000,6 +1979,11 @@ static char cfg_filename[256] = "";
 
 int main(int argc, char *argv[]) {
   int g;
+
+  /* Line-buffer stdout so diagnostics (e.g. [LINE-F] at a crash) flush to a
+   * redirected log immediately instead of sitting in the block buffer while
+   * the CPU spins in the Sad Mac loop. */
+  setvbuf(stdout, NULL, _IOLBF, 0);
 
   ps_setup_protocol();
 

@@ -515,6 +515,49 @@ def patch_rom(infile, outfile):
     # ROM+$1A left as original $1AF1C — RM ignores it
     print(f"  RomRsrcStart ($1A) unchanged (RM hardcodes ${COMBO_ROM_OFF:06X})")
 
+    # === Lock SERD before the ROM JSRs into it (first-half patch) ===
+    # ROM $07B4 does MOVEA.L D0,A0; MOVEA.L (A0),A0; JSR (A0) to call the just-
+    # GetResource'd 'SERD' serial driver with NO HLock.  The driver runs from a
+    # movable handle; its init NewPtr compacts the system heap and slides the
+    # unlocked driver block away → it calls into freed/reused heap → Line-F /
+    # Sad Mac F/A.  Redirect through a stub that _HLocks the handle first.
+    SERD_STUB_OFF = 0x46000  # free mirror space between installer and RESMGR
+    serd_stub_vaddr = 0x40800000 + SERD_STUB_OFF
+    assert rom[0x07B4:0x07BA] == b'\x20\x40\x20\x50\x4E\x90', "SERD call site mismatch"
+    rom[0x07B4:0x07BA] = struct.pack('>HI', 0x4EB9, serd_stub_vaddr)  # JSR stub.l
+    patches += 1
+    print(f"=== SERD HLock: JSR ${serd_stub_vaddr:08X} at $07B4 ===")
+
+    # === boot32: replace the SE ROM's 24-bit RAM test / sizing (first-half) ===
+    # The power-on diagnostic dispatcher (entered via $40800044 -> $40801BDE)
+    # calls leaf routines whose result D6 it checks with `tst.l d6; bne SadMac`
+    # (0 = pass).  Three are fatal/wrong under born-32 (IS=0, flat 32MB):
+    #   $26F0  destructive RAM test — sweeps a fill pattern across the tested
+    #          range INCLUDING the low exception-vector table; a later Line-F
+    #          then vectors through a clobbered $02C into the poisoned stack.
+    #          -> ramtest (noErr, no writes).
+    #   $2928  RAM aliasing TEST — must return 0=pass.  -> ramtest (noErr).
+    #   $25FA  RAM SIZING — returns top-of-RAM in D6, installed as SP.  The SE
+    #          probe caps well below 32MB.  -> memsize (reports $02000000).
+    # boot32 jump table: blob+0 -> memsize ($02000000), blob+6 -> ramtest (0).
+    boot32_path = os.path.join(os.path.dirname(__file__), 'boot32', 'boot32.bin')
+    BOOT32_ROM_OFF = 0x70000        # mirror half -> virtual $40870000
+    boot32 = b''
+    if os.path.exists(boot32_path):
+        boot32 = open(boot32_path, 'rb').read()
+        boot32_vaddr = 0x40800000 + BOOT32_ROM_OFF
+        assert rom[0x25FA:0x25FE] == b'\x41\xfa\x00\x7e', "sizing entry mismatch"
+        assert rom[0x2928:0x292C] == b'\x20\x0f\x45\xf9', "aliasing-test entry mismatch"
+        assert rom[0x26F0:0x26F4] == b'\x24\x48\x26\x09', "RAM-test entry mismatch"
+        rom[0x25FA:0x2600] = struct.pack('>HI', 0x4EF9, boot32_vaddr + 0)  # sizing -> memsize
+        rom[0x2928:0x292E] = struct.pack('>HI', 0x4EF9, boot32_vaddr + 6)  # aliasing -> ramtest
+        rom[0x26F0:0x26F6] = struct.pack('>HI', 0x4EF9, boot32_vaddr + 6)  # RAM test -> ramtest
+        patches += 3
+        print(f"=== boot32: $25FA->memsize(${boot32_vaddr:08X}), "
+              f"$2928->ramtest, $26F0->ramtest ===")
+    else:
+        print(f"=== WARNING: boot32.bin not found ({boot32_path}) ===")
+
     # Fix checksum (AFTER all first-half patches, before mirroring)
     checksum = 0
     # ROM version at $08 left as $0276 — System file needs it to find patches.
@@ -526,6 +569,19 @@ def patch_rom(infile, outfile):
 
     # Write patched ROM (mirror to 512KB)
     out = bytearray(rom + rom)
+
+    # SERD HLock stub (mirror half): MOVEA.L D0,A0; _HLock; MOVEA.L (A0),A0;
+    # JSR (A0); RTS.  D0 = handle from GetResource; lock it, then call the
+    # driver exactly as the original code did.
+    serd_stub = struct.pack('>HHHHH', 0x2040, 0xA029, 0x2050, 0x4E90, 0x4E75)
+    out[SERD_STUB_OFF:SERD_STUB_OFF + len(serd_stub)] = serd_stub
+    print(f"=== SERD HLock stub embedded at ROM+${SERD_STUB_OFF:05X} ({len(serd_stub)} bytes) ===")
+
+    # Embed boot32 blob in mirror half ($40870000)
+    if boot32:
+        assert BOOT32_ROM_OFF + len(boot32) <= len(out), "boot32 overflows ROM"
+        out[BOOT32_ROM_OFF:BOOT32_ROM_OFF + len(boot32)] = boot32
+        print(f"=== boot32 embedded at ROM+${BOOT32_ROM_OFF:05X} ({len(boot32)} bytes) ===")
 
     # Embed Figment binary in mirror half
     if os.path.exists(figment_path):

@@ -125,8 +125,13 @@ void setvar_mac68k(struct emulator_config *cfg, char *var, char *val) {
 
     if (CHKVAR("figment")) {
         extern int figment_enabled;
+        extern int figment_verbose;
+        extern int suppress_rom_patches;
         figment_enabled = 1;
-        printf("[MAC68K] Figment MM trap intercept enabled\n");
+        figment_verbose = (getenv("HUGESE_VERBOSE") != NULL);
+        suppress_rom_patches = (getenv("HUGESE_NOPATCH") != NULL);
+        printf("[MAC68K] Figment MM trap intercept enabled (verbose=%d nopatch=%d)\n",
+               figment_verbose, suppress_rom_patches);
     }
 }
 
@@ -189,10 +194,10 @@ void handle_ovl_mappings_mac68k(struct emulator_config *cfg) {
             uint32_t ram_end = cfg->map_size[index];
 
             if (ram_start < ram_end) {
+                /* Born-32 huge SE: flat RAM to ram_end, WTC at the true top
+                 * of 32MB ($01FF0000).  (Was capped at $7F0000 for the old
+                 * IS=8 / MODE32 boot — no longer.) */
                 uint32_t wtc_start = ram_end - WTC_REGION_SIZE;
-                /* Huge SE: WTC at $7F0000 during 24-bit boot */
-                if (ovl_sysrom_pos >= 0x40000000)
-                    wtc_start = 0x7F0000;
                 if (wtc_start > ram_start) {
                     ram_range_ptr = cfg->map_data[index] + ram_start;
                     m68k_add_ram_range(ram_start, wtc_start, ram_range_ptr);
@@ -212,13 +217,11 @@ void handle_ovl_mappings_mac68k(struct emulator_config *cfg) {
         } else {
             /* OVL off: RAM at 0x000000 */
             uint32_t ram_end = cfg->map_size[index];
+            /* Born-32 huge SE: WTC at the true top of 32MB ($01FF0000).
+             * IS=0 PMMU identity-maps the whole flat space; RAM above $800000
+             * is now real (no longer shadowed by I/O).  (Was $7F0000 for the
+             * old IS=8 boot, with MODE32 expected to relocate it later.) */
             uint32_t wtc_start = ram_end - WTC_REGION_SIZE;
-
-            /* Huge SE: WTC at $7F0000 (top of visible 8MB), not $01FF0000
-             * (top of 32MB).  PMMU identity-maps everything — no entry 7
-             * remap.  MODE32 will move WTC to $01FF0000 via pseudovirt trap. */
-            if (ovl_sysrom_pos >= 0x40000000)
-                wtc_start = 0x7F0000;
 
             /* Set video buffer virtual address — 24-bit masked, because
              * custom_write sees addresses after slow-path 24-bit mask. */
@@ -231,10 +234,7 @@ void handle_ovl_mappings_mac68k(struct emulator_config *cfg) {
             m68k_add_ram_range(0x0, wtc_start, cfg->map_data[index]);
             ram_wtc_ptr = cfg->map_data[index] + wtc_start;
             m68k_add_ram_range_wtc(wtc_start, wtc_start + WTC_REGION_SIZE, ram_wtc_ptr);
-            /* RAM above $800000 is not visible to CPU in 24-bit mode
-             * (PMMU entries 8+ map to $40xxxxxx I/O/ROM).
-             * Do NOT add a fast-path range — it would shadow the ROM alias. */
-            printf("[MAC68K] RAM at 00000000-%08X fast, %08X-%08X wtc\n",
+            printf("[MAC68K] RAM at 00000000-%08X fast, %08X-%08X wtc (born-32 flat)\n",
                    wtc_start, wtc_start, wtc_start + WTC_REGION_SIZE);
         }
     }
@@ -255,6 +255,15 @@ void handle_reset_mac68k(struct emulator_config *cfg) {
 void shutdown_platform_mac68k(struct emulator_config *cfg) {
     printf("[MAC68K] Performing Mac68k platform shutdown.\n");
     if (cfg) {}
+
+    /* Mute the BBU audio DMA on exit: the audio DMA free-runs off the SE's
+     * physical sound buffer (top of the real ~4MB, $3FFD00-$400000) on its own
+     * video-timed clock, independent of the CPU.  If we exit with garbage in
+     * that buffer the speaker buzzes until power-cycle.  Zero it so a constant
+     * sample = silence. */
+    for (uint32_t a = 0x3F0000; a < 0x400000; a += 2)
+        ps_write_16(a, 0);
+    printf("[MAC68K] Zeroed SE physical video/sound buffer ($3F0000-$400000) to mute BBU.\n");
 
     if (cfg->platform->subsys) {
         free(cfg->platform->subsys);
@@ -337,6 +346,19 @@ int custom_read_mac68k(struct emulator_config *cfg, unsigned int addr,
         }
         (void)type;
         return 1;
+    }
+    /* DEBUG: log addresses that fall through the remap in the I/O-ish high
+     * ranges, so we can see the exact (un-stripped, $40-prefixed) form the
+     * SCSI Manager hands us. */
+    {
+        static int ft = 0;
+        if (ft < 40 && ((addr & 0x00F00000) == 0x00800000 /* $8xxxxx */
+                        || (addr >= 0x40880000 && addr < 0x40900000) /* $408xxxxx high SCSI */
+                        || (addr >= 0x40DF0000 && addr < 0x40F00000))) {
+            printf("[REMAP-MISS] addr=$%08X type=%d PC=$%08X\n",
+                   addr, type, m68k_get_reg(NULL, M68K_REG_PC));
+            ft++;
+        }
     }
     return -1;
 }
