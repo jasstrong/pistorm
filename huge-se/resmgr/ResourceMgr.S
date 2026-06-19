@@ -1360,6 +1360,7 @@ ROZInit:
     asl.l #3,%d0 // Get the size (size = 8*X)						<c396>
     _newptr // get MPB in ROZ. (If failure, system dead.)
     move.l %a0,0x1F40.w // save MP block base for ReDoMap
+    move.l %a0,0x1F48.w // [hugeSE fix] permanent copy of MPB base; ReDoMap resets the $1F40 cursor from this
 
     move.w %d6,%d0 // get the size of the map						<1.5>
     _newhandle // get map in ROZ.  (If failure, system dead.)
@@ -1387,6 +1388,11 @@ ROZInit:
 
 ReDoMap:
  // new routine
+    move.l 0x1F48.w,0x1F40.w // [hugeSE fix] reset MP-slot cursor to the MPB base. ReDoMap is
+                             // re-entrant (System 7.5.5 calls InitResources twice); $1F40 is both
+                             // base and running cursor, so without this reset the 2nd pass runs
+                             // past the MPB end and overruns the adjacent ROM-map handle's block
+                             // header ($AB->$40 tag), cascading to the ADB Sad Mac.
     bsr CountCombos // to determine the sizes
     move.l %d1,%d0 // get approximate size of map into d0
     move.l RomMapHndl,%a0 // Get the handle to the ROM Map in ROZ
@@ -8368,95 +8374,95 @@ FlushResourceCache:
 /* RM trap installation table: Toolbox table offsets + handler addresses */
 rm_trap_table:
     .word 0x0034
-    .long 0x40848F3A
+    .long Count1Resources
     .word 0x0038
-    .long 0x40848F68
+    .long Get1IndResource
     .word 0x003C
-    .long 0x40849050
+    .long Get1IndType
     .word 0x0040
-    .long 0x4084907C
+    .long Unique1ID
     .word 0x006C
-    .long 0x4084882E
+    .long HCreateResFile
     .word 0x0070
-    .long 0x40848FFC
+    .long Count1Types
     .word 0x007C
-    .long 0x408490C8
+    .long Get1Resource
     .word 0x0080
-    .long 0x4084919C
+    .long Get1NamedResource
     .word 0x0084
-    .long 0x4084A3A0
+    .long MaxSizeRsrc
     .word 0x0648
-    .long 0x40849DCA
+    .long DetachResource
     .word 0x064C
-    .long 0x40849EC0
+    .long SetResPurge
     .word 0x0650
-    .long 0x40849EF6
+    .long CurResFile
     .word 0x0654
-    .long 0x4084813E
+    .long InitResources
     .word 0x0658
-    .long 0x40848722
+    .long RsrcZoneInit
     .word 0x065C
-    .long 0x4084890E
+    .long OpenResFile
     .word 0x0660
-    .long 0x408489B8
+    .long UseResFile
     .word 0x0664
-    .long 0x40848AC2
+    .long UpdateResFile
     .word 0x0668
-    .long 0x40848E6E
+    .long CloseResFile
     .word 0x066C
-    .long 0x40849EEA
+    .long SetResLoad
     .word 0x0670
-    .long 0x40848F3E
+    .long CountResources
     .word 0x0674
-    .long 0x40848F6C
+    .long GetIndResource
     .word 0x0678
-    .long 0x40849000
+    .long CountTypes
     .word 0x067C
-    .long 0x40849054
+    .long GetIndType
     .word 0x0680
-    .long 0x408490D0
+    .long GetResource
     .word 0x0684
-    .long 0x408491A0
+    .long GetNamedResource
     .word 0x0688
-    .long 0x40849D2E
+    .long LoadResource
     .word 0x068C
-    .long 0x40849D94
+    .long ReleaseResource
     .word 0x0690
-    .long 0x40849E86
+    .long HomeResFile
     .word 0x0694
-    .long 0x4084A37A
+    .long SizeResource
     .word 0x0698
-    .long 0x40849F28
+    .long GetResAttrs
     .word 0x069C
-    .long 0x40849F40
+    .long SetResAttrs
     .word 0x06A0
-    .long 0x40849F7E
+    .long GetResInfo
     .word 0x06A4
-    .long 0x40849FD2
+    .long SetResInfo
     .word 0x06A8
-    .long 0x40849DF2
+    .long ChangedResource
     .word 0x06AC
-    .long 0x4084A02C
+    .long AddResource
     .word 0x06B0
-    .long 0x40849F0A
+    .long AddReference
     .word 0x06B4
-    .long 0x4084A146
+    .long RmveResource
     .word 0x06B8
-    .long 0x40849F1C
+    .long RmveReference
     .word 0x06BC
-    .long 0x40849F00
+    .long ResError
     .word 0x06C0
-    .long 0x40849E3E
+    .long WriteResource
     .word 0x06C4
-    .long 0x40848892
+    .long CreateResFile
     .word 0x0704
-    .long 0x40849080
+    .long UniqueID
     .word 0x0710
-    .long 0x4084896A
+    .long ROMOpenRFPerm
     .word 0x07D8
-    .long 0x408489E8
+    .long GetResFileAttrs
     .word 0x07DC
-    .long 0x408489F6
+    .long SetResFileAttrs
     .word 0xFFFF  /* end marker */
 
 /* Debug strings for $A0FE print trap */
