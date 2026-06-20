@@ -1310,12 +1310,11 @@ static __attribute__((noinline)) uint m68ki_read_8_fc(m68ki_cpu_core *state, uin
 	{
 		{
 			uint32_t masked24 = address & 0x00FFFFFF;
-			if (masked24 >= 0xEFE000 && masked24 <= 0xEFFFFF) {
-				static int ch_via = 0;
-				if (ch_via++ < 5)
-					printf("[VIA-CACHE] addr=$%08X range=%08X-%08X val=$%02X\n",
-					       address, cache->lower, cache->upper,
-					       cache->offset[address - cache->lower]);
+			if (masked24 >= 0x5FF000 && masked24 <= 0x5FFFFF) {
+				static int ch_scsi = 0;
+				if (ch_scsi++ < 8)
+					printf("[SCSI-CACHE] addr=$%08X range=%08X-%08X val=$%02X *** STALE I/O FROM TRANS-CACHE ***\n",
+					       address, cache->lower, cache->upper, cache->offset[address - cache->lower]);
 			}
 		}
 		return cache->offset[address - cache->lower];
@@ -1325,10 +1324,10 @@ static __attribute__((noinline)) uint m68ki_read_8_fc(m68ki_cpu_core *state, uin
 		if(address >= state->read_addr[i] && address < state->read_upper[i]) {
 			{
 				uint32_t masked24 = address & 0x00FFFFFF;
-				if (masked24 >= 0xEFE000 && masked24 <= 0xEFFFFF) {
-					static int rh_via = 0;
-					if (rh_via++ < 5)
-						printf("[VIA-RANGE] addr=$%08X range[%d]=%08X-%08X val=$%02X\n",
+				if (masked24 >= 0x5FF000 && masked24 <= 0x5FFFFF) {
+					static int rh_scsi = 0;
+					if (rh_scsi++ < 8)
+						printf("[SCSI-RANGE] addr=$%08X range[%d]=%08X-%08X val=$%02X *** STALE I/O FROM READ-RANGE ***\n",
 						       address, i, state->read_addr[i], state->read_upper[i],
 						       state->read_data[i][address - state->read_addr[i]]);
 				}
@@ -1373,6 +1372,15 @@ static inline uint m68ki_read_16_fc(m68ki_cpu_core *state, uint address, uint fc
 
 	/* 68000/010/EC020: mask to 24-bit before fast-path range checks */
 	address = ADDRESS_68K(address);
+
+	/* version-read SITE hunt: log EVERY distinct PC that reads RomBase+8
+	 * ($40800008) so we can find where 7.5.5 classifies the machine (and which
+	 * read to selectively feed $0178) vs the ROM's own boot reads. */
+	if (address == 0x40800008 || address == 0x00800008) {
+		static uint32_t seen[256]; static int nseen=0; int dup=0;
+		for (int i=0;i<nseen;i++) if (seen[i]==REG_PC) { dup=1; break; }
+		if (!dup && nseen<256) { seen[nseen++]=REG_PC; printf("[VER-READ] $%08X read by PC=$%08X ovl=%d\n", address, REG_PC, state->ovl); }
+	}
 
 	address_translation_cache *cache = &state->fc_read_translation_cache;
 	if(cache->offset && address >= cache->lower && address < cache->upper)
@@ -1475,15 +1483,52 @@ static inline void m68ki_write_8_fc(m68ki_cpu_core *state, uint address, uint fc
 	/* 68000/010/EC020: mask to 24-bit before fast-path range checks */
 	address = ADDRESS_68K(address);
 
+	if ((address & 0x00FFFFFF) == 0x0B73) printf("[SYSINFO-WR] $0B73 <- $%02X (bit0 24bit=%d) PC=$%08X\n", value & 0xFF, value & 1, REG_PC);
+
+	if (address >= 0x17600 && address < 0x17E00) {
+		extern int dbg_codewin; extern unsigned int dbg_codewin_n;
+		if (dbg_codewin && dbg_codewin_n < 8000) {
+			printf("[CODEWR8 ] $%06X <- $%02X  PC=$%08X\n",
+			       address, value & 0xFF, ADDRESS_68K(REG_PC));
+			dbg_codewin_n++;
+		}
+		{ static int vid=0; extern uint32_t g_last_getres_type,g_last_getres_id,g_last_getres_pc;
+		  if(!vid){ vid=1; uint32_t t=g_last_getres_type;
+		    printf("[VICTIM] $176xx loaded; last GetResource type='%c%c%c%c' id=%d retPC=$%08X  curPC=$%08X\n",
+		      (t>>24)&0xFF,(t>>16)&0xFF,(t>>8)&0xFF,t&0xFF,(int16_t)g_last_getres_id,g_last_getres_pc,ADDRESS_68K(REG_PC));
+		    printf("[VICTIM] D:");
+		    for(int i=0;i<8;i++) printf(" %08X",REG_DA[i]);
+		    printf("\n[VICTIM] A:");
+		    for(int i=8;i<16;i++) printf(" %08X",REG_DA[i]);
+		    printf("\n[VICTIM] lowmem: BufPtr($10C)=%08X HeapEnd($114)=%08X SysZone($2A6)=%08X ApplZone($2AA)=%08X MemTop($108)=%08X\n",
+		      m68ki_read_32(state,0x10C),m68ki_read_32(state,0x114),m68ki_read_32(state,0x2A6),m68ki_read_32(state,0x2AA),m68ki_read_32(state,0x108));
+		    printf("[VICTIM] pctrace:");
+		    for(int i=0;i<32;i++){ int idx=(state->pc_trace_idx+i)&31; printf(" %08X",state->pc_trace[idx]); }
+		    printf("\n[VICTIM] stack ret-addrs (ROM $408xxxxx) from SP=$%08X:\n", REG_DA[15]);
+		    { uint32_t sp = REG_DA[15] & 0x00FFFFFF;
+		      for(int i=0;i<64;i++){ uint32_t v=m68ki_read_32(state,(sp+i*4)&0x00FFFFFF);
+		        if(v>=0x40800000 && v<0x40880000)
+		          printf("    SP+%02X = $%08X\n", i*4, v); } }
+		    printf("[VICTIM] end\n"); } }
+	}
+
 	address_translation_cache *cache = &state->fc_write_translation_cache;
 	if(cache->offset && address >= cache->lower && address < cache->upper)
 	{
+		if ((address & 0x00FFFFFF) >= 0x2420 && (address & 0x00FFFFFF) <= 0x2423)
+			printf("[MP2420-W8] $%06X <- $%02X PC=$%08X\n", address & 0x00FFFFFF, value & 0xFF, REG_PC);
+			if ((address & 0x00FFFFFF)>=0x0CB0 && (address & 0x00FFFFFF)<=0x0CB2) printf("[MMUMODE-WR] $%04X <- $%02X PC=$%08X\n", address & 0x00FFFFFF, value & 0xFF, REG_PC);
+			if ((address & 0x00FFFFFF)>=0x2C9C && (address & 0x00FFFFFF)<=0x2C9F) printf("[COMPL-WR8] $%06X <- $%02X PC=$%08X\n", address & 0x00FFFFFF, value & 0xFF, REG_PC);
 		cache->offset[address - cache->lower] = (unsigned char)value;
 		return;
 	}
 
 	for (int i = 0; i < state->write_ranges; i++) {
 		if(address >= state->write_addr[i] && address < state->write_upper[i]) {
+			if ((address & 0x00FFFFFF) >= 0x2420 && (address & 0x00FFFFFF) <= 0x2423)
+				printf("[MP2420-W8] $%06X <- $%02X PC=$%08X\n", address & 0x00FFFFFF, value & 0xFF, REG_PC);
+			if ((address & 0x00FFFFFF)>=0x0CB0 && (address & 0x00FFFFFF)<=0x0CB2) printf("[MMUMODE-WR] $%04X <- $%02X PC=$%08X\n", address & 0x00FFFFFF, value & 0xFF, REG_PC);
+			if ((address & 0x00FFFFFF)>=0x2C9C && (address & 0x00FFFFFF)<=0x2C9F) printf("[COMPL-WR8] $%06X <- $%02X PC=$%08X\n", address & 0x00FFFFFF, value & 0xFF, REG_PC);
 			state->write_data[i][address - state->write_addr[i]] = (unsigned char)value;
 			if (state->write_through[i])
 				break;
@@ -1513,6 +1558,8 @@ static inline void m68ki_write_16_fc(m68ki_cpu_core *state, uint address, uint f
 		printf("  Stack: ");
 		for (int i = 0; i < 8; i++)
 			printf("$%08X ", m68ki_read_32(state, (REG_DA[15] + i*4) & 0x00FFFFFF));
+		printf("\n  pc_trace: ");
+		for (int i = 0; i < 32; i++) { int idx=(state->pc_trace_idx+i)&31; printf("%08X ", state->pc_trace[idx]); }
 		printf("\n");
 	}
 	/* Big SE: proactive instruction fixup on 16-bit write.
@@ -1567,15 +1614,62 @@ static inline void m68ki_write_16_fc(m68ki_cpu_core *state, uint address, uint f
 	/* 68000/010/EC020: mask to 24-bit before fast-path range checks */
 	address = ADDRESS_68K(address);
 
+	if (address >= 0x17600 && address < 0x17E00) {
+		extern int dbg_codewin; extern unsigned int dbg_codewin_n;
+		if (dbg_codewin && dbg_codewin_n < 8000) {
+			printf("[CODEWR16] $%06X <- $%04X  PC=$%08X\n",
+			       address, value & 0xFFFF, ADDRESS_68K(REG_PC));
+			dbg_codewin_n++;
+		}
+		if (dbg_codewin && (value & 0xFFFF) == 0xFFFF) {
+			static int clobber_dumped = 0;
+			if (!clobber_dumped) {
+				clobber_dumped = 1;
+				uint32_t sp = REG_DA[15];
+				printf("[CLOBBER] $%06X <- $FFFF  PC=$%08X  SP=$%08X  A5=$%08X\n",
+				       address, ADDRESS_68K(REG_PC), sp, REG_DA[13]);
+				printf("[CLOBBER] stack:");
+				for (int i = 0; i < 24; i++)
+					printf(" %08X", m68ki_read_32(state, (sp + i*4) & 0x00FFFFFF));
+				printf("\n[CLOBBER] pctrace:");
+				for (int i = 0; i < 32; i++) {
+					int idx = (state->pc_trace_idx + i) & 31;
+					printf(" %08X", state->pc_trace[idx]);
+				}
+				printf("\n");
+				/* figment header: data D, header at D-16; back@-16 tags@-12
+				 * mpFlags@-11 size@-8. Walk the back-chain from the NewPtr block
+				 * ($179D0 data) down to see if SERD's $176xx code is a busy/locked
+				 * block or sits inside a free block. */
+				{ uint32_t D = 0x179D0;
+				  for (int n=0; n<8 && D>0x10000 && D<0x200000; n++) {
+					uint32_t hdr=D-16;
+					uint32_t back=m68ki_read_32(state,hdr) & 0x00FFFFFF;
+					uint8_t tags=m68ki_read_8(state,hdr+4);
+					uint8_t mpf=m68ki_read_8(state,hdr+5);
+					uint32_t sz=m68ki_read_32(state,hdr+8);
+					printf("[CLOBBER] blk data@$%06X hdr@$%06X back=$%06X tags=$%02X mpFlags=$%02X(%s) size=$%08X\n",
+					       D, hdr, back, tags, mpf, (mpf&0x80)?"LOCKED":"", sz);
+					if (back < 0x2000 || back >= D) break;
+					D = back + 16;
+				  } }
+			}
+		}
+	}
+
 	address_translation_cache *cache = &state->fc_write_translation_cache;
 	if(cache->offset && address >= cache->lower && address < cache->upper)
 	{
+		if ((address & 0x00FFFFFF) >= 0x2420 && (address & 0x00FFFFFF) <= 0x2423)
+			printf("[MP2420-W16] $%06X <- $%04X PC=$%08X\n", address & 0x00FFFFFF, value & 0xFFFF, REG_PC);
 		((short *)(cache->offset + (address - cache->lower)))[0] = htobe16(value);
 		return;
 	}
 
 	for (int i = 0; i < state->write_ranges; i++) {
 		if(address >= state->write_addr[i] && address < state->write_upper[i]) {
+			if ((address & 0x00FFFFFF) >= 0x2420 && (address & 0x00FFFFFF) <= 0x2423)
+				printf("[MP2420-W16] $%06X <- $%04X PC=$%08X\n", address & 0x00FFFFFF, value & 0xFFFF, REG_PC);
 			((short *)(state->write_data[i] + (address - state->write_addr[i])))[0] = htobe16(value);
 			if (state->write_through[i])
 				break;
@@ -1602,6 +1696,17 @@ static inline void m68ki_write_16_fc(m68ki_cpu_core *state, uint address, uint f
 // M68KI_WRITE_32_FC
 static inline void m68ki_write_32_fc(m68ki_cpu_core *state, uint address, uint fc, uint value)
 {
+	{
+		uint32_t _wa = ADDRESS_68K(address), _pp = ADDRESS_68K(REG_PPC);
+		/* Flag any ROM (non-figment) write into the SysZone stdHeap header — the
+		 * ROM MM directly poking figment's zone with 24-bit logic (the "antics"). */
+		if (_wa >= 0x2000 && _wa <= 0x2074 &&
+		    _pp >= 0x40800000 && _pp < 0x40840000) {
+			static int ant = 0;
+			if (ant < 30) { printf("[ROM-ZONE-WR] *$%08X = $%08X  by ROM PPC=$%08X\n",
+				_wa, value, _pp); ant++; }
+		}
+	}
 	m68ki_set_fc(fc); /* auto-disable (see m68kcpu.h) */
 	state->mmu_tmp_fc = fc;
 	state->mmu_tmp_rw = 0;
@@ -1615,6 +1720,25 @@ static inline void m68ki_write_32_fc(m68ki_cpu_core *state, uint address, uint f
 
 	/* 68000/010/EC020: mask to 24-bit before fast-path range checks */
 	address = ADDRESS_68K(address);
+
+	/* ADB queue-init watch: catch any write to the deferred-queue control block
+	 * (ABusVars $2B68 +316/320/324/328 = $2CA4/$2CA8/$2CAC/$2CB0) — does the ADB
+	 * init ever set it up, with what value (NULL? a real buffer?), from what PC? */
+	if ((address & 0x00FFFFFF) >= 0x2CA4 && (address & 0x00FFFFFF) <= 0x2CB0) {
+		printf("[ADBQ-INIT] $%06X <- $%08X PC=$%08X\n", address & 0x00FFFFFF, value, REG_PC);
+	}
+
+	/* CODE-segment load watch: log writes into the deterministic crash
+	 * window $17600-$17E00 to find where the fill stops (truncation) and
+	 * which routine is the loader (PC). */
+	if (address >= 0x17600 && address < 0x17E00) {
+		extern int dbg_codewin; extern unsigned int dbg_codewin_n;
+		if (dbg_codewin && dbg_codewin_n < 8000) {
+			printf("[CODEWR32] $%06X <- $%08X  PC=$%08X\n",
+			       address, value, ADDRESS_68K(REG_PC));
+			dbg_codewin_n++;
+		}
+	}
 
 	/* Watch for writes to A-line vector ($028) */
 	if ((address & 0x00FFFFFF) == 0x0028) {
@@ -1655,12 +1779,24 @@ static inline void m68ki_write_32_fc(m68ki_cpu_core *state, uint address, uint f
 	address_translation_cache *cache = &state->fc_write_translation_cache;
 	if(cache->offset && address >= cache->lower && address < cache->upper)
 	{
+		if ((address & 0x00FFFFFF) >= 0x2420 && (address & 0x00FFFFFF) <= 0x2423)
+			printf("[MP2420-W32] $%06X <- $%08X PC=$%08X\n", address & 0x00FFFFFF, value, REG_PC);
+			if ((address & 0x00FFFFFF)==0x2054) printf("[FF-W32] firstFree($2054) <- $%08X PC=$%08X\n", value, REG_PC);
+			if ((address & 0x00FFFFFF)==0x2C9C) printf("[COMPL-WR32] $2C9C <- $%08X PC=$%08X\n", value, REG_PC);
+		if ((address & 0x00FFFFFF)==0x0A50||(address & 0x00FFFFFF)==0x0A54||(address & 0x00FFFFFF)==0x0A5A||(address & 0x00FFFFFF)==0x0B84)
+			printf("[RMGLOB-W32] $%04X <- $%08X PC=$%08X\n", address & 0x00FFFFFF, value, REG_PC);
 		((int *)(cache->offset + (address - cache->lower)))[0] = htobe32(value);
 		return;
 	}
 
 	for (int i = 0; i < state->write_ranges; i++) {
 		if(address >= state->write_addr[i] && address < state->write_upper[i]) {
+			if ((address & 0x00FFFFFF) >= 0x2420 && (address & 0x00FFFFFF) <= 0x2423)
+				printf("[MP2420-W32] $%06X <- $%08X PC=$%08X\n", address & 0x00FFFFFF, value, REG_PC);
+				if ((address & 0x00FFFFFF)==0x2054) printf("[FF-W32] firstFree($2054) <- $%08X PC=$%08X\n", value, REG_PC);
+				if ((address & 0x00FFFFFF)==0x2C9C) printf("[COMPL-WR32] $2C9C <- $%08X PC=$%08X\n", value, REG_PC);
+			if ((address & 0x00FFFFFF)==0x0A50||(address & 0x00FFFFFF)==0x0A54||(address & 0x00FFFFFF)==0x0A5A||(address & 0x00FFFFFF)==0x0B84)
+				printf("[RMGLOB-W32] $%04X <- $%08X PC=$%08X\n", address & 0x00FFFFFF, value, REG_PC);
 			((int *)(state->write_data[i] + (address - state->write_addr[i])))[0] = htobe32(value);
 			if (state->write_through[i])
 				break;
@@ -2538,6 +2674,86 @@ static inline void m68ki_exception_1010(m68ki_cpu_core *state)
 			return;  /* handled — PC already past the A-line word */
 	}
 
+	/* NewPtr/NewHandle entry: log caller + requested size so we can pair it
+	 * with figment's "NewPtr OK at=$addr" and find who gets the $176xx block. */
+	{
+		extern int figment_verbose;
+		if (figment_verbose) {
+			uint16_t t = REG_IR;
+			if (t==0xA11E||t==0xA31E||t==0xA51E||t==0xA71E)
+				printf("[NEWPTR] size=$%X  retPC=$%08X\n", REG_DA[0], REG_PC);
+			else if (t==0xA122||t==0xA322||t==0xA522||t==0xA722)
+				printf("[NEWHND] size=$%X  retPC=$%08X\n", REG_DA[0], REG_PC);
+		}
+	}
+
+	/* _HLock ($A029): log when a block in the SERD region ($17xxx-$1Axxx) is
+	 * locked, to confirm the SERD-HLock stub actually locks SERD's code block. */
+	if (REG_IR == 0xA029) {
+		uint32_t h = REG_DA[8] & 0x00FFFFFF;
+		uint32_t blk = h ? (m68ki_read_32(state, h) & 0x00FFFFFF) : 0;
+		if ((blk >= 0x17000 && blk < 0x1B000) || (REG_PC >= 0x40846000 && REG_PC < 0x40846010))
+			printf("[HLOCK] handle=$%06X block=$%06X  retPC=$%08X%s\n", h, blk, REG_PC,
+			       (REG_PC>=0x40846000&&REG_PC<0x40846010)?"  <-- SERD STUB":"");
+	}
+
+		/* File Manager _Read ($A002): born-32 24-bit-dirty workaround. HFS file
+	 * positions can carry a garbage high byte (a 24-bit-clean System running in
+	 * flat 32-bit). A high byte >= $10 (>256MB) is never a real read on this
+	 * volume, so mask it to the real 24-bit offset -- this breaks the catalog
+	 * B-tree corruption cascade (the $1E2F6 boot wall). ioPosOffset @ $2E. */
+	if (REG_IR == 0xA002) {
+		extern int figment_enabled;
+		if (figment_enabled) {
+			uint32_t pb = REG_DA[8];
+			uint32_t pos = m68ki_read_32(state, pb + 0x2E);
+			if ((pos >> 24) >= 0x10)
+				m68ki_write_32(state, pb + 0x2E, pos & 0x00FFFFFF);
+		}
+	}
+	
+	
+/* Suppress OS ROM patching: force GetResource('ptch'/'PTCH') -> nil so
+	 * Boot3's DetachAndExecute cleanly skips (handle==nil -> @skip).  Our ROM
+	 * already carries the SuperMario MM/RM; the disk's ROM patches both
+	 * duplicate that and collide with figment's heap zones at $176xx. */
+	if (REG_IR == 0xA9A0 || REG_IR == 0xA81F) {  /* GetResource / Get1Resource (theType:L, theID:W) */
+		extern int suppress_rom_patches;
+		extern uint32_t g_last_getres_type, g_last_getres_id, g_last_getres_pc;
+		{ uint32_t sp = REG_DA[15];
+		  g_last_getres_type = m68ki_read_32(state, sp + 2);
+		  g_last_getres_id = m68ki_read_16(state, sp + 0);
+		  g_last_getres_pc = REG_PC;
+		  if (g_last_getres_type == 0x67757364u /* 'gusd' */) {
+			printf("[GUSD-REQ] trap=$%04X id=%d PC=$%08X\n", REG_IR, (int16_t)g_last_getres_id, REG_PC);
+			extern int gusd_arm; extern uint32_t gusd_ret_pc, gusd_res_sp;
+			gusd_arm = 1; gusd_ret_pc = ADDRESS_68K(REG_PC); gusd_res_sp = sp + 6;
+		  } }
+		if (suppress_rom_patches) {
+			uint32_t sp = REG_DA[15];
+			uint32_t type = m68ki_read_32(state, sp + 2);
+			if (type == 0x70746368u /* 'ptch' */ || type == 0x50544348u /* 'PTCH' */
+			    || type == 0x53455244u /* 'SERD' — test: skip serial driver setup */) {
+				m68ki_write_32(state, sp + 6, 0);       /* result Handle = nil */
+				REG_DA[15] = sp + 6;                    /* pop id(2)+type(4) */
+				m68ki_write_16(state, 0x0A60, 0xFF40);  /* ResErr = -192 resNotFound */
+				return;
+			}
+		}
+	}
+
+	/* Gestalt ($A1AD / $A0AD) capture: 'mach' (machine type) & 'addr' (addressing mode).
+	 * D0=selector on entry; A0=response value on return. Arm here, read on return. */
+	if (REG_IR == 0xA1AD || REG_IR == 0xA0AD) {
+		uint32_t sel = REG_DA[0];
+		if (sel == 0x6D616368u /* 'mach' */ || sel == 0x61646472u /* 'addr' */) {
+			extern int gest_arm; extern uint32_t gest_ret_pc, gest_sel;
+			gest_arm = 1; gest_ret_pc = ADDRESS_68K(REG_PC); gest_sel = sel;
+			printf("[GESTALT-REQ] '%c%c%c%c' trap=$%04X PC=$%08X\n",
+			       (sel>>24)&0xFF,(sel>>16)&0xFF,(sel>>8)&0xFF,sel&0xFF, REG_IR, REG_PC);
+		}
+	}
+
 	/* Debug print trap ($A0FE) — Figment calls this to print to emulator console.
 	 * A0 = pointer to null-terminated string, D0 = optional 32-bit value */
 	if (REG_IR == 0xA0FE) {
@@ -2552,7 +2768,10 @@ static inline void m68ki_exception_1010(m68ki_cpu_core *state)
 				if (!buf[i]) break;
 			}
 			buf[i] = 0;
-			printf("[FIGMENT] %s $%08X\n", buf, val);
+			extern int figment_verbose;
+			/* Always surface PANIC messages; gate the rest behind verbose. */
+			if (figment_verbose || (buf[0]=='P'&&buf[1]=='A'&&buf[2]=='N'&&buf[3]=='I'&&buf[4]=='C'))
+				printf("[FIGMENT] %s $%08X\n", buf, val);
 			return;
 		}
 	}
@@ -2646,8 +2865,14 @@ static inline void m68ki_exception_1010(m68ki_cpu_core *state)
 			/* Toolbox trap (bit 11 set). Check if it's an RM trap. */
 			uint16_t trap_idx = trap & 0x01FF;
 			uint32_t handler = m68ki_read_32(state, 0x0E00 + trap_idx * 4);
+			{ if (trap == 0xA9F0) {  /* _LoadSeg(segID:W @SP+0) — figment_enabled already true here */
+				uint32_t sp = REG_DA[15];
+				printf("[LOADSEG] seg=%d  handler=$%08X  retPC=$%08X  A5=$%08X\n",
+					(int16_t)m68ki_read_16(state, sp + 0), handler, REG_PC, REG_DA[13]);
+			  } }
+			extern int figment_verbose;
 			static int tb_log = 0;
-			if (tb_log < 3) {
+			if (figment_verbose && tb_log < 3) {
 				printf("[TB-TRAP] $%04X idx=$%03X handler=$%08X figment=%d\n",
 					trap, trap_idx, handler, figment_enabled);
 				tb_log++;
@@ -2655,14 +2880,14 @@ static inline void m68ki_exception_1010(m68ki_cpu_core *state)
 			/* RM handlers are in the mirror half at $40848000+ */
 			if (handler >= 0x40848000 && handler < 0x40860000) {
 				static int rm_trap_log = 0;
-				if (rm_trap_log++ < 50) {
+				if (figment_verbose && rm_trap_log++ < 50) {
 					printf("[RM-TRAP] $%04X → $%08X  retPC=$%08X",
 						trap, handler, REG_PC);
 					/* For GetResource ($A9A0), show type+ID from stack */
 					if (trap == 0xA9A0) {
 						uint32_t sp = REG_DA[15];
-						uint32_t type = m68ki_read_32(state, sp + 4);
-						uint16_t id = m68ki_read_16(state, sp + 8);
+						uint32_t type = m68ki_read_32(state, sp + 2);
+						uint16_t id = m68ki_read_16(state, sp + 0);
 						printf("  type='%c%c%c%c' id=%d",
 							(type>>24)&0xFF, (type>>16)&0xFF,
 							(type>>8)&0xFF, type&0xFF, (int16_t)id);
@@ -2679,11 +2904,14 @@ static inline void m68ki_exception_1010(m68ki_cpu_core *state)
 
 	uint sr;
 
-	/* A-line ring buffer — disabled for performance */
-	/* unsigned int ri = aline_ring_idx & (ALINE_RING_SIZE - 1);
-	aline_ring_pc[ri] = ADDRESS_68K(REG_PPC);
-	aline_ring_trap[ri] = REG_IR;
-	aline_ring_idx++; */
+	/* A-line ring buffer — records every unhandled A-trap (toolbox dispatch)
+	 * so we can see the last traps before a fatal Line-A double-fault. */
+	{
+		unsigned int ri = aline_ring_idx & (ALINE_RING_SIZE - 1);
+		aline_ring_pc[ri] = ADDRESS_68K(REG_PPC);
+		aline_ring_trap[ri] = REG_IR;
+		aline_ring_idx++;
+	}
 
 
 #if M68K_LOG_1010_1111 == OPT_ON
