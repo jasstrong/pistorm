@@ -1026,14 +1026,17 @@ InitRSRCMgr:
     movem.l (%sp)+,%a0/%d0
     move.l #0x00FFFFFF,Lo3Bytes  /* init Lo3Bytes — SE ROM doesn't set this */
     move.l #0x00010001,OneOne   /* init OneOne — SE ROM doesn't set this */
-    /* ExpandMem: use zeroed area in system zone instead of allocating
-     * (the _NewPtrSysClear trap corrupts SP — needs investigation) */
+    /* ExpandMem: allocate a proper cleared system-zone block. The old
+     * #0x2200 hack pointed ExpandMem INTO the live SysZone, so resmgr writes
+     * at ExpandMem+$52 clobbered master pointers -> heap corruption. */
     move.l ExpandMem,%d0
     beq.w .Lneed_em
     cmpi.l #0xFFFFFFFF,%d0
     bne.w .Lhave_em
 .Lneed_em:
-    move.l #0x2200,ExpandMem     /* use system zone area (zeroed) */
+    move.l #0x200,%d0            /* ExpandMem size (generous; resmgr uses up to ~$52+) */
+    _NewPtrSysClear              /* .word 0xA71E -> A0 = cleared sys-heap ptr */
+    move.l %a0,ExpandMem
 .Lhave_em:
     move.l %sp,0x1F14.w          /* SP after ExpandMem */
     /* Install RM traps into Toolbox trap table NOW (not at boot).
