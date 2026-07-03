@@ -8374,6 +8374,44 @@ FlushResourceCache:
 
 
 
+/* _ResourceDispatch ($A822) clean stub.  The SE ROM has no override dispatcher, but
+ * System 7.5.5 calls _GetOverrideMap etc.; left unhandled they return garbage ($00010001)
+ * that SwapRomMap writes into TopMapHndl -> resource-map chain derail/hang.  Return CLEAN
+ * (no overrides), exactly as the real GetOverrideMap does when no override maps exist:
+ *   sel 6 GetOverrideMap(map)->Handle : return the input map itself
+ *   sel 4 MakeOverrideMap(map)->void  : no-op
+ *   sel 5 InsertOverrideMap(o,m)->void: no-op
+ * D0 = selector.  Pascal stack: caller reserved result (sel 6) then pushed arg(s); the
+ * dispatcher put our return address on top. */
+RsrcDispatchStub:
+    cmpi.w #6,%d0
+    beq.s .Lrd_get
+    cmpi.w #5,%d0
+    beq.s .Lrd_ins
+    cmpi.w #4,%d0
+    beq.s .Lrd_mak
+    moveq #0,%d0            /* other selectors: noErr (not used on hugeSE) */
+    rts
+.Lrd_get:                  /* GetOverrideMap(Handle resourceMap) -> Handle */
+    move.l (%sp)+,%a0      /* pop return address */
+    move.l (%sp)+,%d1      /* pop arg: resourceMap */
+    move.l %a0,-(%sp)      /* push return address back */
+    move.l %d1,4(%sp)      /* result slot = input map (no override) */
+    moveq #0,%d0
+    rts
+.Lrd_ins:                  /* InsertOverrideMap(Handle,Handle) -> void */
+    move.l (%sp)+,%a0
+    addq.l #8,%sp          /* pop 2 args */
+    move.l %a0,-(%sp)
+    moveq #0,%d0
+    rts
+.Lrd_mak:                  /* MakeOverrideMap(Handle) -> void */
+    move.l (%sp)+,%a0
+    addq.l #4,%sp          /* pop 1 arg */
+    move.l %a0,-(%sp)
+    moveq #0,%d0
+    rts
+
 /* RM trap installation table: Toolbox table offsets + handler addresses */
 rm_trap_table:
     .word 0x0034
@@ -8466,6 +8504,8 @@ rm_trap_table:
     .long GetResFileAttrs
     .word 0x07DC
     .long SetResFileAttrs
+    .word 0x0088          /* _ResourceDispatch ($A822) — clean override stub */
+    .long RsrcDispatchStub
     .word 0xFFFF  /* end marker */
 
 /* Debug strings for $A0FE print trap */

@@ -52,12 +52,17 @@
 .equ MNams,         mNames
 .equ TypeCount,     0       /* first word of type list = count-1 */
 
-/* Resource map override stack frame offsets (from A6) */
-.equ realCurMap,           -2
-.equ overrideCurMap,       -4
-.equ OverrideSysMapHndl,   -8
-.equ OverrideSysMap,       -12
-.equ doOverrides,          -14
+/* Resource map override stack frame offsets (from A6).
+ * These MUST live BELOW the ioBlock (ioStkFrame = -52), per the SuperMario ResourceMgrStack
+ * RECORD: a6Link(0), ioBlock(ds.b 52), realCurMap(-54), overrideCurMap(-56),
+ * OverrideSysMapHndl(-60), OverrideSysMap(-64), doOverrides(-66).  born-32 had them at
+ * -2..-14, INSIDE the ioBlock -> StdEntry's ioBlock writes clobbered OverrideSysMapHndl to
+ * garbage ($00010001), which StdExit's SwapRomMap wrote into TopMapHndl (map-chain hang). */
+.equ realCurMap,           -54
+.equ overrideCurMap,       -56
+.equ OverrideSysMapHndl,   -60
+.equ OverrideSysMap,       -64
+.equ doOverrides,          -66
 
 /* IO parameter block field aliases */
 .equ IOFileName,    ioNamePtr
@@ -118,7 +123,7 @@
 .equ RobustnessData, 0
 .equ bkLim,          0     /* old MM zone header offset */
 .equ purgeProc,      0x28  /* old MM zone header offset for purge proc */
-.equ localSize,      ioStkFrame   /* -52: I/O parameter block + locals */
+.equ localSize,      -66   /* ioBlock (52) + override locals (14); was -52 which overlapped them */
 .equ result,         -2
 .equ currentMap,     -4
 .equ cachedMap,      -8
