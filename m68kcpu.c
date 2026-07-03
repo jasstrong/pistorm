@@ -71,6 +71,29 @@ void aline_ring_dump(void) {
 			printf("  [%3d] PC=%08X trap=$%04X\n", i, aline_ring_pc[j], aline_ring_trap[j]);
 	}
 }
+
+/* Branch ring buffer — definitions (declared extern in m68kcpu.h). Records recent
+ * absolute control transfers (m68ki_jump) to hunt 24-bit-stripped jump targets. */
+uint32_t branch_ring_src[BRANCH_RING_SIZE];
+uint32_t branch_ring_dst[BRANCH_RING_SIZE];
+uint16_t branch_ring_ir[BRANCH_RING_SIZE];
+unsigned int branch_ring_idx = 0;
+int branch_ring_armed = 0;
+int branch_strip_budget = 40;
+void branch_ring_arm(int on) { branch_ring_armed = on; }
+void branch_ring_dump(const char *why) {
+	printf("[BRANCH-RING] %s — last %d absolute transfers (oldest first):\n",
+	       why ? why : "", BRANCH_RING_SIZE);
+	for (int i = 0; i < BRANCH_RING_SIZE; i++) {
+		unsigned int j = (branch_ring_idx + i) & (BRANCH_RING_SIZE - 1);
+		if (branch_ring_src[j] || branch_ring_dst[j]) {
+			int stripped = (branch_ring_dst[j] & 0xFFF80000) == 0x00800000;
+			printf("  [%3d] $%08X --ir$%04X--> $%08X%s\n", i,
+			       branch_ring_src[j], branch_ring_ir[j], branch_ring_dst[j],
+			       stripped ? "   <-- STRIPPED" : "");
+		}
+	}
+}
 uint m68ki_tracing = 0;
 uint m68ki_address_space;
 
@@ -1055,10 +1078,6 @@ int m68k_execute(m68ki_cpu_core *state, int num_cycles)
 
 			/* Record previous program counter */
 			REG_PPC = REG_PC;
-
-			/* PC trace ring buffer for crash diagnostics */
-			state->pc_trace[state->pc_trace_idx & 31] = REG_PC;
-			state->pc_trace_idx = (state->pc_trace_idx + 1) & 31;
 
 			/* Record previous D/A register state (in case of bus error) */
 //#define M68K_BUSERR_THING
