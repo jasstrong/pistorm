@@ -49,6 +49,7 @@ const char *config_item_names[CONFITEM_NUM] = {
   "platform",
   "setvar",
   "kbfile",
+  "iomap",
 };
 
 const char *mapcmd_names[MAPCMD_NUM] = {
@@ -558,6 +559,27 @@ struct emulator_config *load_config_file(char *filename) {
         get_next_string(parse_line, var_value, &str_pos, ' ');
         cfg->platform->setvar(cfg, var_name, var_value);
 
+        break;
+      }
+      case CONFITEM_IOMAP: {
+        /* iomap <phys_lo> <phys_hi> <bus_base> : SE-bus remap window.
+         * bus = bus_base + (addr - phys_lo) for addr in [phys_lo, phys_hi). */
+        char a[64], b[64], c[64];
+        memset(a, 0, 64); memset(b, 0, 64); memset(c, 0, 64);
+        get_next_string(parse_line, a, &str_pos, ' ');
+        get_next_string(parse_line, b, &str_pos, ' ');
+        get_next_string(parse_line, c, &str_pos, ' ');
+        if (cfg->io_remap_count < MAX_IO_REMAP) {
+          unsigned long lo = strtoul(a, NULL, 0), hi = strtoul(b, NULL, 0), bus = strtoul(c, NULL, 0);
+          cfg->io_remap_lo[cfg->io_remap_count] = lo;
+          cfg->io_remap_hi[cfg->io_remap_count] = hi;
+          cfg->io_remap_bus[cfg->io_remap_count] = bus;
+          cfg->io_remap_count++;
+          printf("[CFG] I/O remap window #%u: phys $%08lX-$%08lX -> SE bus base $%08lX.\n",
+                 cfg->io_remap_count - 1, lo, hi, bus);
+        } else {
+          printf("[CFG] Too many iomap windows (max %d), ignoring.\n", MAX_IO_REMAP);
+        }
         break;
       }
       case CONFITEM_NONE:

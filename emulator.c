@@ -73,6 +73,8 @@ static const char *pc_trace_path = NULL;
 #define PCRING_SIZE 16384
 static uint32_t pc_ring[PCRING_SIZE];
 static uint32_t pc_ring_pos = 0;
+static uint32_t g_d3_before = 0;  /* [D3-FROM-708C] d3 captured before jsr $708C */
+uint32_t g_last_scrn_pc = 0;      /* [SCRN-WR] log writer only when it changes */
 
 static void pc_trace_flush(void) {
     if (!pc_trace_buf || !pc_trace_count) return;
@@ -489,14 +491,20 @@ int gestalt_trap_intercept(void) {
     else return 0;
   } else if (selector == 0x6D616368) {  // 'mach' (gestaltMachineType)
     if (is_big_se) result = 6;          // gestaltMacII — ROM at $800000 in 24-bit
-    else if (is_040) result = 22;       // gestaltQuadra700
-    else if (is_030) result = 9;        // gestaltMacSE030
+    else if (is_040) result = 15;       // hugeSE-040: UNALLOCATED machineType (Apple gap) — same reason
+                                        // as the 030 case below: reporting a real machine (Quadra700) made
+                                        // 7.5.5's ROM patcher patch the wrong ROM.
+    else if (is_030) result = 16;       // hugeSE: UNALLOCATED machineType (12/14/15/16 are Apple gaps).
+                                        // NOT a real SE/30 — reporting gestaltMacSE30(9) made System 7.5.5's
+                                        // ROM patcher patch the (non-SE/30) hugeSE ROM -> resmgr map corruption.
+                                        // May require adding machineType 16 to the 'gusd' resource.
     else return 0;
   } else {
     return 0;  // not handled — let the trap dispatcher run
   }
   m68k_set_reg(NULL, M68K_REG_D0, 0);       // noErr
   m68k_set_reg(NULL, M68K_REG_A0, result);
+  if (selector == 0x6D616368) { static int gm=0; if(gm++<6) printf("[MACH-INTERCEPT] Gestalt('mach') -> machineType=%u\n", result); }
   return 1;
 }
 
@@ -512,11 +520,17 @@ int suppress_rom_patches = 0;   /* HUGESE_NOPATCH: force GetResource('ptch'/'PTC
                                  * so the OS doesn't patch our already-modified ROM */
 int gusd_arm = 0; uint32_t gusd_ret_pc = 0; uint32_t gusd_res_sp = 0; /* 'gusd' dump-on-return */
 int gest_arm = 0; uint32_t gest_ret_pc = 0; uint32_t gest_sel = 0; /* Gestalt mach/addr capture */
+int mdb_arm = 0; int mdb_done = 0; uint32_t mdb_buf = 0; /* HFS MDB read: dump on-disk $4244 block when it fills */
+int mdb_settle = 0; uint32_t mdb_pend = 0; /* once $4244 seen, settle N instrs so the byte-pump finishes before dumping */
+int node_settle = 0; uint32_t node_buf = 0; uint32_t node_pos = 0; /* dump+validate the B-tree node a high read fills, after the byte-pump settles */
+uint32_t g_mnext_addr = 0, g_mnext_val = 0; /* dynamic watch: a resmgr map's mNext field addr + the valid value written, to catch the stray write that corrupts it (figment-heap nondeterministic so the addr varies per run) */
 
 /* Figment trap table: maps OS trap number → binary offset of fig_XXX glue.
  * Auto-generated from figment.elf symbols. */
 #define FIGMENT_ROM_OFF 0x40000  /* in the mirror half of 512K ROM */
 #include "huge-se/figment/figment_offsets.h"
+
+int r0_dirty = 1;  /* bigSE: region-0 code window written since last scan (see R0_MARK_DIRTY) */
 
 /* Figment trap lookup — no longer used for write interception (traps are
  * now baked into the ROM by patch-rom.py), but kept for diagnostics. */
@@ -933,6 +947,12 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			/* Set the address space for reads */
 			m68ki_use_data_space(); /* auto-disable (see m68kcpu.h) */
 
+			/* [REMOVED 2026-06-19] The stripped-ROM-pointer redirect that bounced
+			 * $00800000-$0087FFFF execution to ROM was WRONG: the System loads real
+			 * code into that RAM region (8MB mark, NOT a ROM mirror), so it misfired
+			 * on legitimate loaded-System execution -> instant boot death (<10s) vs
+			 * yesterday's full minutes-long System load. Reverted to no-redirect. */
+
 			/* Call external hook to peek at CPU */
 			m68ki_instr_hook(REG_PC); /* auto-disable (see m68kcpu.h) */
 
@@ -960,6 +980,13 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			   * the top byte of pointers. SuperMario's Fig_InitMemMgr does this BCLR; the
 			   * SE ROM doesn't. Clear them right after InitMemMgr returns (InitRsrcMgr
 			   * entry $07E8), before the System launches. */
+			  /* SCOPE (2026-07-03): force is hugeSE-only (flat 32-bit). Ordinary SE and
+			   * bigSE are 24-bit and MUST keep $0B73 bits 0/1 set — clearing them stops
+			   * the System masking pointer high bytes, so junk-topped pointers deref into
+			   * random RAM (nondeterministic heap corruption). Gate by ROM position, the
+			   * only reliable distinguisher of the three configs: SE $00400000 / bigSE
+			   * $00800000 (skip) vs hugeSE $40800000 (apply). $xx07E8 is shared low ROM. */
+			  if (ovl_sysrom_pos >= 0x40000000)
 			  { static int go32=0;
 			    if (!go32 && rom_off == 0x07E8) { go32=1;
 			      uint8_t ov=m68ki_read_8(state,0x0B73); m68ki_write_8(state,0x0B73, ov & 0xFC);
@@ -997,29 +1024,266 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			             REG_DA[9], REG_DA[11], sp, m68ki_read_32(state,sp), m68ki_read_32(state,sp+4),
 			             m68ki_read_32(state,sp+8), m68ki_read_32(state,sp+12)); } }
 			  if (rom_off == 0x5CA) { static int s=0; if(s++<2) printf("[SCRNBASE-SET] $0824 <- *(0x10C)=$%08X PC=$%08X\n", m68ki_read_32(state,0x10C), REG_PC); }
-			  if (rom_off == 0xF4A) { static int f=0; if(f++<3) printf("[ICON-F4A] ScrnBase($0824)=$%08X PC=$%08X\n", m68ki_read_32(state,0x0824), REG_PC); }
+			  if (rom_off == 0xF4A) { static int f=0; if(f==0) branch_ring_dump("floppy-X bail (1st give-up)"); if(f++<3) printf("[ICON-F4A] ScrnBase($0824)=$%08X PC=$%08X\n", m68ki_read_32(state,0x0824), REG_PC); }
 			  if (rom_off == 0x1176) { static int h=0; if(h++<3) printf("[HAPPYMAC] ScrnBase($0824)=$%08X PC=$%08X\n", m68ki_read_32(state,0x0824), REG_PC); }
+			  /* [ROVR-GET] InitResources' GetResource('ROvr',0) returns a bogus non-nil handle
+			   * whose master ptr = a resource map base -> ROM executes the map (Sad Mac F/3).
+			   * $48234 = insn right after _GetResource pops the handle into D0. Log the handle,
+			   * its deref, and the map-chain heads to see WHICH handle came back. */
+			  if (rom_off == 0x48236) { static int n=0; if (n++<4) { uint32_t h=REG_DA[0]&0x1FFFFFF; uint32_t tmh=m68ki_read_32(state,0xA50), smh=m68ki_read_32(state,0xA54);
+			      printf("[ROVR-GET] D0(handle)=$%08X *h=$%08X | TopMapHndl=$%08X *TMH=$%08X SysMapHndl=$%08X *SMH=$%08X ResErr($A60)=$%04X CurMap($A5A)=$%04X\n",
+			             REG_DA[0], h?m68ki_read_32(state,h):0xDEAD, tmh, m68ki_read_32(state,tmh&0x1FFFFFF), smh, m68ki_read_32(state,smh&0x1FFFFFF), m68ki_read_16(state,0xA60), m68ki_read_16(state,0xA5A)); } }
+			  /* [ROVR-JSR] about to execute the 'ROvr' resource: A0 = its (deref'd) code ptr.
+			   * Also dump the figment block header (16 bytes below data; flags@+4 bit layout)
+			   * to see whether the block is LOCKED — the doc requires locked+nonpurgeable. */
+			  if (rom_off == 0x4823E) { static int n=0; if (n++<4) { uint32_t a0=REG_DA[8]&0x1FFFFFF, hdr=a0-16;
+			      printf("[ROVR-JSR] A0=$%08X first-words: %04X %04X %04X %04X | blkhdr@$%06X: %08X %08X %08X %08X\n", REG_DA[8],
+			             m68ki_read_16(state,a0), m68ki_read_16(state,a0+2), m68ki_read_16(state,a0+4), m68ki_read_16(state,a0+6),
+			             hdr, m68ki_read_32(state,hdr), m68ki_read_32(state,hdr+4), m68ki_read_32(state,hdr+8), m68ki_read_32(state,hdr+12));
+			      printf("[ROVR-DUMP] full resource ($E4 bytes @$%06X):\n", a0);
+			      for (uint32_t off=0; off<0xE8; off+=16) { printf("  +%03X:", off);
+			        for (int w=0; w<16; w+=2) printf(" %04X", m68ki_read_16(state,a0+off+w)); printf("\n"); } } }
+			  /* [ROVRMP-WR] TEMP: watch the 'ROvr' master pointer slot ($22B8) — catch the
+			   * relocation of the executing block (who moves it, from which trap). */
+			  { static uint32_t p=0xDEADBEEF; uint32_t v=m68ki_read_32(state,0x22B8); if(v!=p){ static int n=0; if(p!=0xDEADBEEF && n++<14) { uint32_t ob=p&0x1FFFFFF, nb=v&0x1FFFFFF;
+			      printf("[ROVRMP-WR] $22B8(MP): $%08X -> $%08X @PPC=$%08X PC=$%08X SP=$%08X | old tags=$%02X first: %04X %04X %04X %04X | new tags=$%02X\n",
+			             p, v, REG_PPC, REG_PC, REG_DA[15],
+			             (ob>0x2000&&ob<0x1F00000)?m68ki_read_8(state,ob-16+4):0xEE,
+			             (ob>0x2000&&ob<0x1F00000)?m68ki_read_16(state,ob):0xEEEE, (ob>0x2000&&ob<0x1F00000)?m68ki_read_16(state,ob+2):0xEEEE,
+			             (ob>0x2000&&ob<0x1F00000)?m68ki_read_16(state,ob+4):0xEEEE, (ob>0x2000&&ob<0x1F00000)?m68ki_read_16(state,ob+6):0xEEEE,
+			             (nb>0x2000&&nb<0x1F00000)?m68ki_read_8(state,nb-16+4):0xEE); } p=v; } }
+			  /* [GUSD-RAM] hugeSE 'gusd' override (the volume-independent sibling of bigSE's
+			   * fake_gusd stream revert): the boot volume's stock gusd carries the 24-bit
+			   * methods -> the System runs 24-bit-dirty pointers on flat-32 hugeSE (jas's
+			   * known non-patched-gusd hang). Arm on GetResource/Get1Resource entry
+			   * ($490DE/$490D6) when the stacked type is 'gusd'; at StdExitOut's RTS
+			   * ($49554) read the returned handle from the Pascal result slot and rewrite
+			   * machine-5 (+$0F) and machine-9 (+$1F) method low-bytes to $05 (32-bit
+			   * IIci method) in RAM. Idempotent; disk untouched. setvar patch_gusd 1. */
+			  { extern int patch_gusd_enabled; static int gr_armed=0;
+			    if (patch_gusd_enabled) {
+			      if (rom_off == 0x490DE || rom_off == 0x490D6) {
+			        uint32_t sp=REG_DA[15]; uint32_t rtype=m68ki_read_32(state,sp+6);
+			        if (rtype==0x67757364u) { gr_armed=1; printf("[GUSD-RAM] GetResource('gusd') id=%d — armed\n",(int16_t)m68ki_read_16(state,sp+4)); } }
+			      else if (rom_off == 0x49554) {
+			        /* Content-keyed: at EVERY RM trap exit, if the Pascal result slot holds a
+			         * handle whose data starts with the gusd anchor, patch the methods. Catches
+			         * the fetch regardless of which trap loaded it (Get/Get1/Named/RGetResource).
+			         * The gusd streams COMPRESSED off disk (stream watcher blind) and only
+			         * exists in this form after decompression. */
+			        uint32_t sp=REG_DA[15]; uint32_t hv=m68ki_read_32(state,sp+4); uint32_t h=hv&0x1FFFFFF; gr_armed=0;
+			        uint32_t p = (h && h>0x1000 && h<0x1F00000) ? (m68ki_read_32(state,h)&0x1FFFFFF) : 0;
+			        if (p && p>0x1000 && p<0x1F00000 &&
+			            m68ki_read_32(state,p)==0x0001AE5Bu && m68ki_read_32(state,p+4)==0x5E75006Du) {
+			          uint8_t m5=m68ki_read_8(state,p+0x0F), m9=m68ki_read_8(state,p+0x1F);
+			          printf("[GUSD-RAM] found via RM exit: handle=$%08X data=$%06X m5-method=$%02X m9-method=$%02X",
+			                 hv, p, m5, m9);
+			          if (m5!=0x05) { m68ki_write_8(state,p+0x0F,0x05); }
+			          if (m9!=0x05) { m68ki_write_8(state,p+0x1F,0x05); }
+			          printf(" -> now $05/$05\n"); }
+			        { static int once=0; if(!once){ once=1;
+			            printf("[GUSD-RAM] toolbox tbl: $A80C(rGetResource)->$%08X $A9A0(GetResource)->$%08X\n",
+			                   m68ki_read_32(state,0xE00+0x0C*4), m68ki_read_32(state,0xE00+0x1A0*4)); } } }
+			    } }
+			  /* [WARM-RESET] catch re-entry at the ROM reset PC ($4080002A) after cold boot —
+			   * dump the branch ring to show who jumped back to ROM start (pass-1 silent reboot). */
+			  if (rom_off == 0x2A) { static int r=0; r++; if (r >= 2 && r <= 4) { printf("[WARM-RESET] ROM reset entry #%d PPC=$%08X SP=$%08X\n", r, REG_PPC, REG_DA[15]); branch_ring_dump("warm reset"); } }
+			  /* [BOOTCODE-WR] TEMP: pass-2 System startup code runs at $205xx (sys heap); its block
+			   * turned into "SICN" resource data mid-trap -> wild RTS -> Sad Mac F/3. Watch $20600
+			   * to catch the overwriter (figment move/purge of an executing block?). REMOVE AFTER USE. */
+			  { static uint32_t p=0xDEADBEEF; uint32_t v=m68ki_read_32(state,0x20600); if(v!=p){ static int n=0; if(p!=0xDEADBEEF && n++<10) printf("[BOOTCODE-WR] $20600: $%08X -> $%08X @PPC=$%08X PC=$%08X A0=$%08X A1=$%08X SP=$%08X\n", p, v, REG_PPC, REG_PC, REG_DA[8], REG_DA[9], REG_DA[15]); p=v; } }
+			  /* [CHKHEAP] figment _CheckHeap walk advance ($40846610: adda.l $8(a2),a2 =
+			   * workBlock += workBlock->size@+8). If size==0 (or a2 doesn't advance) the walk
+			   * loops forever — that malformed block is the heap-corruption root the $A02F
+			   * "hang" really is. a2=workBlock, flags@+4, size@+8, prevBlock(back)@+0 (figment). */
+			  /* [GROWSYS] c_GrowSysZone(curHeap,newEnd) @$40843AEE — born-32 system-heap-grow. */
+			  if (rom_off == 0x43AEE) {
+			    static int g=0; if (g++ < 8) { uint32_t sp=REG_DA[15];
+			      uint32_t ch=m68ki_read_32(state,sp+4), ne=m68ki_read_32(state,sp+8);
+			      printf("[GROWSYS] curHeap=$%08X newEnd=$%08X curBackLimit=$%08X PC=$%08X\n",
+			             ch, ne, m68ki_read_32(state,ch+0x40), REG_PC); }
+			  }
+			  /* [EXTHEAP] ExtendHeapLimit(newTrailBlock,curHeap) @$408439A8 — sets oldTrailBlock
+			   * (=curHeap->backLimit@+$40)->size = newTrailBlock-oldTrailBlock, then KillBlocks it.
+			   * If oldTrailBlock==$25604 we expect its size set to ~$19E4 — but it's 0, so watch. */
+			  if (rom_off == 0x439A8) {
+			    static int e=0; if (e++ < 8) { uint32_t sp=REG_DA[15];
+			      uint32_t ntb=m68ki_read_32(state,sp+4), ch=m68ki_read_32(state,sp+8);
+			      uint32_t otb=m68ki_read_32(state,ch+0x40);
+			      printf("[EXTHEAP] newTrailBlock=$%08X curHeap=$%08X oldTrailBlock=$%08X (oldTrail->size will be $%X) PC=$%08X\n",
+			             ntb, ch, otb, ntb-otb, REG_PC); }
+			  }
+			  if (rom_off == 0x46610) {
+			    static uint32_t prev=0; static int n=0, stuck=0;
+			    uint32_t wb = REG_DA[10];                       /* a2 = workBlock */
+			    uint32_t size = m68ki_read_32(state, wb + 8);
+			    uint8_t  flags = m68ki_read_8(state, wb + 4);
+			    if ((size == 0 || wb == prev) && stuck++ < 3) {
+			      uint32_t ch = REG_DA[11];   /* a3 = curHeap (zone header) */
+			      printf("[CHKHEAP-STUCK] workBlock=$%08X size=$%08X flags=$%02X back=$%08X prev=$%08X heapStart=$%08X backLimit(d7)=$%08X\n",
+			             wb, size, flags, m68ki_read_32(state, wb), prev, m68ki_read_32(state, ch+0x18), REG_DA[7]);
+			      printf("  curHeap(a3)=$%08X  ch+$A4(stat)=$%08X  ch+$40(backLimit)=$%08X  (is $2400C == ch+$A4? %d)\n",
+			             ch, ch+0xA4, m68ki_read_32(state, ch+0x40), (ch+0xA4)==0x2400C);
+			      printf("  prevBlk $%06X: back=$%08X flags/size=$%08X size=$%08X\n", prev,
+			             m68ki_read_32(state, prev), m68ki_read_32(state, prev+4), m68ki_read_32(state, prev+8));
+			      printf("  raw $24000: %08X %08X %08X %08X  $25600: %08X %08X %08X %08X\n",
+			             m68ki_read_32(state,0x24000), m68ki_read_32(state,0x24004), m68ki_read_32(state,0x24008), m68ki_read_32(state,0x2400C),
+			             m68ki_read_32(state,0x25600), m68ki_read_32(state,0x25604), m68ki_read_32(state,0x25608), m68ki_read_32(state,0x2560C));
+			      printf("  ZONES: SysZone($2A6)=%08X ApplZone($2AA)=%08X ApplLimit($130)=%08X HeapEnd($114)=%08X MemTop($108)=%08X BufPtr($10C)=%08X\n",
+			             m68ki_read_32(state,0x2A6), m68ki_read_32(state,0x2AA), m68ki_read_32(state,0x130),
+			             m68ki_read_32(state,0x114), m68ki_read_32(state,0x108), m68ki_read_32(state,0x10C));
+			      printf("  zone@$23F68: heapStart(+$18)=%08X backLimit(+$40)=%08X  | does $23F68 overlap SysZone $2000-$26FE8? curHeap=%08X\n",
+			             m68ki_read_32(state,0x23F68+0x18), m68ki_read_32(state,0x23F68+0x40), ch);
+			    }
+			    else if (n++ < 24)
+			      printf("[CHKHEAP] workBlock=$%08X size=$%08X flags=$%02X\n", wb, size, flags);
+			    prev = wb;
+			  }
+			  /* [CHILD-RAW] $809392 read child node# as a 32-bit value: move.l $18(a1,d1.w),d0.
+			   * At $9396 d0 holds it. When d0 has a dirty high word ($0035...), dump the buffer
+			   * a1, offset d1, and raw bytes around a1+d1+$14..$20 -- shows whether $0035 is IN the
+			   * buffer (cascade/on-disk) or whether the read offset is wrong (child# is 16-bit at +$1A). */
+			  /* [D3-FROM-708C] d3 (child node#) before vs after the $6FC-vectored search
+			   * (jsr $708C @ $809380). If before already has $0035 high word -> $708C only
+			   * sets the low 16 bits (stale-high-word bug). If before is clean -> $708C
+			   * computes the full dirty value. d5 = the position it read (d2<<9). */
+			  if (rom_off == 0x9380) { g_d3_before = REG_DA[3]; }
+			  /* [CHAIN] resmgr map-chain walk ($40849442: d0 = map+16 next-link). Dump
+			   * each map (a0=master ptr) and its next-link; flag a ROM/wild handle. [CHAIN-WR]
+			   * = the link write ($40849470: movel a3,a0@(16)). Shows which map has the bad
+			   * $40801370 link and whether it was written or is uninitialized garbage. */
+			  /* TEST: at every resmgr map+16 read site, if the next-link is a wild/
+			   * uninitialized handle, ZERO THE FIELD in memory (a0/a3 = mapbase, +16 =
+			   * link) AND the loaded reg → terminates the chain for all future walks.
+			   * $49284: moveal a3@(16),a4 ; $49442/$49490: movel a0@(16),d0. */
+			  /* NEUTRALIZED 2026-06-23: the field-write band-aid caused a wild-write cascade
+			   * (mapbase was already garbage $1AE61AC). Log-only now. Real fix = figment heap
+			   * stability for resmgr map handles (mNext corrupted in heap, not by the walk). */
+			  if (rom_off == 0x49284) { uint32_t mp=REG_DA[11]&0x1FFFFFF, a4=REG_DA[12]; if(a4 && ((a4&0xFF000000u)||a4<0x100u)) { static int w=0; if(w++<8) printf("[CHAIN-BAD] $49284 map=$%06X bad mNext=$%08X\n", mp, a4); } }
+			  /* [TMH-ONEONE] catch TopMapHndl ($A50) clobbered to $00010001 (OneOne) — the derail
+			   * head seen earlier. PPC = the writing instruction. */
+			  /* DISABLED 2026-07-02: bug fixed (frame-layout + $A822 stub); per-instruction read = throttle.
+			  { static uint32_t p=0; uint32_t v=m68ki_read_32(state,0xA50); if(v!=p){ if(v==0x00010001u){ static int n=0; if(n++<4) printf("[TMH-ONEONE] TopMapHndl <- $00010001 @PPC=$%08X prev=$%08X D0=$%08X D1=$%08X A0=$%08X A1=$%08X\n", REG_PPC, p, REG_DA[0], REG_DA[1], REG_DA[8], REG_DA[9]); } p=v; } } */
+			  /* [FB62] watch the frame-local slot ($00FFFB62 = A6-8 from SWAP-A3) for the
+			   * $00010001 (OneOne) write, capturing the culprit instruction (PPC). */
+			  /* DISABLED 2026-07-02: bug fixed; per-instruction read = throttle.
+			  { static uint32_t p=0xDEADBEEF; uint32_t v=m68ki_read_32(state,0x00FFFB62); if(v!=p){ if(v==0x00010001u){ static int n=0; if(n++<8) printf("[FB62] $FFFB62 <- $00010001 @PPC=$%08X (PC=$%08X) prev=$%08X D0=$%08X D1=$%08X A0=$%08X A1=$%08X A6=$%08X\n", REG_PPC, REG_PC, p, REG_DA[0], REG_DA[1], REG_DA[8], REG_DA[9], REG_DA[14]); } p=v; } } */
+			  /* [SWAP-A3] confirm A6 at the corrupting write (is the frame at $FFFB6A?). */
+			  if (rom_off == 0x494B0 && REG_DA[11]==0x00010001u) { static int n=0; if(n++<2) printf("[SWAP-A3] A6=$%08X *(A6-8)=$%08X\n", REG_DA[14], m68ki_read_32(state,(REG_DA[14]&0x1FFFFFF)-8)); }
+			  /* [MNEXT-WR] resmgr writes to mNext(map+16). Compare vs [CHAIN-BAD] reads: if a
+			   * garbage-read map WAS written correctly here -> it got corrupted/relocated after
+			   * (heap instability); if never written -> uninitialized. $489AC=insert(TopMapHndl). */
+			  /* [BADMP-ZONE] at CheckZoneForBadFreeMPs ($466CE, where firstFreeMP is loaded):
+			   * which zone has the garbage firstFreeMP(+8)? low SysZone (~$2000) or the high
+			   * ROM-placed ApplZone (~$100000+, in the filled region)? Decides the fix site. */
+			  if (rom_off == 0x466EE) { uint32_t a1=REG_DA[9]&0x1FFFFFF, z=REG_DA[11]; uint32_t val=m68ki_read_32(state,a1), nxt=val&~1u, hs=m68ki_read_32(state,z+0x18), bl=m68ki_read_32(state,z+0x40); if(nxt && (nxt<hs||nxt>=bl)){ static int n=0; if(n++<10) printf("[DIRTY-SLOT] slot=$%06X *slot=$%08X (next=$%08X OUT-OF-ZONE) head=$%08X zone=$%08X\n", a1, val, nxt, m68ki_read_32(state,z+8), z); } }
+			  /* [2254-WRITE] catch the store that stamps a dirty high word into MP slot $2254
+			   * (valid MP content is an in-zone addr, high word $0000/$0010; $22B4 = the bug). */
+			  /* DISABLED 2026-07-02: bug fixed; per-instruction read = throttle.
+			  { static uint32_t prev=0xFFFFFFFF; uint32_t v=m68ki_read_32(state,0x2254); if(v!=prev){ if((v>>16) >= 0x100u){ static int n=0; if(n++<8) printf("[2254-WRITE] $2254: $%08X -> $%08X @PPC=$%08X (PC=$%08X) D0=$%08X D1=$%08X A0=$%08X A1=$%08X SP=$%08X\n", prev, v, REG_PPC, REG_PC, REG_DA[0], REG_DA[1], REG_DA[8], REG_DA[9], REG_DA[15]); } prev=v; } } */
+			  if (rom_off == 0x489AC) { static int w=0; if(w++<14) printf("[MNEXT-WR] $489AC map(a1)=$%06X <- TopMapHndl=$%08X\n", REG_DA[9]&0x1FFFFFF, m68ki_read_32(state,0xA50)); }
+			  if (rom_off == 0x49456) { static int w=0; if(w++<14) printf("[MNEXT-WR] $49456 map(a0)=$%06X <- a2=$%08X\n", REG_DA[8]&0x1FFFFFF, REG_DA[10]); }
+			  if (rom_off == 0x49470) { uint32_t mp=REG_DA[8]&0x1FFFFFF, val=REG_DA[11]; static int w=0; if(w++<14) printf("[MNEXT-WR] $49470 map(a0)=$%06X <- a3=$%08X\n", mp, val); extern uint32_t g_mnext_addr, g_mnext_val; if(val>=0x1000u && val<0x40000u && mp<0x2000000u){ g_mnext_addr=mp+16; g_mnext_val=val; } }
+			  if (rom_off == 0x48EEC) { static int w=0; if(w++<14) printf("[MNEXT-WR] $48EEC map(a1)=$%06X <- a0=$%08X\n", REG_DA[9]&0x1FFFFFF, REG_DA[8]); }
+			  if (rom_off == 0x481F0) { static int w=0; if(w++<14) printf("[MNEXT-WR] $481F0 map(a1)=$%06X <- *($A54)=$%08X\n", REG_DA[9]&0x1FFFFFF, m68ki_read_32(state,0xA54)); }
+			  /* [PCHIST] where do the (scarce) instructions go? coarse PC buckets. */
+			  { static unsigned long long tot=0, b_chk=0, b_fig=0, b_rm=0, b_scsi=0, b_drv=0, b_rom=0, b_oth=0;
+			    uint32_t pc=REG_PC; tot++;
+			    if (pc>=0x40846580 && pc<0x40846b00) b_chk++;
+			    else if (pc>=0x40840000 && pc<0x40848000) b_fig++;
+			    else if (pc>=0x40848000 && pc<0x4084b000) b_rm++;
+			    else if (pc>=0x4081a000 && pc<0x4081b000) b_scsi++;
+			    else if (pc>=0x00013000 && pc<0x00016000) b_drv++;
+			    else if (pc>=0x40800000 && pc<0x40880000) b_rom++;
+			    else b_oth++;
+			    if ((tot % 20000000ULL)==0) printf("[PCHIST] %lluM instr: chkheap=%.0f%% fig=%.0f%% resmgr=%.0f%% scsiMgr=%.0f%% driver=%.0f%% otherROM=%.0f%% other=%.0f%%\n", tot/1000000ULL, 100.0*b_chk/tot, 100.0*b_fig/tot, 100.0*b_rm/tot, 100.0*b_scsi/tot, 100.0*b_drv/tot, 100.0*b_rom/tot, 100.0*b_oth/tot); }
+			  /* [253C-CLOBBER] removed 2026-06-27: debunked (was reading stale D0); also it
+			   * did an m68ki_read_32 EVERY instruction — a major throttle. */
+			  if (rom_off == 0x9384) {
+			    static int n=0; if ((REG_DA[3] & 0xFFFF0000) && n++<5)
+			      printf("[D3-FROM-708C] before=$%08X after(d3)=$%08X d5(pos)=$%08X d2=$%08X vec($6FC)=$%08X a4=$%06X a3=$%06X\n",
+			             g_d3_before, REG_DA[3], REG_DA[5], REG_DA[2], m68ki_read_32(state,0x6FC), REG_DA[12]&0xFFFFFF, REG_DA[11]&0xFFFFFF);
+				    /* born-32 FIX: the SE ROM FM catalog B-tree search ($40807092) returns the
+				     * node# in d3 with a stale high word (its divu.w/mulu.w position math is
+				     * 24-bit-dirty). Harmless on a real 24-bit SE — node#<<9 truncates the junk
+				     * off the top of the bus — but fatal under flat IS=0. Node#s are 16-bit here,
+				     * so clear the high word to mimic the 24-bit machine. */
+				    /* DISABLED 2026-06-22: $0035 is NOT dirt — it's the high byte of a LEGIT
+				     * large-volume physical block ($00353486) on the real ~1.8GB 'MacPack'
+				     * volume. Masking truncated the B-tree node read to block $3486 (wrong
+				     * sector) -> catalog garbage -> floppy-X. Keep the log; do NOT mask. */
+				    if (REG_DA[3] & 0xFFFF0000u) { static int fx=0; if (fx++<5) printf("[D3-FIX-DISABLED] keeping legit high block $%08X (would have masked to $%08X)\n", REG_DA[3], REG_DA[3]&0xFFFF); }
+			  }
+			  if (rom_off == 0x70A4) { static int p=0; if ((REG_DA[3] & 0xFFFF0000u) && p++<8) { uint32_t a1=REG_DA[9], d1=REG_DA[1]&0xFFFF, src=(a1+d1+6)&0xFFFFFF; printf("[70A4-PRE] d3=$%08X (high=$%04X DIRTY) a1=$%08X d1=$%X src[a1+d1+6]=$%04X PC=$%08X\n", REG_DA[3], (REG_DA[3]>>16)&0xFFFF, a1, d1, m68ki_read_16(state, src), REG_PC); } }
+				  if (rom_off == 0x7096) { static int q=0; if ((REG_DA[3] & 0xFFFF0000u) && q++<8) printf("[6964-RET] d3=$%08X (high=$%04X) PC=$%08X\n", REG_DA[3], (REG_DA[3]>>16)&0xFFFF, REG_PC); }
+				  /* [D3-DIRTY-AT] disabled 2026-06-22 (jas): ran logic every instruction = major emulator slowdown; $0035 is legit, not dirt */
+				  /* catch the instant any data reg's high word becomes $0035 (the node# poison) */
+				  /* [D-0035-AT] disabled 2026-06-22 (jas): looped all 8 regs every instruction = major slowdown; $0035 is legit high byte, not poison */
+				  /* [SCRN-CHG] disabled 2026-06-22 (jas): read $0824 every instruction = slowdown; ScrnBase churn is benign (see notes) */
+				  if (rom_off == 0x939C) { /* DISABLED 2026-06-22: storing the LEGIT physblk $353486 into BTCB+$12; masking it to $3486 truncated the node read to the wrong sector. Keep log, do NOT mask. */ if (REG_DA[2] & 0xFFFF0000u) { static int f2=0; if (f2++<6) printf("[D2-FIX-DISABLED] keeping BTCB+$12=$%08X (would have masked to $%08X)\n", REG_DA[2], REG_DA[2]&0xFFFF); } }
+				  if (rom_off == 0x783C) { uint32_t _d3=REG_DA[3]&0xFFFFu, _d6=REG_DA[6]&0xFFFFu, _p=_d3*_d6; if (((_p>>16)&0xFFFFu)==0x0035u && (_p&0xFFu)!=0u) { static int mb=0; if (mb++<6) { uint32_t a2=REG_DA[10]&0xFFFFFFu, a1=REG_DA[9]&0xFFFFFFu; uint8_t nlen=m68ki_read_8(state,a2+0x2C); char vn[28]; int vi=0; for(;vi<nlen&&vi<27;vi++) vn[vi]=(char)m68ki_read_8(state,a2+0x2D+vi); vn[vi]=0; printf("[MAPFB] xdrStABN=$%04X * AlBlkSiz/$200=$%04X = $%08X | VCB '%s': SigWord(+$08)=$%04X NmAlBlks(+$1A)=$%04X AlBlkSiz(+$1C)=$%08X AlBlSt(+$24)=$%04X | a2(VCB)=$%06X a1(extent)=$%06X\n", _d3,_d6,_p, vn, m68ki_read_16(state,a2+0x08), m68ki_read_16(state,a2+0x1A), m68ki_read_32(state,a2+0x1c), m68ki_read_16(state,a2+0x24), a2, a1); } } }
+				  /* [MAPFB-EXIT] MapFBlock rts ($4080785E): capture its result for the
+				   * high-block (System-file) case. d0 = error code (expect 0/noErr), d3 =
+				   * the 32-bit physical device block (~$353486), sp@ = CALLER return addr,
+				   * d5 = file position. The caller is who reads the block — disassemble it
+				   * to find where born-32 truncates d3<<9 or reads via a non-$A002 path. */
+				  if (rom_off == 0x785E) { uint32_t d3=REG_DA[3]; if (d3 > 0x300000u) { static int me=0; if (me++<8) { uint32_t sp=REG_DA[15]; printf("[MAPFB-EXIT] d0(err)=%d physblk(d3)=$%08X pos(d3<<9)=$%08X caller(ret)=$%08X d5(filepos)=$%08X d4=$%08X\n", (int16_t)(REG_DA[0]&0xFFFF), d3, d3<<9, m68ki_read_32(state,sp), REG_DA[5], REG_DA[4]); } } }
+				  /* [BTREAD] B-tree node-read path for the high-block case. $9702 = read
+				   * routine entry (reached only if the cache-check at $9396 didn't skip it);
+				   * $9764 = ioPosOffset just built (d0 = physblk<<9), plus *($720) = where the
+				   * rts at $9768 jumps (should be $4080976E to reach the _Read at $977C);
+				   * $976E = the read-issue code actually reached. Filter to high physblk. */
+				  if (rom_off == 0x9702) { uint32_t pb=m68ki_read_32(state,(REG_DA[12]&0xFFFFFF)+0x12); if (pb>0x300000u){ static int b=0; if(b++<6) printf("[BTREAD-ENTRY] a4(BTCB)=$%06X physblk(+$12)=$%08X\n", REG_DA[12]&0xFFFFFF, pb); } }
+				  if (rom_off == 0x9764) { uint32_t pos=REG_DA[0]; if (pos>0x10000000u){ static int b=0; if(b++<6) printf("[BTREAD-POS] ioPosOffset(d0)=$%08X a0(PB)=$%08X *($720)=$%08X (->$976E reaches _Read)\n", pos, REG_DA[8], m68ki_read_32(state,0x720)); } }
+				  if (rom_off == 0x976E) { uint32_t p=m68ki_read_32(state,0x3A4+0x2E); if (p>0x10000000u){ static int b=0; if(b++<6) printf("[BTREAD-ISSUE] reached read-issue; ioPos@$3D2=$%08X d1=$%X $342=$%02X (next: $A002/$A003)\n", p, REG_DA[1]&0xFF, m68ki_read_8(state,0x342)); } }
+				  /* [GN-*] pinpoint why GetNode bails before reading the high node. d2 =
+				   * physblk ($353486) filters to our case. $9392: the skip test value
+				   * (a1@($18+d1)==0 -> $93C0). $9404: cache-buffer-walk found nothing
+				   * (a0/a1/a5 candidates, a3=head, *(a3)=first buffer). $940A: err3 (no-alloc
+				   * flag d3 bit1). $9422: err1 (no buffer). $9490: the read was actually reached. */
+				  if (rom_off == 0x9392 && REG_DA[2] > 0x300000u) { static int s=0; if(s++<4){ uint32_t a1=REG_DA[9]; int16_t d1=(int16_t)REG_DA[1]; uint32_t v=m68ki_read_32(state,(a1+0x18+d1)&0xFFFFFF); printf("[GN-SKIP] a1(*$34E)=$%06X d1=$%04X a1@($18+d1)=$%08X (0=>skip direct read, go $93C0) d2(physblk)=$%08X\n", a1&0xFFFFFF,(uint16_t)d1,v,REG_DA[2]); } }
+				  if (rom_off == 0x9404 && REG_DA[2] > 0x300000u) { static int s=0; if(s++<4){ uint32_t a3=REG_DA[11]&0xFFFFFF; printf("[GN-NOBUF] a3(head)=$%06X *(a3)=$%08X cand a0=$%08X a1=$%08X a5=$%08X d3=$%02X d2=$%08X\n", a3, m68ki_read_32(state,a3), REG_DA[8], REG_DA[9], REG_DA[13], REG_DA[3]&0xFF, REG_DA[2]); } }
+				  if (rom_off == 0x940A && REG_DA[2] > 0x300000u) { static int s=0; if(s++<3) printf("[GN-ERR3] d3-bit1 set -> GetNode err 3, NO read. d2=$%08X\n", REG_DA[2]); }
+				  if (rom_off == 0x9422 && REG_DA[2] > 0x300000u) { static int s=0; if(s++<3) printf("[GN-ERR1] no cache buffer -> GetNode err 1, NO read. d2=$%08X\n", REG_DA[2]); }
+				  if (rom_off == 0x9490 && REG_DA[2] > 0x300000u) { static int s=0; if(s++<3) printf("[GN-READ] node read REACHED for physblk d2=$%08X\n", REG_DA[2]); }
+				  if (rom_off == 0x9396) {
+			    static int cd=0; uint32_t d0=REG_DA[0];
+			    if (((d0>>16)&0xFFFFu)==0x0035u && cd++<6) {
+			      uint32_t a1=REG_DA[9], d1=REG_DA[1]&0xFFFF, base=a1+d1;
+			      printf("[CHILD-RAW] d0=$%08X a1=$%08X d1=$%X", d0, a1, d1);
+			      if ((a1 & 0xFF000000)==0 && (a1 & 0xFFFFFF) < 0x02000000) {
+			        printf(" buf[+$10..+$20]:");
+			        for (uint32_t off=0x10; off<=0x20; off+=2) printf(" %04X", m68ki_read_16(state, (base&0xFFFFFF)+off));
+			      } else printf(" (a1 out of RAM range)");
+			      printf(" (read@+$18) PC=$%08X\n", REG_PC);
+			    }
+			  }
 				  /* born-32 skips the SCSI-timing calibration big-se runs, leaving
 				   * TimeSCSIDB ($D04)=$FFFF. SCSI Mgr derives its timing from it at init,
 				   * so set it BEFORE any SCSI activity: once TimeSCCDB ($D02) is
 				   * calibrated, mirror it into $D04 (big-se ends up with both equal). */
 				  { static int tscsi_done = 0;
-				    if (!tscsi_done && rom_off == 0x4A4) {   /* just after the TimeSCCDB store at $4A0 */
+				    if (!tscsi_done && rom_off == 0x4A4) {   /* just after the TimeSCCDB store at $4A0 — fire for BOTH bigSE & hugeSE to compare */
 				      {
-				        /* TEST: force the SCSI/SCC timing globals to big-se's known-good
-				         * calibration (TimeDBRA=$3A2E, TimeSCCDB=$01D1, TimeSCSIDB=$01D1). */
-				        m68ki_write_32(state, 0x0D00, (0x3A2Eu << 16) | 0x01D1u); /* TimeDBRA|TimeSCCDB */
-				        uint32_t cur = m68ki_read_32(state, 0x0D04);
-				        m68ki_write_32(state, 0x0D04, (0x01D1u << 16) | (cur & 0xFFFF)); /* TimeSCSIDB */
+				        /* DO NOT force bigSE's hardcoded timing. born-32's OWN calibration is
+				         * valid — TimeDBRA calibrates to ~$0C01, squarely in bigSE's measured
+				         * $0C77-$0FD5 range — but the old force jammed in $3A2E (≈3x too big),
+				         * making every DBRA-paced delay (SCSI handshake, VIA) mistimed and the
+				         * System-load fragile. Let the real calibration stand; the skipped
+				         * TimeSCSIDB ($FFFF) is filled from the REAL TimeSCCDB by [TIMESCSI-FIX]
+				         * at $1A410 below. */
+				        uint32_t dbra_scc = m68ki_read_32(state, 0x0D00);
+				        uint32_t scsidb   = m68ki_read_32(state, 0x0D04);
 				        tscsi_done = 1;
-				        printf("[TIMING-FORCE] TimeDBRA=$3A2E TimeSCCDB/SCSIDB=$01D1 (PC=$%08X)\n", REG_PC);
+				        printf("[TIMING-REAL] calibrated TimeDBRA=$%04X TimeSCCDB=$%04X TimeSCSIDB=$%04X (force disabled) PC=$%08X\n",
+				               (dbra_scc>>16)&0xFFFF, dbra_scc&0xFFFF, (scsidb>>16)&0xFFFF, REG_PC);
 				      } } }
 					  /* born-32: repair a stripped ROM driver pointer at the .DRVR dispatcher.
 					   * ROM-based drivers (.Sony etc.) live in the ROM mirror at $408xxxxx, but
 					   * the DCE dCtlDriver gets stored 24-bit-masked ($008xxxxx), so the dispatch
 					   * jumps into low RAM (zeros) and wild-jumps.  Restore the $40 ROM high byte
 					   * before the jump-table read at $40802F1E. */
-					  if (rom_off == 0x2F1E && (REG_DA[10] & 0x00F80000) == 0x00800000) {
+					  if (ovl_sysrom_pos >= 0x40000000 && rom_off == 0x2F1E && (REG_DA[10] & 0x00F80000) == 0x00800000) {
 					    REG_DA[10] |= 0x40000000;
 					  }
 					  /* born-32: repair the SE IWM base for the .Sony/disk driver.
@@ -1037,13 +1301,13 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 				  if (rom_off == 0x466) { static int c=0; if (c++<2)
 				    printf("[CAL-OUT] a1=$%08X TimeDBRA(d0)=$%04X pmmu_en=%d\n",
 				      REG_DA[9], REG_DA[0] & 0xFFFF, m68ki_cpu.pmmu_enabled); }
-				  if (rom_off == 0x1A410 && (REG_DA[11] & 0x00F80000) == 0x00580000) {
+				  if (ovl_sysrom_pos >= 0x40000000 && rom_off == 0x1A410 && (REG_DA[11] & 0x00F80000) == 0x00580000) {
 					    REG_DA[11] |= 0x40000000;
 					  }
 					  /* TEST: TimeSCSIDB ($D04) is uncalibrated ($FFFF) in born-32 — the SCSI
 					   * Mgr's selection/handshake delays come out wrong. Force it to the SCC
 					   * calibration ($D02, same paced custom path) before the disk driver runs. */
-					  if (rom_off == 0x1A410) {
+					  if (ovl_sysrom_pos >= 0x40000000 && rom_off == 0x1A410) {
 					    uint32_t d04 = (m68ki_read_32(state, 0x0D04) >> 16) & 0xFFFF;
 					    if (d04 == 0xFFFF || d04 == 0) {
 					      uint32_t scc = m68ki_read_32(state, 0x0D00) & 0xFFFF; /* TimeSCCDB @ $D02 */
@@ -1052,6 +1316,78 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 					      m68ki_write_32(state, 0x0D04, (scc << 16) | (cur & 0xFFFF));
 					      static int tf = 0;
 					      if (tf++ < 2) printf("[TIMESCSI-FIX] $D04 $FFFF -> $%04X (from TimeSCCDB)\n", scc);
+					    }
+					  }
+					  /* [DACK-DECISION] hugeSE enters the pseudo-DMA/DACK transfer setup
+					   * ($1A774 Mode=DMA); bigSE never gets here (it does PIO). Dump the call
+					   * chain (branch ring + stack ret-addrs) + regs to find WHERE the SCSI
+					   * Mgr chose DACK over PIO and what condition it keyed on. */
+					  if (ovl_sysrom_pos >= 0x40000000 && rom_off == 0x1A774) {
+					    static int dack_once = 0;
+					    if (!dack_once) { dack_once = 1; extern void branch_ring_dump(const char *why);
+					      uint32_t sp = REG_DA[15];
+					      printf("[DACK-DECISION] entered DACK-DMA @$1A774  D0-D7: %08X %08X %08X %08X %08X %08X %08X %08X\n",
+					        REG_DA[0],REG_DA[1],REG_DA[2],REG_DA[3],REG_DA[4],REG_DA[5],REG_DA[6],REG_DA[7]);
+					      printf("  A0-A7: %08X %08X %08X %08X %08X %08X %08X %08X\n",
+					        REG_DA[8],REG_DA[9],REG_DA[10],REG_DA[11],REG_DA[12],REG_DA[13],REG_DA[14],REG_DA[15]);
+					      printf("  stack ret-chain: %08X %08X %08X %08X %08X %08X %08X %08X\n",
+					        m68ki_read_32(state,sp), m68ki_read_32(state,sp+4), m68ki_read_32(state,sp+8), m68ki_read_32(state,sp+12),
+					        m68ki_read_32(state,sp+16), m68ki_read_32(state,sp+20), m68ki_read_32(state,sp+24), m68ki_read_32(state,sp+28));
+					      branch_ring_dump("at DACK-DMA path entry (SCSI Mgr chose blind-DMA)");
+					    }
+					  }
+					  /* [SCSI-DISPATCH] the SCSI Mgr transfer jump-table dispatch
+					   * ($1A21A: movea.l (A4,D0.w),A0; jmp (A0)). Log the table base A4,
+					   * index D0, and selected routine — to see if hugeSE gets a different
+					   * TABLE (mis-detected machine) or a different INDEX (blind vs polled)
+					   * than bigSE, landing it on the DACK ($1A2F6) vs PIO ($1A2F4) entry. */
+					  if (ovl_sysrom_pos >= 0x800000 && rom_off == 0x1A21A) {
+					    static int sd_n = 0;
+					    if (sd_n++ < 30) {
+					      uint32_t a4 = REG_DA[12]; int16_t d0 = (int16_t)(REG_DA[0] & 0xFFFF);
+					      uint32_t ent = m68ki_read_32(state, ADDRESS_68K(a4 + d0));
+					      printf("[SCSI-DISPATCH] A4(tbl)=$%08X D0(idx)=$%04X -> routine=$%08X (24=$%06X) D1(op)=$%04X\n",
+					             a4, (uint16_t)d0, ent, ent & 0xFFFFFF, REG_DA[1] & 0xFFFF);
+					    }
+					    /* one-shot: when the BLIND read (op5, idx=$14) is chosen, dump the
+					     * call chain — the SCSI-Mgr code that pushed op5 is the blind-decision. */
+					    if (ovl_sysrom_pos >= 0x40000000 && (int16_t)(REG_DA[0] & 0xFFFF) == 0x14) {
+					      static int o5 = 0;
+					      if (!o5) { o5 = 1; extern void branch_ring_dump(const char *why);
+					        uint32_t sp = REG_DA[15];
+					        printf("[OP5-CALLER] stack: %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X\n",
+					          m68ki_read_32(state,sp),m68ki_read_32(state,sp+4),m68ki_read_32(state,sp+8),m68ki_read_32(state,sp+12),
+					          m68ki_read_32(state,sp+16),m68ki_read_32(state,sp+20),m68ki_read_32(state,sp+24),m68ki_read_32(state,sp+28),
+					          m68ki_read_32(state,sp+32),m68ki_read_32(state,sp+36));
+					        branch_ring_dump("at op5(blind) dispatch — who chose blind?");
+					      }
+					    }
+					    /* [FORCE-POLL] (A): redirect hugeSE's blind read (op5 -> $1A2F6) to
+					     * the POLLED read routine op4 ($1A388, read-with-Ticks-timeout) that
+					     * bigSE uses. Patch the op5 dispatch-table entry. */
+					    if (0 && ovl_sysrom_pos >= 0x40000000) {
+					      uint32_t a4 = REG_DA[12]; int16_t d0 = (int16_t)(REG_DA[0] & 0xFFFF);
+					      if (d0 == 0x14) {
+					        uint32_t ea = ADDRESS_68K(a4 + d0), ent = m68ki_read_32(state, ea);
+					        if ((ent & 0x00FFFFFF) == 0x0081A2F6) {
+					          m68ki_write_32(state, ea, (ent & 0xFF000000) | 0x0081A388);
+					          static int fp = 0; if (fp++ < 3) printf("[FORCE-POLL] op5 entry @$%06X $%08X -> op4-polled $1A388\n", ea, ent);
+					        }
+					      }
+					    }
+					  }
+					  /* [BLIND-FLAGS] the SCSI Mgr blind-vs-polled BUILD decision at $40815D40
+					   * (D0 = (-$136,A6) & (-$138,A6); bpl skips). Compare hugeSE vs bigSE to
+					   * find the differing capability bit that makes hugeSE emit blind ops. */
+					  if (ovl_sysrom_pos >= 0x800000 && rom_off == 0x15D40) {
+					    static int bf = 0;
+					    if (bf++ < 12) {
+					      uint32_t a6 = REG_DA[14];
+					      uint16_t f136 = m68ki_read_16(state, ADDRESS_68K(a6 - 0x136));
+					      uint16_t f138 = m68ki_read_16(state, ADDRESS_68K(a6 - 0x138));
+					      uint16_t sz   = m68ki_read_16(state, ADDRESS_68K(a6 + 0x8));
+					      printf("[BLIND-FLAGS] (-$136)=$%04X & (-$138)=$%04X = $%04X (bit15=%d) size($8,A6)=$%04X A6=$%08X\n",
+					             f136, f138, (uint16_t)(f136 & f138), ((f136 & f138) >> 15) & 1, sz, a6);
 					    }
 					  }
 					  /* PROBE: RM master-pointer store $40849642 (move.l a1,(a0)).
@@ -1321,6 +1657,58 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			          printf("\n"); }
 			      }
 			    } }
+			  /* [MDB-READ] poll the most-recently-armed disk read buffer for the HFS
+			   * MDB signature ($4244 'BD' at +0; or at +$200/+$400 if boot blocks were
+			   * read with it). Once it fills, dump the ON-DISK geometry — drNmAlBlks,
+			   * drAlBlkSiz, drAlBlSt — the ground truth to compare against the garbage
+			   * in-memory VCB (AlBlkSiz=$6E00) that MapFBlock later trips on. On-disk
+			   * sane + VCB garbage -> VCB-build corrupts it; on-disk ALSO garbage ->
+			   * the read position itself is dirty (the $0035 bug, one layer up). */
+			  { extern int mdb_arm, mdb_done, mdb_settle; extern uint32_t mdb_buf, mdb_pend;
+			    if (!mdb_done) {
+			      if (mdb_settle > 0) {
+			        /* a $4244 block was spotted; let the sequential byte-pump finish
+			         * filling it (the SCSI driver fills one byte per cycle) before we
+			         * sample, otherwise we read a half-pumped block (just the sig word). */
+			        if (--mdb_settle == 0) {
+			          static int md = 0;
+			          uint32_t base = mdb_pend;
+			          printf("[MDB-READ] base=$%06X drNmAlBlks(+$12)=$%04X drAlBlkSiz(+$14)=$%08X drAlBlSt(+$1C)=$%04X drVBMSt(+$0E)=$%04X drCrDate(+$02)=$%08X PC=$%08X\n",
+			                 base, m68ki_read_16(state, base + 0x12), m68ki_read_32(state, base + 0x14),
+			                 m68ki_read_16(state, base + 0x1C), m68ki_read_16(state, base + 0x0E),
+			                 m68ki_read_32(state, base + 0x02), REG_PC);
+			          printf("  raw[+0..+$26]:");
+			          for (int k = 0; k < 0x28; k += 2) printf(" %04X", m68ki_read_16(state, base + k));
+			          printf("\n");
+			          if (++md >= 4) mdb_done = 1;
+			        }
+			      } else if (mdb_arm) {
+			        uint32_t base = 0; int found = 0;
+			        for (uint32_t o = 0; o <= 0x400 && !found; o += 0x200) {
+			          if ((m68ki_read_16(state, mdb_buf + o) & 0xFFFF) == 0x4244) { base = mdb_buf + o; found = 1; }
+			        }
+			        if (found) { mdb_pend = base; mdb_settle = 20000; mdb_arm = 0; }
+			      }
+			    } }
+			  /* [NODE-DATA] after a high read's byte-pump settles, dump+validate the
+			   * filled buffer as an HFS B-tree node: ndFLink(+0)/ndBLink(+4)/ndType(+8,
+			   * $00=idx $01=hdr $FE=map $FF=leaf)/ndNHeight(+9)/ndNRecs(+$A). Valid node =
+			   * the high-sector read returned good data (as bigSE gets); garbage = the read
+			   * itself is wrong on hugeSE. */
+			  { extern int node_settle; extern uint32_t node_buf, node_pos;
+			    if (node_settle && (REG_PC - ovl_sysrom_pos) == 0x977E) {  /* dump the instant the read returns, before buffer reuse */
+			      static int nd = 0;
+			      uint32_t b = node_buf;
+			      uint8_t ndType = m68ki_read_8(state, b + 8);
+			      const char *tn = ndType==0x00?"index":ndType==0x01?"header":ndType==0xFE?"map":ndType==0xFF?"leaf":"??BAD??";
+			      printf("[NODE-DATA] pos=$%08X buf=$%06X ndFLink=$%08X ndBLink=$%08X ndType=$%02X(%s) ndNHeight=$%02X ndNRecs=$%04X\n",
+			             node_pos, b, m68ki_read_32(state,b+0), m68ki_read_32(state,b+4),
+			             ndType, tn, m68ki_read_8(state,b+9), m68ki_read_16(state,b+0x0A));
+			      printf("  raw[+0..+$1E]:");
+			      for (int k=0;k<0x20;k+=2) printf(" %04X", m68ki_read_16(state, b+k));
+			      printf("\n");
+			      node_settle = 0; (void)nd;  /* disarm; the next high read re-arms */
+			    } }
 			  uint32_t rom_off2 = REG_PC - ovl_sysrom_pos;
 			  if (rom_off2 == 0x2D5C) {  /* SetTrapAddress store: movel a0,a1@(0,d0:w) */
 			    uint32_t a0h = REG_DA[8], a1t = REG_DA[9], d0o = REG_DA[0] & 0xFFFF;
@@ -1437,6 +1825,43 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 						       REG_DA[12], REG_DA[13], REG_DA[14], REG_DA[15]);
 						boot_done = 1;
 					}
+				}
+			}
+
+			/* [CRASH822] bigSE one-shot: at the ACTUAL crash site $800822
+			 * (jsr (2,A6)) — this only executes on the CRASHING pass, when
+			 * (6,A6) matched $44/$C0 (i.e. A6 points at fill, not a real driver
+			 * struct). Dump full regs, what A6 points at, the trigger byte, the
+			 * stack chain, and the JSR/RTS call chain — to find which driver-init
+			 * loop entry landed A6 on $400000-pointing-at-fill, and where. */
+			{
+				extern uint32_t ovl_sysrom_pos;
+				static int crash_once = 0;
+				if (!crash_once && ovl_sysrom_pos == 0x800000
+				    && ADDRESS_68K(REG_PC) == 0x800822) {
+					crash_once = 1;
+					uint32_t a6 = ADDRESS_68K(REG_DA[14]);
+					uint32_t sp = ADDRESS_68K(REG_DA[15]);
+					uint16_t bbid = m68ki_read_16(state, a6);
+					printf("[BOOTBLK] bbEntry jsr(2,A6): A6=$%08X bbID=$%04X -> %s  (6,A6)=$%02X\n",
+					       a6, bbid, bbid == 0x4C4B ? "VALID boot blocks, jsr proceeds" : "FILL/garbage -> wild-exec",
+					       m68ki_read_8(state, a6 + 6));
+					printf("[CRASH822] D0-D7: %08X %08X %08X %08X %08X %08X %08X %08X\n",
+					       REG_DA[0], REG_DA[1], REG_DA[2], REG_DA[3],
+					       REG_DA[4], REG_DA[5], REG_DA[6], REG_DA[7]);
+					printf("[CRASH822] A0-A6: %08X %08X %08X %08X %08X %08X %08X\n",
+					       ADDRESS_68K(REG_DA[8]), ADDRESS_68K(REG_DA[9]), ADDRESS_68K(REG_DA[10]),
+					       ADDRESS_68K(REG_DA[11]), ADDRESS_68K(REG_DA[12]), ADDRESS_68K(REG_DA[13]),
+					       a6);
+					printf("[CRASH822] what A6 points at ($%08X): ", a6);
+					for (int i = 0; i < 8; i++) printf("%04X ", m68ki_read_16(state, a6 + i * 2));
+					printf("\n[CRASH822] SP=$%06X stack chain:\n", sp);
+					for (int i = 0; i < 14; i++)
+						printf("   [SP+%02X] $%08X\n", i * 4, m68ki_read_32(state, sp + i * 4));
+					{ FILE *f = fopen("/home/jas/pistorm/ram-dump.bin", "wb");
+					  if (f) { for (uint32_t a = 0x2000; a < 0x4200; a++) fputc(m68ki_read_8(state, a), f); fclose(f);
+						printf("[CRASH822] dumped loaded RAM $2000-$4200 to ram-dump.bin (dasmtool base $2000)\n"); } }
+					{ extern void branch_ring_dump(const char *); branch_ring_dump("at CRASH822 $800822"); }
 				}
 			}
 
@@ -1579,7 +2004,11 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 					}
 
 					/* Trigger 2: entry into loaded code region.
-					 * Rescan periodically — code may be reloaded. */
+					 * Rescan periodically — code may be reloaded.
+					 * Region 0 IS scanned (from $8000, skipping the lowmem
+					 * globals/vectors/trap-tables below): loaded System drivers/
+					 * patches live in low RAM < $10000 and reference stock ROM
+					 * (e.g. the $FC9A `JMP $41A2A0.L` = post-Welcome dirty jump). */
 					{
 						static uint8_t rgn_scanned[8];
 						static uint32_t rgn_scan_cycle = 0;
@@ -1587,7 +2016,7 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 						if (rgn >= 1 && rgn <= 7 && !rgn_scanned[rgn]) {
 							rgn_scanned[rgn] = 1;
 							scan_lo = rgn << 16;
-							scan_hi = scan_lo + 0x10000;
+							scan_hi = (rgn << 16) + 0x10000;
 							do_scan = 1;
 						}
 						/* Reset scan flags periodically so new code gets caught */
@@ -1597,6 +2026,7 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 						}
 					}
 
+					{ extern int r0_dirty; if (ovl_sysrom_pos == 0x800000 && pc24 >= 0x8000 && pc24 < 0x10000 && r0_dirty) { r0_dirty = 0; scan_lo = 0x8000; scan_hi = 0x10000; do_scan = 1; } }
 					if (do_scan) {
 						int patched = 0;
 						static const uint16_t abs_ops[] = {
@@ -2250,8 +2680,11 @@ void sigint_handler(int sig_num) {
     }
     printf("\n");
     aline_ring_dump();  /* last toolbox A-traps before the crash/stop */
+    branch_ring_dump("at SIGINT");  /* last absolute jumps — find stripped targets */
     printf("Current PC: %08X  SR: %04X\n",
-           m68k_get_reg(NULL, M68K_REG_PC) & 0xFFFFFF,
+           m68k_get_reg(NULL, M68K_REG_PC),  /* full 32-bit — do NOT mask: the old
+             * & 0xFFFFFF made correct $40xxxxxx PCs look 24-bit-"stripped" and sent
+             * us chasing a phantom stripped-pointer bug for multiple sessions. */
            m68k_get_reg(NULL, M68K_REG_SR));
     printf("D0=%08X D1=%08X D2=%08X D3=%08X\n",
            m68k_get_reg(NULL, M68K_REG_D0), m68k_get_reg(NULL, M68K_REG_D1),
@@ -2491,6 +2924,7 @@ switch_config:
   signal(SIGINT, sigint_handler);
   signal(SIGUSR1, sigusr1_handler);
   signal(SIGUSR2, sigusr2_handler);
+  branch_ring_arm(1);  /* live-flag 24-bit-stripped jump targets ([STRIP-JUMP]) */
 
   ps_reset_state_machine();
   ps_pulse_reset();
@@ -2622,22 +3056,26 @@ static uint32_t platform_res;
 unsigned int garbage = 0;
 
 static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t *res) {
-  /* Custom I/O handlers use 24-bit SE bus addresses; mapped buffers use
-   * full 32-bit so 32MB RAM doesn't shadow I/O (see huge-se VIA fix). */
-  uint32_t bus24 = addr & 0x00FFFFFF;
   switch (cfg->platform->id) {
     case PLATFORM_MAC:
-      /* Mac SE BBU clears OVL on first access to ROM/SCSI range */
-      if (ovl && bus24 >= (ovl_sysrom_pos & 0x00FFFFFF) &&
-          bus24 < (ovl_sysrom_pos & 0x00FFFFFF) + 0x100000) {
-        ovl = 0;
-        m68ki_cpu.ovl = 0;
-        printf("[MAC] OVL off (read from ROM/SCSI range %08X).\n", bus24);
-        handle_ovl_mappings_mac68k(cfg);
+      /* Mac SE BBU clears OVL on first access to the ROM range. With I/O now
+       * carried at full $40-prefixed physical (no 24-bit mask), the ROM lives
+       * at ovl_sysrom_pos ($40800000); accept the 24-bit form too so OVL can't
+       * get stuck during the transition. */
+      if (ovl) {
+        uint32_t a24 = addr & 0x00FFFFFF, rom24 = ovl_sysrom_pos & 0x00FFFFFF;
+        if ((addr  >= ovl_sysrom_pos && addr  < ovl_sysrom_pos + 0x100000) ||
+            (a24   >= rom24          && a24   < rom24 + 0x100000)) {
+          ovl = 0;
+          m68ki_cpu.ovl = 0;
+          printf("[MAC] OVL off (read from ROM range %08X).\n", addr);
+          handle_ovl_mappings_mac68k(cfg);
+        }
       }
-      /* Custom read handler (Big SE SCSI remap, etc.) — uses 24-bit addr */
+      /* Custom I/O handler — full $40xxxxxx physical; remaps to the SE bus via
+       * the configured iomap windows (custom_read_mac68k → se_bus_addr). */
       if (cfg->platform->custom_read &&
-          cfg->platform->custom_read(cfg, bus24, &target, type) != -1) {
+          cfg->platform->custom_read(cfg, addr, &target, type) != -1) {
         *res = target;
         return 1;
       }
@@ -2667,6 +3105,8 @@ unsigned int m68k_read_memory_8(unsigned int address) {
    * Mask to 24-bit only for the SE bus I/O path below. */
   uint32_t bus_addr = address & 0x00FFFFFF;
 
+  if ((address >= 0x02000000u && address < 0x40000000u) || address >= 0x41000000u) {
+    static int wr=0; if (wr++<24) printf("[WILD-RD8] addr=$%08X PC=$%08X\n", address, m68k_get_reg(NULL, M68K_REG_PC)); }
   if (platform_read_check(OP_TYPE_BYTE, address, &platform_res)) {
     return platform_res;
   }
@@ -2790,6 +3230,8 @@ unsigned int m68k_read_memory_8(unsigned int address) {
 unsigned int m68k_read_memory_16(unsigned int address) {
   uint32_t bus_addr = address & 0x00FFFFFF;
 
+  if ((address >= 0x02000000u && address < 0x40000000u) || address >= 0x41000000u) {
+    static int wr=0; if (wr++<24) printf("[WILD-RD16] addr=$%08X PC=$%08X\n", address, m68k_get_reg(NULL, M68K_REG_PC)); }
   if (platform_read_check(OP_TYPE_WORD, address, &platform_res)) {
     return platform_res;
   }
@@ -2809,6 +3251,8 @@ unsigned int m68k_read_memory_16(unsigned int address) {
 unsigned int m68k_read_memory_32(unsigned int address) {
   uint32_t bus_addr = address & 0x00FFFFFF;
 
+  if ((address >= 0x02000000u && address < 0x40000000u) || address >= 0x41000000u) {
+    static int wr=0; if (wr++<24) printf("[WILD-RD32] addr=$%08X PC=$%08X\n", address, m68k_get_reg(NULL, M68K_REG_PC)); }
   if (platform_read_check(OP_TYPE_LONGWORD, address, &platform_res)) {
     return platform_res;
   }
@@ -2841,25 +3285,24 @@ unsigned int m68k_read_memory_32(unsigned int address) {
 }
 
 static inline int32_t platform_write_check(uint8_t type, uint32_t addr, uint32_t val) {
-  uint32_t bus24 = addr & 0x00FFFFFF;
   switch (cfg->platform->id) {
     case PLATFORM_MAC: {
-      /* Debug: log first writes to VIA range */
-      static int via_dbg = 0;
-      if (bus24 >= 0xE00000 && bus24 <= 0xEFFFFF && via_dbg < 20) {
-        printf("[MAC-VIA] write addr=%08X val=%02X type=%d\n", bus24, val, type);
-        via_dbg++;
+      /* OVL clear — same as the read path: ROM at full ovl_sysrom_pos, 24-bit
+       * form accepted too so OVL can't get stuck during the transition. */
+      if (ovl) {
+        uint32_t a24 = addr & 0x00FFFFFF, rom24 = ovl_sysrom_pos & 0x00FFFFFF;
+        if ((addr >= ovl_sysrom_pos && addr < ovl_sysrom_pos + 0x100000) ||
+            (a24  >= rom24          && a24  < rom24 + 0x100000)) {
+          ovl = 0;
+          m68ki_cpu.ovl = 0;
+          printf("[MAC] OVL off (write to ROM range %08X).\n", addr);
+          handle_ovl_mappings_mac68k(cfg);
+        }
       }
-      if (ovl && bus24 >= (ovl_sysrom_pos & 0x00FFFFFF) &&
-          bus24 < (ovl_sysrom_pos & 0x00FFFFFF) + 0x100000) {
-        ovl = 0;
-        m68ki_cpu.ovl = 0;
-        printf("[MAC] OVL off (write to ROM/SCSI range %08X).\n", bus24);
-        handle_ovl_mappings_mac68k(cfg);
-      }
-      /* Custom write handler — uses 24-bit addr for I/O range matching */
+      /* Custom I/O write handler — full $40xxxxxx physical; remaps to the SE bus
+       * via the configured iomap windows (custom_write_mac68k → se_bus_addr). */
       if (cfg->platform->custom_write &&
-          cfg->platform->custom_write(cfg, bus24, val, type) != -1) {
+          cfg->platform->custom_write(cfg, addr, val, type) != -1) {
         return 1;
       }
       break;
@@ -2879,6 +3322,14 @@ static inline int32_t platform_write_check(uint8_t type, uint32_t addr, uint32_t
 
 void m68k_write_memory_8(unsigned int address, unsigned int value) {
   uint32_t bus_addr = address & 0x00FFFFFF;
+  /* [WILD-WR] a register holding a 24-bit-dirty value used as a RAM address:
+   * outside 32MB RAM ($0-$01FFFFFF) and the $40xxxxxx ROM/IO window. This is
+   * where the junk gets written into structures under flat IS=0 (a real SE's
+   * 24-bit bus would have masked it back into RAM). */
+  if ((address >= 0x02000000u && address < 0x40000000u) || address >= 0x41000000u) {
+    static int ww=0; if (ww++<24) printf("[WILD-WR8] addr=$%08X <- $%02X PC=$%08X\n", address, value & 0xFF, m68k_get_reg(NULL, M68K_REG_PC)); }
+  if (address >= 0x822u && address <= 0x827u) { static int sb=0; if (sb++<20) printf("[SCRNBASE-WR8] $%08X <- $%02X PC=$%08X\n", address, value & 0xFF, m68k_get_reg(NULL, M68K_REG_PC)); }
+  { uint32_t pc=m68k_get_reg(NULL,M68K_REG_PC); if (address>=0x01FFA700u && address<0x01FFFC80u && pc!=g_last_scrn_pc) { g_last_scrn_pc=pc; static int s=0; if(s++<80) printf("[SCRN-WR8] $%08X <- $%02X PC=$%08X\n", address, value&0xFF, pc); } }
   if (bus_addr >= 0x2420 && bus_addr <= 0x2423)
     printf("[MP2420-WR8] addr=$%06X <- $%02X  PC=$%08X\n", bus_addr, value & 0xFF, m68k_get_reg(NULL, M68K_REG_PC));
 
@@ -3050,6 +3501,10 @@ void m68k_write_memory_8(unsigned int address, unsigned int value) {
 
 void m68k_write_memory_16(unsigned int address, unsigned int value) {
   uint32_t bus_addr = address & 0x00FFFFFF;
+  if ((address >= 0x02000000u && address < 0x40000000u) || address >= 0x41000000u) {
+    static int ww=0; if (ww++<24) printf("[WILD-WR16] addr=$%08X <- $%04X PC=$%08X\n", address, value & 0xFFFF, m68k_get_reg(NULL, M68K_REG_PC)); }
+  if (address >= 0x822u && address <= 0x827u) { static int sb=0; if (sb++<20) printf("[SCRNBASE-WR16] $%08X <- $%04X PC=$%08X\n", address, value & 0xFFFF, m68k_get_reg(NULL, M68K_REG_PC)); }
+  { uint32_t pc=m68k_get_reg(NULL,M68K_REG_PC); if (address>=0x01FFA700u && address<0x01FFFC80u && pc!=g_last_scrn_pc) { g_last_scrn_pc=pc; static int s=0; if(s++<80) printf("[SCRN-WR16] $%08X <- $%04X PC=$%08X\n", address, value&0xFFFF, pc); } }
   if (bus_addr >= 0x2420 && bus_addr <= 0x2423)
     printf("[MP2420-WR16] addr=$%06X <- $%04X  PC=$%08X\n", bus_addr, value & 0xFFFF, m68k_get_reg(NULL, M68K_REG_PC));
 
@@ -3112,6 +3567,10 @@ void m68k_write_memory_16(unsigned int address, unsigned int value) {
 
 void m68k_write_memory_32(unsigned int address, unsigned int value) {
   uint32_t bus_addr = address & 0x00FFFFFF;
+  if ((address >= 0x02000000u && address < 0x40000000u) || address >= 0x41000000u) {
+    static int ww=0; if (ww++<24) printf("[WILD-WR32] addr=$%08X <- $%08X PC=$%08X\n", address, value, m68k_get_reg(NULL, M68K_REG_PC)); }
+  if (address >= 0x824u && address <= 0x827u) { static int sb=0; if (sb++<16) printf("[SCRNBASE-WR] $%08X <- $%08X PC=$%08X\n", address, value, m68k_get_reg(NULL, M68K_REG_PC)); }
+  { uint32_t pc=m68k_get_reg(NULL,M68K_REG_PC); if (address>=0x01FFA700u && address<0x01FFFC80u && pc!=g_last_scrn_pc) { g_last_scrn_pc=pc; static int s=0; if(s++<80) printf("[SCRN-WR32] $%08X <- $%08X PC=$%08X\n", address, value, pc); } }
   if (bus_addr >= 0x2420 && bus_addr <= 0x2423)
     printf("[MP2420-WR32] addr=$%06X <- $%08X  PC=$%08X\n", bus_addr, value, m68k_get_reg(NULL, M68K_REG_PC));
   /* RM map-chain low-mem globals: TopMapHndl/SysMapHndl/CurMap/SuperMario-terminator */

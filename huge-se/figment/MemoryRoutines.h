@@ -75,7 +75,7 @@
 	OSErr c_HSetRBit(Handle handle);
 	OSErr c_HClrRBit(Handle handle);
 	unsigned char c_HGetState(Handle handle);
-	OSErr c_HSetState(Handle handle, unsigned char flags);
+	OSErr c_HSetState(Handle handle, unsigned long flags);	/* long: see MemMgr.c — glue pushes flags as a long, char param read the wrong byte */
 
 
 	#ifdef StarTrek

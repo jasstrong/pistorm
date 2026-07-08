@@ -11,7 +11,7 @@ CFLAGS = -m68030 -O2 -fno-builtin -DpatchedIn \
          -include figment_shim.h \
          -I. -I"$(R68INC)" -I"$(SMINT)"
 
-OBJS = MemMgr.o MemMgrInternal.o MemMgrHeap.o MemMgrUtils.o figment_stubs.o figment_glue.o
+OBJS = MemMgr.o MemMgrInternal.o MemMgrHeap.o MemMgrUtils.o MemMgrDebug.o figment_stubs.o figment_glue.o
 
 all: figment.bin
 

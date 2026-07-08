@@ -320,6 +320,14 @@ stdHeap* CreateNewHeap(GrowZoneProcPtr pgrowZone, long numMasters, Ptr limit, Pt
 	heapPtr->lastFree = firstRealBlock;
 	heapPtr->favoredFree = firstRealBlock;
 	heapPtr->lowestRemovableBlock = firstRealBlock;
+	heapPtr->validationFlags = checkHeap | checkHeapIn;  /* run _CheckHeap on MM entry+exit.
+	                                  [hugeSE 2026-06-27] RE-CONFIRMED load-bearing: setting =0
+	                                  AGAIN broke the boot (display corruption, jas saw it) — same
+	                                  regression as 06-19, NOT the gpclk thing. _CheckHeap's walk
+	                                  is doing something the boot depends on (or it halts on a real
+	                                  corruption that otherwise scribbles the heap). DO NOT disable.
+	                                  Its O(n^2) ramp (36%+ late boot) must be fixed by making it
+	                                  CHEAPER / less frequent, not by turning it off. */
 	heapPtr->gzProc = pgrowZone;
 	heapPtr->heapType = heapDouJour;
 	
@@ -532,6 +540,14 @@ stdHeap* MoveHeapHeaderHigh(stdHeap* oldHeap)
 	
 	/* we want &newHeap->spoofBlock + spoofBlock.size to point to first REAL block for heapwalkers */
 	(newHeap->spoofBlock).size = kBackPtrSize + (ulong)newFree - (ulong)&newHeap->spoofBlock;
+
+	/*
+	 *	Born-32 (huge-se) fix: reset the first block's back link to the spoof
+	 *	pointer, exactly as CreateNewHeap does.  Without this it stays 0 (set
+	 *	above), so KillBlock's coalescing back-walk on a full heap falls off the
+	 *	bottom into block 0 and spins — which hung the system-heap grow.
+	 */
+	newFree->back = (void*)((Ptr)&newHeap->spoofBlock - kBackPtrSize);
 
 	newHeap->firstFreeMP = 0;
 	#ifdef implemented_discontiguous_heaps

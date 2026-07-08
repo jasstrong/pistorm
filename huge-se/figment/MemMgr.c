@@ -643,6 +643,7 @@ OSErr c_NewHandle(Handle* theHandle, unsigned long trapWord, Size requestedSize)
 		DbgCheckHeap(curHeap);
 		*theHandle = newMasterPtr;
 		FIG_DBG("  NewHandle OK mp=", (unsigned long)newMasterPtr);
+		FIG_DBG("  NewHandle blk=", (unsigned long)newBlock->data);
 		return LMSetMemErr(noErr);
 		}
 	}
@@ -1163,7 +1164,8 @@ OSErr c_SetHandleSize(Handle handle, Size requestedSize)
 	
 		DbgMasterPtrCheck(handle, curHeap);
 		DbgClientCheckHeap(curHeap);
-		
+
+
 	/* Align the requested size up to a nice multiple */
 		reqBlockSize = AlignUp(requestedSize + kBlockOverhead);
 		
@@ -1193,13 +1195,15 @@ OSErr c_SetHandleSize(Handle handle, Size requestedSize)
 		if (blockIsPurgable = IsUnlockedPurgableHandle(blockHeader))
 			MarkBlockNonPurgable(blockHeader, curHeap)
 
-		/* call SetBlockSize to change the size of the block */		
+		/* call SetBlockSize to change the size of the block */
 		LMSetGZRootHnd(handle);		/* incase growzone proc gets called */
 		LMSetGZRootPtr(*handle);	/* because the ptr exists (as opposed to reallocating it */
+
 		blockHeader = (handleBlock*) SetBlockSize((stdBlock*)blockHeader, reqBlockSize, curHeap);
+
 		LMSetGZRootHnd(nil);
 		LMSetGZRootPtr(nil);
-		
+
 		if (blockHeader)
 			{
 			blockHeader->sizeDelta = blockHeader->size - requestedSize - kPsuedoBlockSize;
@@ -3249,7 +3253,13 @@ Locked => Locked
 						Purgable		->	NonPurgable		No change			No change
 						Purgable		->	Purgable			No change			No change
 */
-OSErr c_HSetState(Handle handle, unsigned char newFlags)
+/* newFlags is a LONG on purpose: the hand-written glue (fig_HSetState) pushes the
+ * flags as move.l %d0,-(%sp) with the value in the LOW byte. With an
+ * `unsigned char` parameter gcc reads the FIRST byte of the 4-byte arg slot
+ * (always $00), so every HSetState silently cleared mpFlags — no resource was
+ * ever locked/purgeable, and figment compaction moved executing code resources
+ * (the post-Welcome F-line crash loop). A long parameter reads the full slot. */
+OSErr c_HSetState(Handle handle, unsigned long newFlags)
 	{
 	stdHeap*			curHeap;
 	handleBlock*	blockHeader;	/* client's text pointer, or blockHeader */

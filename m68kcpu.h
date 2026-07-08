@@ -1295,14 +1295,25 @@ static __attribute__((noinline)) uint m68ki_read_8_fc(m68ki_cpu_core *state, uin
 	address = ADDRESS_68K(address);
 
 
+
 	address_translation_cache *cache = &state->fc_read_translation_cache;
 	if(cache->offset && address >= cache->lower && address < cache->upper)
 	{
+		{ extern uint32_t ovl_sysrom_pos; uint32_t _a = address & 0x00FFFFFF;
+		  if (ovl_sysrom_pos >= 0x40000000 && _a >= 0x5FF000 && _a < 0x600000) {
+		    static int _c = 0;
+		    if (_c++ < 20) printf("[SCSI-RD-CACHED] addr=$%08X served from RAM cache [$%08X-$%08X) val=$%02X PC=$%08X *** STALE I/O READ (PMMU CI not honored) ***\n",
+		       address, cache->lower, cache->upper, cache->offset[address - cache->lower], ADDRESS_68K(REG_PC)); } }
 		return cache->offset[address - cache->lower];
 	}
 
 	for (int i = 0; i < state->read_ranges; i++) {
 		if(address >= state->read_addr[i] && address < state->read_upper[i]) {
+			{ extern uint32_t ovl_sysrom_pos; uint32_t _a = address & 0x00FFFFFF;
+			  if (ovl_sysrom_pos >= 0x40000000 && _a >= 0x5FF000 && _a < 0x600000) {
+			    static int _m = 0;
+			    if (_m++ < 20) printf("[SCSI-RD-RAMRANGE] addr=$%08X in map range [$%08X-$%08X) val=$%02X PC=$%08X *** I/O READ HITTING RAM MAP ***\n",
+			       address, state->read_addr[i], state->read_upper[i], state->read_data[i][address - state->read_addr[i]], ADDRESS_68K(REG_PC)); } }
 			SET_FC_TRANSLATION_CACHE_VALUES
 			return state->read_data[i][address - state->read_addr[i]];
 		}
@@ -1429,6 +1440,14 @@ static inline uint m68ki_read_32_fc(m68ki_cpu_core *state, uint address, uint fc
 /* Buffer snoop — detect when watched address becomes non-zero */
 
 // M68KI_WRITE_8_FC
+/* Big SE region-0 dirty flag: any write into the low-RAM code window
+ * ($8000-$10000) marks it dirty, so the autopatcher rescans that small window
+ * once on the next entry — catching loaded-driver stock-ROM refs regardless of
+ * write size/order. Cheap: one range compare per write. */
+#define R0_MARK_DIRTY(addr) do { extern uint32_t ovl_sysrom_pos; extern int r0_dirty; \
+	uint32_t _rd = (addr) & 0x00FFFFFF; \
+	if (ovl_sysrom_pos == 0x800000 && _rd >= 0x8000 && _rd < 0x10000) r0_dirty = 1; } while (0)
+
 static inline void m68ki_write_8_fc(m68ki_cpu_core *state, uint address, uint fc, uint value)
 {
 	m68ki_set_fc(fc); /* auto-disable (see m68kcpu.h) */
@@ -1444,6 +1463,25 @@ static inline void m68ki_write_8_fc(m68ki_cpu_core *state, uint address, uint fc
 	/* 68000/010/EC020: mask to 24-bit before fast-path range checks */
 	address = ADDRESS_68K(address);
 
+	R0_MARK_DIRTY(address);
+
+	/* [SCSI-WR8] hugeSE: any write whose 24-bit addr is the 5380 range — is it
+	 * the $40-prefixed I/O form (→custom_write→chip) or a bare $00 form that the
+	 * PMMU maps into low RAM (swallowed, never reaches the 5380)? PC names the
+	 * issuer (ROM driver $1A4xx vs RAM copy $434xxx). */
+	{ extern uint32_t ovl_sysrom_pos;
+	  if (ovl_sysrom_pos >= 0x800000) {
+	    uint32_t _a24 = address & 0x00FFFFFF;
+	    /* both configs' 5380 register windows: hugeSE $5FFxxx (from $405FFxxx),
+	     * bigSE $8FFxxx — both map to SE-bus $5FFxxx. Log reg#+val for a diff. */
+	    if ((_a24 >= 0x5FF000 && _a24 < 0x600000) || (_a24 >= 0x8FF000 && _a24 < 0x900000)) {
+	      static int _sw = 0;
+	      if (_sw++ < 120)
+	        printf("[SCSI-WR8] reg=%u val=$%02X full=$%08X PC=$%08X\n",
+	               (unsigned)((_a24 >> 4) & 7), (unsigned)(value & 0xFF), address, ADDRESS_68K(REG_PC));
+	    }
+	  }
+	}
 
 
 	address_translation_cache *cache = &state->fc_write_translation_cache;
@@ -1539,6 +1577,7 @@ static inline void m68ki_write_16_fc(m68ki_cpu_core *state, uint address, uint f
 
 	/* 68000/010/EC020: mask to 24-bit before fast-path range checks */
 	address = ADDRESS_68K(address);
+	R0_MARK_DIRTY(address);
 
 	if (address >= 0x17600 && address < 0x17E00) {
 		extern int dbg_codewin; extern unsigned int dbg_codewin_n;
@@ -1550,10 +1589,18 @@ static inline void m68ki_write_16_fc(m68ki_cpu_core *state, uint address, uint f
 		if (dbg_codewin && (value & 0xFFFF) == 0xFFFF) {
 			static int clobber_dumped = 0;
 			if (!clobber_dumped) {
+				extern void branch_ring_dump(const char *why);
 				clobber_dumped = 1;
 				uint32_t sp = REG_DA[15];
 				printf("[CLOBBER] $%06X <- $FFFF  PC=$%08X  SP=$%08X  A5=$%08X\n",
 				       address, ADDRESS_68K(REG_PC), sp, REG_DA[13]);
+				printf("[CLOBBER] A0-A7: %08X %08X %08X %08X %08X %08X %08X %08X\n",
+				       REG_DA[8], REG_DA[9], REG_DA[10], REG_DA[11],
+				       REG_DA[12], REG_DA[13], REG_DA[14], REG_DA[15]);
+				printf("[CLOBBER] D0-D7: %08X %08X %08X %08X %08X %08X %08X %08X\n",
+				       REG_DA[0], REG_DA[1], REG_DA[2], REG_DA[3],
+				       REG_DA[4], REG_DA[5], REG_DA[6], REG_DA[7]);
+				branch_ring_dump("at [CLOBBER] (bad-A6 movem into resource code)");
 				printf("[CLOBBER] stack:");
 				for (int i = 0; i < 24; i++)
 					printf(" %08X", m68ki_read_32(state, (sp + i*4) & 0x00FFFFFF));
@@ -1642,6 +1689,7 @@ static inline void m68ki_write_32_fc(m68ki_cpu_core *state, uint address, uint f
 
 	/* 68000/010/EC020: mask to 24-bit before fast-path range checks */
 	address = ADDRESS_68K(address);
+	R0_MARK_DIRTY(address);
 
 	/* ADB queue-init watch: catch any write to the deferred-queue control block
 	 * (ABusVars $2B68 +316/320/324/328 = $2CA4/$2CA8/$2CAC/$2CB0) — does the ADB
@@ -2006,6 +2054,47 @@ static inline void m68ki_jump(m68ki_cpu_core *state, uint new_pc)
 			branch_strip_budget--;
 			printf("[STRIP-JUMP] src=$%08X ir=$%04X -> dst=$%08X (want $40%06X)\n",
 			       ADDRESS_68K(REG_PPC), REG_IR, new_pc, new_pc & 0xFFFFFF);
+		}
+		/* [ROMREF-JMP scaffold REMOVED 2026-07-07] — it was redirecting the
+		 * legitimate boot-block execution (ROM jsr's bbEntry at $400002; the
+		 * boot blocks load to $400000, bbID=$4C4B) to $800002 and Sad-Mac'ing.
+		 * That "one ROM-window jump" is NORMAL boot, not a stock-ROM ref. */
+		/* [DIRTY-JMP] bigSE one-shot: the FIRST control transfer whose target
+		 * holds the $6DB6DB6D RAM-fill = a dirty pointer sending the System into
+		 * unformatted RAM (the post-Welcome crash). Fires BEFORE the wild loop,
+		 * so src PC + the address registers name the dirty pointer's origin, and
+		 * the branch ring is still the clean pre-crash call chain. */
+		{
+			extern uint32_t ovl_sysrom_pos;
+			static int dirty_once = 0;
+			int dirty = 0;
+			const char *why = "";
+			if (!dirty_once && ovl_sysrom_pos == 0x800000 && (new_pc & 0xFFFFFF) < 0x7F0000) {
+				/* bigSE (24-bit): target in low RAM holds the fill. */
+				uint32_t w = m68ki_read_32(state, new_pc);
+				if (w == 0x6DB6DB6Du || w == 0xDB6D6DB6u) { dirty = 1; why = "fill"; }
+			} else if (!dirty_once && ovl_sysrom_pos == 0x40800000) {
+				/* hugeSE: a dirty jump is either (a) a junk high byte sending
+				 * new_pc into the unmapped gap $02000000-$40800000 (e.g. the
+				 * recorded $302200D2), or (b) a low-RAM target holding the
+				 * $6DB6DB6D fill. Read only below the video WTC window. */
+				if (new_pc >= 0x02000000 && new_pc < 0x40800000) {
+					dirty = 1; why = "gap/junk-hi";
+				} else if (new_pc < 0x01FF0000) {
+					uint32_t w = m68ki_read_32(state, new_pc);
+					if (w == 0x6DB6DB6Du || w == 0xDB6D6DB6u) { dirty = 1; why = "fill"; }
+				}
+			}
+			if (dirty) {
+				dirty_once = 1;
+				/* raw regs/PC — do NOT mask, the junk high byte is the evidence */
+				printf("[DIRTY-JMP] first dirty jump (%s): src=$%08X ir=$%04X -> dst=$%08X\n",
+				       why, REG_PPC, REG_IR, new_pc);
+				printf("  A0-A7: %08X %08X %08X %08X %08X %08X %08X %08X\n",
+				       REG_DA[8], REG_DA[9], REG_DA[10], REG_DA[11],
+				       REG_DA[12], REG_DA[13], REG_DA[14], REG_DA[15]);
+				branch_ring_dump("at DIRTY-JMP (first dirty jump)");
+			}
 		}
 	}
 	REG_PC = new_pc;
@@ -2942,6 +3031,11 @@ static inline void m68ki_exception_illegal(m68ki_cpu_core *state)
 	printf("  A: %08X %08X %08X %08X %08X %08X %08X %08X\n",
 		REG_DA[8], REG_DA[9], REG_DA[10], REG_DA[11],
 		REG_DA[12], REG_DA[13], REG_DA[14], REG_DA[15]);
+	/* [ILL-CHAIN] one-shot: dump the JSR/RTS branch ring at the FIRST illegal
+	 * instruction — the last absolute transfer is the dirty jump into RAM
+	 * garbage (the post-Welcome crash), and its src PC names the culprit. */
+	{ static int ill_chain_once = 0; if (!ill_chain_once) { ill_chain_once = 1;
+		branch_ring_dump("at first ILLEGAL (post-Welcome dirty jump)"); } }
 	{
 		uint32_t fpc = ADDRESS_68K(REG_PPC);
 		printf("  Code @%08X: ", fpc);

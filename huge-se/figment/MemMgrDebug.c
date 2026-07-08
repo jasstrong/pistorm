@@ -109,24 +109,9 @@ static void CopyBytes(const void* source, void* dest, long length)
 
 void DbgMessage(const char *str, long data)
 {
-	char*	s = (char *)str;
-	char	dataStr[256];
-	long	count = 7, length;
-
-	while (*s++); /* find end of c string */
-	length = s - str;
-	dataStr[0] = length + 9;
-	CopyBytes(str, &dataStr[1], length);
-	s = &dataStr[length];
-	*s++ = ' ';
-	*s++ = ' ';
-	do {
-		char c = (data >> (count << 2) & 0x0f) + '0';
-		if( c > '9' )
-			c += 'a' - '9' - 1;
-		*s++ = c;
-	} while (--count >= 0);
-	DebugStr((void *) dataStr);
+	/* Route Figment's internal heap-validation messages to the emulator
+	 * console via the paravirt $A0FE trap instead of DebugStr ($ABFF). */
+	figment_debug(str, (unsigned long)data);
 }
 
 

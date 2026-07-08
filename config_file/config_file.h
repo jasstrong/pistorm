@@ -8,6 +8,7 @@
 #include <unistd.h>
 
 #define MAX_NUM_MAPPED_ITEMS 8
+#define MAX_IO_REMAP 8
 #define SIZE_KILO 1024
 #define SIZE_MEGA (1024 * 1024)
 #define SIZE_GIGA (1024 * 1024 * 1024)
@@ -49,6 +50,7 @@ typedef enum {
   CONFITEM_PLATFORM,
   CONFITEM_SETVAR,
   CONFITEM_KBFILE,
+  CONFITEM_IOMAP,
   CONFITEM_NUM,
 } config_items;
 
@@ -83,6 +85,19 @@ struct emulator_config {
   unsigned int loop_cycles;
   unsigned int mapped_low, mapped_high;
   unsigned int custom_low, custom_high;
+
+  /* Configurable SE-bus I/O remap windows. A physical address in [lo,hi)
+   * is translated to the real bus as: bus = bus_base + (addr - lo).
+   * No window matches → identity pass-through. One shim serves every variant:
+   *   ordinary SE : (no windows)                       identity
+   *   bigSE       : { $880000, $900000, $580000 }       relocated SCSI
+   *   hugeSE      : { $40000000, $41000000, $0 }         subtract $40000000
+   *   68020 board : its own windows (no width assumption)
+   * cfg directive: `iomap <lo> <hi> <bus_base>` (hex). */
+  unsigned int io_remap_count;
+  unsigned long io_remap_lo[MAX_IO_REMAP];
+  unsigned long io_remap_hi[MAX_IO_REMAP];
+  unsigned long io_remap_bus[MAX_IO_REMAP];
 };
 
 struct platform_config {

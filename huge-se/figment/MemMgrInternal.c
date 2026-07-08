@@ -535,11 +535,14 @@ static freeBlock* SlideBlocksUp(stdBlock* firstBlock, freeBlock* bubbleFree, std
 	IfIntDebugMsg(!IsFreeBlock(bubbleFree),"end range is not free", bubbleFree);
 	IfIntDebugMsg(firstBlock == nil,"firstBlock is nil", curHeap);
 	
-	/* if the block in front of the range is free, then set it as the boundary */	
+	/* if the block in front of the range is free, then set it as the boundary */
 	if (IsFreeBlock(firstBlock->back))
 		firstBlock = firstBlock->back;
-	
-	/* loop,  slide relocatables up and letting the freeblock bubble down */	
+
+	/* [SLIDEUP-FIXED probe 2026-06-18] REMOVED — confirmed SlideBlocksUp is NOT the
+	 * ABusVars corruptor (probe fired 0 times while the crash reproduced). */
+
+	/* loop,  slide relocatables up and letting the freeblock bubble down */
 	do
 		{
 		IfIntDebugMsg(!IsUnlockedBlock(workBlock), "workBlock not relocatable", workBlock);
@@ -1067,7 +1070,53 @@ Boolean ExtendApplLimit(blockSize_t sizeNeeded, stdHeap* curHeap)
 
 
 /*
- *	Scans circular double linked list looking for a free block. Starts at favored free. 
+ *	Born-32 (huge-se): grow a non-app (system) heap up to newEnd, in figment's
+ *	own format.  The Mac SE ROM's 24-bit system-heap-grow ($4080AE20) splices a
+ *	new free block into the zone in ROM MM format, corrupting figment's 32-bit
+ *	zone; patch-rom.py patches that routine to call this instead.
+ *
+ *	The system heap was not built by CreateNewHeap, so its first block's `back`
+ *	link is nil instead of pointing at the spoof block in the zone header.  That
+ *	makes ExtendHeapLimit's KillBlock coalescing back-walk fall off the bottom
+ *	into block 0 and spin, so restore the spoof back-link (exactly as
+ *	CreateNewHeap does) before extending.
+ */
+void c_GrowSysZone(stdHeap* curHeap, void* newEnd);
+void c_GrowSysZone(stdHeap* curHeap, void* newEnd)
+	{
+	stdBlock*	firstBlock = (stdBlock*) curHeap->heapStart;
+	ptrBlock*	newTrailBlock;
+
+	/*
+	 *	born-32 (huge-se) ApplZone-overlap fix.  The SE ROM's system-heap-grow
+	 *	($4080A352/$A378) re-places ApplZone right above SysZone's current top
+	 *	(ApplZone base = SysZone->oldBackLimit + $C) EVERY time the system heap
+	 *	grows.  Incremental growth therefore creates ApplZone low (e.g. $24000),
+	 *	then grows SysZone up THROUGH that vacated region — the old ApplZone block
+	 *	headers survive inside SysZone's newly-absorbed space and corrupt the heap
+	 *	walk (a KillBlock coalesce extends a free block onto the stale $24004 block,
+	 *	whose successor $25604 is unformatted → _CheckHeap loops forever).
+	 *
+	 *	Fix: grow the system heap to a generous fixed ceiling on the FIRST grow so
+	 *	ApplZone is placed ONCE, high, above SysZone's max extent.  Every later ROM
+	 *	grow-request is then <= the current top and becomes a no-op, so ApplZone is
+	 *	never re-placed low and no stale headers ever land in SysZone's range.
+	 */
+	#define kBornSysZoneCeiling ((void*)0x00100000UL)	/* 1 MB — ApplZone lands just above this */
+	if ((unsigned long)newEnd < (unsigned long)kBornSysZoneCeiling)
+		newEnd = kBornSysZoneCeiling;
+
+	if (firstBlock->back == nil)
+		firstBlock->back = (void*)((Ptr)&curHeap->spoofBlock - kBackPtrSize);
+
+	newTrailBlock = (ptrBlock*) AlignDown(newEnd);
+	if (newTrailBlock > (ptrBlock*) curHeap->backLimit)
+		ExtendHeapLimit(newTrailBlock, curHeap);
+	}
+
+
+/*
+ *	Scans circular double linked list looking for a free block. Starts at favored free.
  *	As a side effect, if a block is found, favoredFree is set to that block. 
  *	If no block is found, it returns nil.
  */
@@ -2683,16 +2732,39 @@ freeBlock* KillBlock(stdBlock* blockHeader, stdHeap* curHeap)
 			{
 			/* scan downward until a free block is found */
 			freeBlock* workBlock = (freeBlock*)blockHeader;
-			
+
 			do
 				{
 				workBlock = workBlock->back;
 				IfIntDebugMsg(workBlock <= (freeBlock*)(BACK(((stdBlock*)(curHeap->lowestRemovableBlock)))),
 											"we reached front of heap", workBlock);
 				}
-			while (!IsFreeBlock(workBlock));
-			
-			SetFreeChain((freeBlock*)blockHeader, workBlock, workBlock->nextFree);
+			while (workBlock != nil && !IsFreeBlock(workBlock));	/* never follow a nil back ptr */
+
+			if (workBlock == nil)
+				{
+				/* The scan ran off the front of the heap without finding a free
+				 * block — the free list is inconsistent (e.g. a stale firstFree
+				 * pointing at an already-allocated block).  This should never
+				 * happen: PANIC loudly, then recover by treating blockHeader as
+				 * the lowest free block (chain to the dummy, same as above). */
+				FIG_DBG("PANIC: KillBlock free-scan hit nil back ptr (allocator left bad free list)", (unsigned long)blockHeader);
+				{
+				/* Insert blockHeader at the head of the free chain.  Guard the
+				 * stale case where firstFree already points at blockHeader: using
+				 * it as our own 'next' would self-loop the chain.  Skip to its
+				 * successor, and if that is still us (or nil) fall back to the
+				 * dummy (blockHeader becomes the sole free block). */
+				freeBlock* succ = curHeap->firstFree;
+				if (succ == (freeBlock*)blockHeader)
+					succ = ((freeBlock*)blockHeader)->nextFree;
+				if (succ == nil || succ == (freeBlock*)blockHeader)
+					succ = DummyFree(curHeap);
+				SetFreeChain((freeBlock*)blockHeader, DummyFree(curHeap), succ);
+				}
+				}
+			else
+				SetFreeChain((freeBlock*)blockHeader, workBlock, workBlock->nextFree);
 			}
 		/* blockHeader->size & blockHeader->back stay the same */
 		#ifndef small_freeBlock_headers

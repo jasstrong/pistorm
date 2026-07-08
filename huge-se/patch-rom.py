@@ -107,7 +107,12 @@ def build_combo_resources(rom, combo_rom_off):
     MAX_COM_IND = 1   # combo indices 0-1 valid (d3 forced to 1 in RM)
     VERSION = 1
     MEM_HEAD_SZ = 8   # 8-byte memory block header (old MM format)
-    MP_BASE = 168     # zone_header(120) + MoreMasters_block(32) + ptrBlock_header(16)
+    # MPB offset within the ROZ zone. The old-MM value (168=$A8) is WRONG for
+    # figment's 32-bit zone: at runtime the RM's _NewPtr MPB lands at zone+$1E0
+    # (measured: trueROZ=$2338, MPB($1F40)=$2518). Using $A8 made RelHandles
+    # $138 too low, dropping resource #8 (.Sony) onto ROMMapHndl's slot ($2420)
+    # and clobbering the map handle -> RM walks driver code as a map -> hang.
+    MP_BASE = 0x1E0   # figment ROZ: MPB at zone+$1E0 (DoRomEntry uses HandleZone+RelHandle)
 
     # Structure table: 10 bytes
     #   [0-3]: offset from RomBase to first entry
@@ -235,7 +240,7 @@ def patch_rom(infile, outfile):
             if patch32(off + 2, 0x400000, 0x40800000, size=rom_size * 2):
                 log[-1] = f"  {name:10s} " + log[-1].split(': ', 1)[1]
             # SCSI/IWM: $580000-$5FFFFF → $40880000-$408FFFFF (big-se remap + $40 prefix)
-            if patch32(off + 2, 0x580000, 0x40880000, size=0x80000):
+            if patch32(off + 2, 0x580000, 0x40580000, size=0x80000):
                 log[-1] = f"  {name:10s} " + log[-1].split(': ', 1)[1]
             # IWM VPA path: $DFE000-$DFFFFF → $40DFE000-$40DFFFFF
             if patch32(off + 2, 0xDFE000, 0x40DFE000, size=0x2000):
@@ -255,7 +260,7 @@ def patch_rom(infile, outfile):
             name = moveq_imm[opcode]
             if patch32(off + 2, 0x400000, 0x40800000, size=rom_size * 2):
                 log[-1] = f"  {name:10s} " + log[-1].split(': ', 1)[1]
-            if patch32(off + 2, 0x580000, 0x40880000, size=0x80000):
+            if patch32(off + 2, 0x580000, 0x40580000, size=0x80000):
                 log[-1] = f"  {name:10s} " + log[-1].split(': ', 1)[1]
             if patch32(off + 2, 0xDFE000, 0x40DFE000, size=0x2000):
                 log[-1] = f"  {name:10s} " + log[-1].split(': ', 1)[1]
@@ -528,6 +533,39 @@ def patch_rom(infile, outfile):
     patches += 1
     print(f"=== SERD HLock: JSR ${serd_stub_vaddr:08X} at $07B4 ===")
 
+    # === Boot-icon screen dest: use runtime ScrnBase, not the IS=8 video base ===
+    # HAPPYMAC/boot-icon blits hardcode the screen dest as an absolute address
+    # (e.g. $7FCB5E).  That's the original 4MB value $3FCB5E relocated by the
+    # VBUF pass to the IS=8 8MB-top video base — but these icons are drawn
+    # AFTER MODE32, when the framebuffer lives at the top of physical RAM
+    # (ScrnBase = MemTop - $5900).  A static base can't serve both phases, so
+    # replace each "moveal #addr,A2" with a JSR to a stub that loads the live
+    # ScrnBase ($0824) and adds the (phase-independent) centering offset.
+    # Boot-icon / Sad-Mac screen dests are hardcoded to the IS=8 8MB-top video
+    # base ($7Fxxxx); but the icons draw AFTER MODE32, when the framebuffer is
+    # at the 32MB top (ScrnBase $01FFA700 = MemTop $02000000 - $5900, confirmed
+    # at runtime).  Repoint each absolute screen address in place, $7F -> $1FF
+    # (new = (old & $FFFF) | $01FF0000).  Handles both "moveal #imm,A2" (247C)
+    # and "lea imm.L,A2" (45F9).  Covers Happy Mac AND the Sad Mac screen-clear
+    # + hex-code plotting in CRITERR ($10A0).
+    _icon_sites = [
+        (0x1188, 0x247C, 0x007FCB5E),  # HAPPYMAC icon
+        (0x1196, 0x247C, 0x007FCCDF),  # HAPPYMAC symbol
+        (0x0F4A, 0x247C, 0x007FCB5E),  # boot/Sad-Mac icon
+        (0x0F5C, 0x247C, 0x007FCF1F),  # boot/Sad-Mac symbol
+        (0x10A0, 0x45F9, 0x007FA700),  # CRITERR: screen-clear + hex-code base
+    ]
+    _icon_done = 0
+    for _site, _op, _old in _icon_sites:
+        _new = (_old & 0x0000FFFF) | 0x01FF0000
+        if rom[_site:_site+6] == struct.pack('>HI', _op, _old):
+            rom[_site:_site+6] = struct.pack('>HI', _op, _new)
+            _icon_done += 1
+            patches += 1
+        else:
+            print(f"  WARN: screen site ${_site:05X} mismatch (got {rom[_site:_site+6].hex()}), skipped")
+    print(f"=== Boot/Sad-Mac screen dests → $01FFxxxx: {_icon_done}/{len(_icon_sites)} sites ===")
+
     # === boot32: replace the SE ROM's 24-bit RAM test / sizing (first-half) ===
     # The power-on diagnostic dispatcher (entered via $40800044 -> $40801BDE)
     # calls leaf routines whose result D6 it checks with `tst.l d6; bne SadMac`
@@ -568,6 +606,51 @@ def patch_rom(infile, outfile):
     rom[0x07CC] = 0xFF
     patches += 1
     print("=== Lo3Bytes init patched to $FFFFFFFF (32-bit clean) ===")
+
+    # === FXM MapFBlock: add.w -> add.l (SuperMario 3/24/87 fix) ===
+    # $4080783E in MapFBlock adds the intra-alloc-block physical-block offset
+    # (d0) into the physical start block (d3) with a 16-bit `add.w d0,d3`
+    # ($D640), losing carry into the high word — 24-bit-dirty.  SuperMario
+    # OS/HFS/FXM.a fixed this to `ADD.L D0,D3` ($D680) on 3/24/87.  Harmless on a
+    # 24-bit SE; under flat IS=0 the lost carry corrupts the physical block.
+    assert rom[0x783E:0x7840] == b'\xD6\x40', "MapFBlock add.w site mismatch"
+    rom[0x783E:0x7840] = b'\xD6\x80'
+    patches += 1
+    print("=== FXM MapFBlock add.w->add.l patched (32-bit clean) ===")
+
+    # === Route the ROM's system-heap-grow ($AE20) into figment ===
+    # When the system heap fills, this ROM routine (entry: A0=new heap end,
+    # A6=curHeap) splices a new free block at the old end into the zone using the
+    # ROM Memory Manager's OWN 24-bit block/free-list format ($4080AAD2 /
+    # $4080B03A) — which does NOT match figment's 32-bit zone, corrupting
+    # figment's free list / sentinels.  It's a direct (non-trap) call so figment
+    # never sees it.  Replace the routine body with a call to figment's
+    # c_GrowSysZone(curHeap, newEnd) — it restores the system heap's spoof
+    # back-link (which was never set, so KillBlock's coalescing back-walk would
+    # otherwise fall off into block 0) and then ExtendHeapLimit's the zone in
+    # figment's own format. Preserve all regs; RTS.
+    import subprocess as _sp
+    _nm = os.path.expanduser('~/Retro68-build/toolchain/bin/m68k-apple-macos-nm')
+    _figelf = os.path.join(os.path.dirname(__file__), 'figment', 'figment.elf')
+    FIG_GROWSYSZONE = None
+    for _ln in _sp.check_output([_nm, _figelf], text=True).splitlines():
+        _p = _ln.split()
+        if len(_p) >= 3 and _p[2] == 'c_GrowSysZone':
+            FIG_GROWSYSZONE = int(_p[0], 16)
+    assert FIG_GROWSYSZONE, "c_GrowSysZone not found in figment.elf"
+    assert rom[0x0AE20:0x0AE22] == b'\x48\xe7', "ROM heap-grow prologue mismatch"
+    # C args pushed right->left: c_GrowSysZone(curHeap, newEnd) => push newEnd(A0), curHeap(A6)
+    grow_stub  = struct.pack('>HH', 0x48E7, 0xFFFE)            # movem.l d0-d7/a0-a6,-(sp)
+    grow_stub += struct.pack('>H', 0x2F08)                     # move.l a0,-(sp)  (newEnd, arg2)
+    grow_stub += struct.pack('>H', 0x2F0E)                     # move.l a6,-(sp)  (curHeap, arg1)
+    grow_stub += struct.pack('>HI', 0x4EB9, FIG_GROWSYSZONE)   # jsr c_GrowSysZone
+    grow_stub += struct.pack('>H', 0x508F)                     # addq.l #8,sp
+    grow_stub += struct.pack('>HH', 0x4CDF, 0x7FFF)            # movem.l (sp)+,d0-d7/a0-a6
+    grow_stub += struct.pack('>H', 0x4E75)                     # rts
+    assert len(grow_stub) <= 0x20, "grow stub too big"
+    rom[0x0AE20:0x0AE20 + len(grow_stub)] = grow_stub
+    patches += 1
+    print(f"=== ROM system-heap-grow ($AE20) -> figment c_GrowSysZone (${FIG_GROWSYSZONE:08X}) ===")
 
     # Fix checksum (AFTER all first-half patches, before mirroring)
     checksum = 0

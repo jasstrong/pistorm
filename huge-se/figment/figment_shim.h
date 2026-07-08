@@ -2,6 +2,14 @@
 #ifndef FIGMENT_SHIM_H
 #define FIGMENT_SHIM_H
 
+/* Enable Figment's internal heap-validation code (_CheckHeap, DbgMessage).
+ * Routed to the paravirt $A0FE debug trap via DbgMessage below. */
+#define hasFigmentInternalDebugging 1
+
+/* Suppress Figment's own DebugStr/Debugger prototypes — Retro68's
+ * Multiverse.h already declares them (with conflicting signatures). */
+#define define_debugger_and_debugstr 1
+
 /* MPW unsigned type aliases */
 typedef unsigned char uchar;
 typedef unsigned short ushort;
