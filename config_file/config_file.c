@@ -64,6 +64,7 @@ const char *mapcmd_names[MAPCMD_NUM] = {
   "autodump_file",
   "autodump_mem",
   "delay",
+  "sebus",
 };
 
 int get_config_item_type(char *cmd) {
@@ -204,7 +205,7 @@ void get_next_string(char *str, char *str_out, int *strpos, char separator) {
   }
 }
 
-void add_mapping(struct emulator_config *cfg, unsigned int type, unsigned int addr, unsigned int size, int mirr_addr, char *filename, char *map_id, unsigned int autodump) {
+void add_mapping(struct emulator_config *cfg, unsigned int type, unsigned int addr, unsigned int size, int mirr_addr, char *filename, char *map_id, unsigned int autodump, long sebus_addr) {
   unsigned int index = 0, file_size = 0;
   FILE *in = NULL;
 
@@ -223,6 +224,7 @@ void add_mapping(struct emulator_config *cfg, unsigned int type, unsigned int ad
   cfg->map_size[index] = size;
   cfg->map_high[index] = addr + size;
   cfg->map_mirror[index] = mirr_addr;
+  cfg->map_sebus[index] = sebus_addr;
   if (strlen(map_id)) {
     if (cfg->map_id[index]) {
       free(cfg->map_id[index]);
@@ -429,6 +431,7 @@ struct emulator_config *load_config_file(char *filename) {
         unsigned int maptype = 0, mapsize = 0, mapaddr = 0, autodump = 0;
         unsigned int mirraddr = ((unsigned int)-1);
         unsigned int mapdelay = 0;
+        long sebusaddr = -1;   /* SE-bus write-through target for wtcram (-1 = none) */
         char mapfile[128], mapid[128];
         memset(mapfile, 0x00, 128);
         memset(mapid, 0x00, 128);
@@ -480,12 +483,16 @@ struct emulator_config *load_config_file(char *filename) {
               get_next_string(parse_line, cur_cmd, &str_pos, ' ');
               mapdelay = get_int(cur_cmd);
               break;
+            case MAPCMD_SEBUS:
+              get_next_string(parse_line, cur_cmd, &str_pos, ' ');
+              sebusaddr = (long)get_int(cur_cmd);
+              break;
             default:
               printf("[CFG] Unknown/unhandled map argument %s on line %d.\n", cur_cmd, cur_line);
               break;
           }
         }
-        add_mapping(cfg, maptype, mapaddr, mapsize, mirraddr, mapfile, mapid, autodump);
+        add_mapping(cfg, maptype, mapaddr, mapsize, mirraddr, mapfile, mapid, autodump, sebusaddr);
         if (mapdelay) {
           /* Store delay on the mapping we just added */
           for (int i = MAX_NUM_MAPPED_ITEMS - 1; i >= 0; i--) {
@@ -642,7 +649,7 @@ uint8_t *get_mapped_data_pointer_by_address(struct emulator_config *cfg, uint32_
     if (cfg->map_type[i] == MAPTYPE_NONE || !cfg->map_data[i])
       continue;
     else if (address >= cfg->map_offset[i] && address < cfg->map_high[i]) {
-      if (cfg->map_type[i] == MAPTYPE_RAM || cfg->map_type[i] == MAPTYPE_RAM_NOALLOC || cfg->map_type[i] == MAPTYPE_ROM)
+      if (cfg->map_type[i] == MAPTYPE_RAM || cfg->map_type[i] == MAPTYPE_RAM_NOALLOC || cfg->map_type[i] == MAPTYPE_ROM || cfg->map_type[i] == MAPTYPE_RAM_WTC)
         return cfg->map_data[i] + (address - cfg->map_offset[i]);
     }
   }

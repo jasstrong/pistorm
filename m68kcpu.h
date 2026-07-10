@@ -1065,6 +1065,10 @@ typedef struct m68ki_cpu_core
 	unsigned int write_upper[8];
 	unsigned char *write_data[8];
 	unsigned char write_through[8];
+	/* For a write_through range: the SE-bus address its writes mirror to.
+	 * A write at (write_addr[i]+k) is also written to (write_sebus[i]+k) on the
+	 * real SE bus. (unsigned)-1 = no SE-bus mirror (buffer-only, e.g. plain WTC). */
+	unsigned int write_sebus[8];
 	address_translation_cache code_translation_cache;
 	address_translation_cache fc_read_translation_cache;
 	address_translation_cache fc_write_translation_cache;
@@ -1294,7 +1298,29 @@ static __attribute__((noinline)) uint m68ki_read_8_fc(m68ki_cpu_core *state, uin
 	/* 68000/010/EC020: mask to 24-bit before fast-path range checks */
 	address = ADDRESS_68K(address);
 
-
+	/* [DIRTY-IO-RD] born-32: a READ of a BARE 24-bit SE I/O address ($00Dxxxxx IWM /
+	 * $00Exxxxx VIA — no $40 iomap prefix) hits the 32MB RAM, NOT the hardware. A
+	 * status poll reading stale RAM never sees the real bit -> timeout. Early boot
+	 * never uses 13-15MB RAM as data, so any hit here is a 32-bit-dirty I/O access. */
+	{ extern uint32_t ovl_sysrom_pos;
+	  if (ovl_sysrom_pos >= 0x40000000 &&
+	      ((address >= 0x00580000 && address < 0x00600000) ||   /* SCSI */
+	       (address >= 0x00900000 && address < 0x00C00000) ||   /* SCC  */
+	       (address >= 0x00D00000 && address < 0x00E00000) ||   /* IWM  */
+	       (address >= 0x00E80000 && address < 0x00F00000))) {  /* VIA  */
+	    static int drio = 0;
+	    if (drio++ < 40) printf("[DIRTY-IO-RD] bare I/O read $%08X PC=$%08X (hits RAM not HW!)\n",
+	                            address, ADDRESS_68K(REG_PC));
+	  } }
+	/* [VIATMR-RD] VIA timer reads: T1 reg4-7 ($EFE9FE-$EFEFFE), T2 reg8-9
+	 * ($EFF1FE-$EFF3FE), ACR reg11 ($EFF7FE). SCSI-timing calibration reads T2;
+	 * .Sony reads/programs T1 for disk PWM. Catches remapped ($40EFxxxx) + bare. */
+	{ extern uint32_t ovl_sysrom_pos; uint32_t _a24r = address & 0x00FFFFFF;
+	  if (ovl_sysrom_pos >= 0x40000000 && _a24r >= 0xEFE800 && _a24r < 0xEFF800) {
+	    static int vtr = 0;
+	    if (vtr++ < 60) printf("[VIATMR-RD] reg$%06X PC=$%08X%s\n", _a24r, ADDRESS_68K(REG_PC),
+	                           (address>>24)==0x40?"":"  <<BARE-hits-RAM");
+	  } }
 
 	address_translation_cache *cache = &state->fc_read_translation_cache;
 	if(cache->offset && address >= cache->lower && address < cache->upper)
@@ -1494,8 +1520,11 @@ static inline void m68ki_write_8_fc(m68ki_cpu_core *state, uint address, uint fc
 	for (int i = 0; i < state->write_ranges; i++) {
 		if(address >= state->write_addr[i] && address < state->write_upper[i]) {
 			state->write_data[i][address - state->write_addr[i]] = (unsigned char)value;
-			if (state->write_through[i])
-				break;
+			if (state->write_through[i]) {
+				if (state->write_sebus[i] != 0xFFFFFFFF)
+					ps_write_8(state->write_sebus[i] + (address - state->write_addr[i]), value & 0xFF);
+				return;
+			}
 			SET_FC_WRITE_TRANSLATION_CACHE_VALUES
 			return;
 		}
@@ -1579,6 +1608,41 @@ static inline void m68ki_write_16_fc(m68ki_cpu_core *state, uint address, uint f
 	address = ADDRESS_68K(address);
 	R0_MARK_DIRTY(address);
 
+	/* [RT-RANGE] TEMP: track the natural range the ROM RAM test writes ($2710-$2730
+	 * loop) — confirms whether it reaches the screen buffer ($01FFA700). */
+	{ uint32_t _rtpc = ADDRESS_68K(REG_PC);
+	  if (_rtpc >= 0x40802710 && _rtpc <= 0x40802730) {
+	    static uint32_t lo=0xFFFFFFFF, hi=0; static unsigned long n=0;
+	    if (address < lo) lo = address;
+	    if (address > hi) hi = address;
+	    if ((++n & 0xFFFFF)==0) printf("[RT-RANGE] RAM-test writes: $%08X..$%08X\n", lo, hi);
+	  } }
+	/* [SCRNBASE] TEMP: watch writes to ScrnBase ($0824) — if it stays 0, QuickDraw
+	 * draws to address 0 instead of the frame buffer ($01FFA700). */
+	if ((address & 0x00FFFFFF) == 0x0824)
+		printf("[SCRNBASE] $0824 <- $%08X  PC=$%08X\n", value, ADDRESS_68K(REG_PC));
+
+	/* [DIRTY-IO-WR] born-32: a WRITE to a BARE 24-bit SE I/O address (no $40 iomap
+	 * prefix) hits RAM not hardware — e.g. the ROM's `bclr #7,$EFE1FE.L`. */
+	{ extern uint32_t ovl_sysrom_pos; uint32_t _pc = ADDRESS_68K(REG_PC);
+	  if (ovl_sysrom_pos >= 0x40000000 && _pc != 0x40870038 &&   /* skip boot32 RAM-fill */
+	      ((address >= 0x00580000 && address < 0x00600000) ||    /* SCSI */
+	       (address >= 0x00900000 && address < 0x00C00000) ||    /* SCC  */
+	       (address >= 0x00D00000 && address < 0x00E00000) ||    /* IWM  */
+	       (address >= 0x00E80000 && address < 0x00F00000))) {   /* VIA  */
+	    static int dwio = 0;
+	    if (dwio++ < 40) printf("[DIRTY-IO-WR] bare I/O write $%08X <- $%X PC=$%08X (hits RAM not HW!)\n",
+	                            address, (unsigned)value, _pc);
+	  } }
+	/* [VIATMR-WR] VIA timer/ACR writes — who PROGRAMS the timers (.Sony T1 for
+	 * disk PWM sets ACR reg11 free-run; SCSI calibration loads T2). */
+	{ extern uint32_t ovl_sysrom_pos; uint32_t _a24w = address & 0x00FFFFFF;
+	  if (ovl_sysrom_pos >= 0x40000000 && _a24w >= 0xEFE800 && _a24w < 0xEFF800) {
+	    static int vtw = 0;
+	    if (vtw++ < 60) printf("[VIATMR-WR] reg$%06X <- $%X PC=$%08X%s\n", _a24w, (unsigned)value,
+	                           ADDRESS_68K(REG_PC), (address>>24)==0x40?"":"  <<BARE");
+	  } }
+
 	if (address >= 0x17600 && address < 0x17E00) {
 		extern int dbg_codewin; extern unsigned int dbg_codewin_n;
 		if (dbg_codewin && dbg_codewin_n < 8000) {
@@ -1626,6 +1690,14 @@ static inline void m68ki_write_16_fc(m68ki_cpu_core *state, uint address, uint f
 					if (back < 0x2000 || back >= D) break;
 					D = back + 16;
 				  } }
+					printf("[LAYOUT] MemTop($108)=$%08X BufPtr($10C)=$%08X HeapEnd($114)=$%08X\n",
+					       m68ki_read_32(state,0x108), m68ki_read_32(state,0x10C), m68ki_read_32(state,0x114));
+					printf("[LAYOUT] SysZone($2A6)=$%08X ApplZone($2AA)=$%08X ApplLimit($130)=$%08X\n",
+					       m68ki_read_32(state,0x2A6), m68ki_read_32(state,0x2AA), m68ki_read_32(state,0x130));
+					printf("[LAYOUT] CurrentA5($904)=$%08X CurStackBase($908)=$%08X ROMBase($2AE)=$%08X\n",
+					       m68ki_read_32(state,0x904), m68ki_read_32(state,0x908), m68ki_read_32(state,0x2AE));
+					printf("[LAYOUT] SCSIvecs $76C=$%08X $7D0=$%08X $7D4=$%08X UTableBase($11C)=$%08X\n",
+					       m68ki_read_32(state,0x76C), m68ki_read_32(state,0x7D0), m68ki_read_32(state,0x7D4), m68ki_read_32(state,0x11C));
 			}
 		}
 	}
@@ -1640,8 +1712,12 @@ static inline void m68ki_write_16_fc(m68ki_cpu_core *state, uint address, uint f
 	for (int i = 0; i < state->write_ranges; i++) {
 		if(address >= state->write_addr[i] && address < state->write_upper[i]) {
 			((short *)(state->write_data[i] + (address - state->write_addr[i])))[0] = htobe16(value);
-			if (state->write_through[i])
-				break;
+			if (state->write_through[i]) {
+				/* Mirror to the configured SE-bus address (relocating WTC). */
+				if (state->write_sebus[i] != 0xFFFFFFFF)
+					ps_write_16(state->write_sebus[i] + (address - state->write_addr[i]), value);
+				return;
+			}
 			SET_FC_WRITE_TRANSLATION_CACHE_VALUES
 			return;
 		}
@@ -1691,6 +1767,41 @@ static inline void m68ki_write_32_fc(m68ki_cpu_core *state, uint address, uint f
 	address = ADDRESS_68K(address);
 	R0_MARK_DIRTY(address);
 
+	/* [RT-RANGE] TEMP: track the natural range the ROM RAM test writes ($2710-$2730
+	 * loop) — confirms whether it reaches the screen buffer ($01FFA700). */
+	{ uint32_t _rtpc = ADDRESS_68K(REG_PC);
+	  if (_rtpc >= 0x40802710 && _rtpc <= 0x40802730) {
+	    static uint32_t lo=0xFFFFFFFF, hi=0; static unsigned long n=0;
+	    if (address < lo) lo = address;
+	    if (address > hi) hi = address;
+	    if ((++n & 0xFFFFF)==0) printf("[RT-RANGE] RAM-test writes: $%08X..$%08X\n", lo, hi);
+	  } }
+	/* [SCRNBASE] TEMP: watch writes to ScrnBase ($0824) — if it stays 0, QuickDraw
+	 * draws to address 0 instead of the frame buffer ($01FFA700). */
+	if ((address & 0x00FFFFFF) == 0x0824)
+		printf("[SCRNBASE] $0824 <- $%08X  PC=$%08X\n", value, ADDRESS_68K(REG_PC));
+
+	/* [DIRTY-IO-WR] born-32: a WRITE to a BARE 24-bit SE I/O address (no $40 iomap
+	 * prefix) hits RAM not hardware — e.g. the ROM's `bclr #7,$EFE1FE.L`. */
+	{ extern uint32_t ovl_sysrom_pos; uint32_t _pc = ADDRESS_68K(REG_PC);
+	  if (ovl_sysrom_pos >= 0x40000000 && _pc != 0x40870038 &&   /* skip boot32 RAM-fill */
+	      ((address >= 0x00580000 && address < 0x00600000) ||    /* SCSI */
+	       (address >= 0x00900000 && address < 0x00C00000) ||    /* SCC  */
+	       (address >= 0x00D00000 && address < 0x00E00000) ||    /* IWM  */
+	       (address >= 0x00E80000 && address < 0x00F00000))) {   /* VIA  */
+	    static int dwio = 0;
+	    if (dwio++ < 40) printf("[DIRTY-IO-WR] bare I/O write $%08X <- $%X PC=$%08X (hits RAM not HW!)\n",
+	                            address, (unsigned)value, _pc);
+	  } }
+	/* [VIATMR-WR] VIA timer/ACR writes — who PROGRAMS the timers (.Sony T1 for
+	 * disk PWM sets ACR reg11 free-run; SCSI calibration loads T2). */
+	{ extern uint32_t ovl_sysrom_pos; uint32_t _a24w = address & 0x00FFFFFF;
+	  if (ovl_sysrom_pos >= 0x40000000 && _a24w >= 0xEFE800 && _a24w < 0xEFF800) {
+	    static int vtw = 0;
+	    if (vtw++ < 60) printf("[VIATMR-WR] reg$%06X <- $%X PC=$%08X%s\n", _a24w, (unsigned)value,
+	                           ADDRESS_68K(REG_PC), (address>>24)==0x40?"":"  <<BARE");
+	  } }
+
 	/* ADB queue-init watch: catch any write to the deferred-queue control block
 	 * (ABusVars $2B68 +316/320/324/328 = $2CA4/$2CA8/$2CAC/$2CB0) — does the ADB
 	 * init ever set it up, with what value (NULL? a real buffer?), from what PC? */
@@ -1733,8 +1844,14 @@ static inline void m68ki_write_32_fc(m68ki_cpu_core *state, uint address, uint f
 	for (int i = 0; i < state->write_ranges; i++) {
 		if(address >= state->write_addr[i] && address < state->write_upper[i]) {
 			((int *)(state->write_data[i] + (address - state->write_addr[i])))[0] = htobe32(value);
-			if (state->write_through[i])
-				break;
+			if (state->write_through[i]) {
+				if (state->write_sebus[i] != 0xFFFFFFFF) {
+					uint32_t _se = state->write_sebus[i] + (address - state->write_addr[i]);
+					ps_write_16(_se, value >> 16);
+					ps_write_16(_se + 2, value & 0xFFFF);
+				}
+				return;
+			}
 			SET_FC_WRITE_TRANSLATION_CACHE_VALUES
 			return;
 		}
@@ -2046,6 +2163,54 @@ static inline void m68ki_jump(m68ki_cpu_core *state, uint new_pc)
 		branch_ring_dst[bi] = new_pc;
 		branch_ring_ir[bi]  = REG_IR;
 		branch_ring_idx++;
+		/* [POST-TRACE] log control transfers whose SOURCE is in the power-on
+		 * diagnostic/POST region ($x0801B00-$x0802A00) to diff big-se vs huge-se
+		 * startup and find what huge-se's boot32 path ELIDES (per user: the SCSI
+		 * stall is likely downstream of skipped POST hardware init). Config-agnostic
+		 * (low 24 bits), one-shot budget so it captures the FIRST pass. */
+		{ uint32_t s = ADDRESS_68K(REG_PPC) & 0x00FFFFFF, d = new_pc & 0x00FFFFFF;
+		  if (s >= 0x1B00 && s < 0x2A00) {
+		    static int pt = 0;
+		    if (pt++ < 700) printf("[POST-TRACE] $%06X -ir%04X-> $%06X\n", s, REG_IR, d);
+		  } }
+		/* [FIG-ALLOC] Catch the figment allocation that lands in the SERD /
+		 * SCSI-pseudo-stack collision zone ($17000-$18100) and detect overlap
+		 * with a previously-returned live block in the zone. rts of
+		 * fig_NewPtr@$40846E98 -> A0=thePtr; fig_NewHandle@$40846E10 -> A0=handle,
+		 * data=*A0. Block's own size lives in its header at data-8. new_pc = the
+		 * caller's return addr = WHO allocated it. (No dispose tracking: in early
+		 * boot the zone sees few frees, so an overlap here is the smoking gun.) */
+		{
+			uint32_t ppc = ADDRESS_68K(REG_PPC);
+			if (ppc == 0x40846E98 || ppc == 0x40846E10) {
+				int isH = (ppc == 0x40846E10);
+				uint32_t a0 = REG_DA[8] & 0x00FFFFFF;
+				uint32_t data = isH ? (a0 ? (m68ki_read_32(state, a0) & 0x00FFFFFF) : 0) : a0;
+				if (data >= 0x1000 && data < 0x200000) {
+					uint32_t sz  = m68ki_read_32(state, (data - 8) & 0x00FFFFFF) & 0x00FFFFFF;
+					uint32_t end = data + sz;
+					if (data < 0x18100 && end > 0x17000) {          /* intersects zone */
+						static struct { uint32_t lo, hi, caller; int isH; } fb[64];
+						static int fn = 0, printed = 0;
+						/* overlap vs prior zone blocks */
+						for (int k = 0; k < fn; k++) {
+							if (data < fb[k].hi && end > fb[k].lo && printed < 30) {
+								printed++;
+								printf("[FIG-OVERLAP] NEW %s data=$%06X..$%06X (caller=$%08X) OVERLAPS "
+								       "prior %s $%06X..$%06X (caller=$%08X)\n",
+								       isH?"Hdl":"Ptr", data, end, new_pc,
+								       fb[k].isH?"Hdl":"Ptr", fb[k].lo, fb[k].hi, fb[k].caller);
+								branch_ring_dump("at [FIG-OVERLAP] overlapping figment allocation");
+							}
+						}
+						if (printed < 30)
+							printf("[FIG-ALLOC] %s data=$%06X size=$%06X end=$%06X caller=$%08X\n",
+							       isH?"Hdl":"Ptr", data, sz, end, new_pc);
+						if (fn < 64) { fb[fn].lo=data; fb[fn].hi=end; fb[fn].caller=new_pc; fb[fn].isH=isH; fn++; }
+					}
+				}
+			}
+		}
 		/* Flag a 24-bit-stripped target: lands in the $00800000-$0087FFFF ROM
 		 * mirror (should be $40800000+). High-signal when the SOURCE is real
 		 * ROM/figment ($40xxxxxx) — i.e. ROM code that jumped and lost the $40. */

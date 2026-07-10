@@ -37,6 +37,7 @@ typedef enum {
   MAPCMD_AUTODUMP_FILE,
   MAPCMD_AUTODUMP_MEM,
   MAPCMD_DELAY,
+  MAPCMD_SEBUS,
   MAPCMD_NUM,
 } map_cmds;
 
@@ -72,6 +73,11 @@ struct emulator_config {
   unsigned int rom_size[MAX_NUM_MAPPED_ITEMS];
   unsigned char *map_data[MAX_NUM_MAPPED_ITEMS];
   unsigned int map_mirror[MAX_NUM_MAPPED_ITEMS];
+  /* For MAPTYPE_RAM_WTC: the SE-bus address this region's writes mirror to.
+   * A write at (map_offset + k) is written through to (map_sebus + k) on the
+   * real SE bus.  (unsigned)-1 = no write-through mirror. Lets a relocating WTC
+   * declare its target (e.g. emu $01FF0000 video -> SE $3F0000) in config. */
+  unsigned long map_sebus[MAX_NUM_MAPPED_ITEMS];
   unsigned int map_delay[MAX_NUM_MAPPED_ITEMS];
   char *map_id[MAX_NUM_MAPPED_ITEMS];
 
@@ -128,7 +134,7 @@ int handle_mapped_write(struct emulator_config *cfg, unsigned int addr, unsigned
 int get_named_mapped_item(struct emulator_config *cfg, char *name);
 int get_mapped_item_by_address(struct emulator_config *cfg, uint32_t address);
 uint8_t *get_mapped_data_pointer_by_address(struct emulator_config *cfg, uint32_t address);
-void add_mapping(struct emulator_config *cfg, unsigned int type, unsigned int addr, unsigned int size, int mirr_addr, char *filename, char *map_id, unsigned int autodump);
+void add_mapping(struct emulator_config *cfg, unsigned int type, unsigned int addr, unsigned int size, int mirr_addr, char *filename, char *map_id, unsigned int autodump, long sebus_addr);
 unsigned int get_int(char *str);
 #endif
 

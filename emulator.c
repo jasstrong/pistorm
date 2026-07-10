@@ -512,8 +512,14 @@ int mode32_active = 0;
 int mode32_enabled = 0;  /* set by config: setvar mode32 1 */
 volatile int mode32_trigger = 0;  /* set by SIGUSR1 */
 int figment_enabled = 0;  /* set when Figment is embedded in ROM */
+int huge_se_emu_pmmu = 0; /* 1 = old emulator-owned PMMU setup at $48 (debug fallback);
+                             0 = ROM builds its own tables post-RAM-test (default) */
 int figment_verbose = 0;  /* set from HUGESE_VERBOSE env; gates debug printfs only */
-int dbg_codewin = 1;            /* log writes into the $17600-$17E00 crash window */
+int dbg_codewin = 0;            /* DISABLED 2026-07-09: the $17600-$17E00 window was a
+                                * STALE hardcoded range — FIG-ALLOC proved it now sits inside
+                                * legit contiguous Ptr blocks ($017958..$017E7C is the SCSI
+                                * pseudo-stack's OWN block). The "SERD clobber" was a false
+                                * positive (normal pseudo-stack writes), NOT heap corruption. */
 unsigned int dbg_codewin_n = 0; /* shared cap counter for CODEWR logs */
 uint32_t g_last_getres_type = 0; uint32_t g_last_getres_id = 0; uint32_t g_last_getres_pc = 0;
 int suppress_rom_patches = 0;   /* HUGESE_NOPATCH: force GetResource('ptch'/'PTCH') -> nil
@@ -1064,6 +1070,7 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			    if (patch_gusd_enabled) {
 			      if (rom_off == 0x490DE || rom_off == 0x490D6) {
 			        uint32_t sp=REG_DA[15]; uint32_t rtype=m68ki_read_32(state,sp+6);
+	        { static int rs=0; if (rs++ < 120) printf("[RSRC-SEQ] GetResource type='%c%c%c%c' id=%d PC=$%08X\n", (char)(rtype>>24),(char)(rtype>>16),(char)(rtype>>8),(char)rtype, (int16_t)m68ki_read_16(state,sp+4), ADDRESS_68K(REG_PC)); }
 			        if (rtype==0x67757364u) { gr_armed=1; printf("[GUSD-RAM] GetResource('gusd') id=%d — armed\n",(int16_t)m68ki_read_16(state,sp+4)); } }
 			      else if (rom_off == 0x49554) {
 			        /* Content-keyed: at EVERY RM trap exit, if the Pascal result slot holds a
@@ -1088,6 +1095,17 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			  /* [WARM-RESET] catch re-entry at the ROM reset PC ($4080002A) after cold boot —
 			   * dump the branch ring to show who jumped back to ROM start (pass-1 silent reboot). */
 			  if (rom_off == 0x2A) { static int r=0; r++; if (r >= 2 && r <= 4) { printf("[WARM-RESET] ROM reset entry #%d PPC=$%08X SP=$%08X\n", r, REG_PPC, REG_DA[15]); branch_ring_dump("warm reset"); } }
+	  /* [BOOTBLK-CHK] TEMP: $40800E0E is `cmpi.w #$4C4B,(a6)` — the boot-block magic
+	   * check. Log the buffer (a6) + its first words so we see what the SCSI read of
+	   * the boot blocks actually returned ($4C4B 'LK' = valid; else bad read / no BB). */
+	  if (rom_off == 0x0E0E) {
+	    static int b=0; if (b++ < 20) { uint32_t a6 = REG_DA[14];
+	      printf("[BOOTBLK-CHK] a6=$%08X (a6)=$%04X %s  hdr[+0..+E]= %04X %04X %04X %04X %04X %04X %04X %04X  sysName= %02X %04X\n",
+	        a6, m68ki_read_16(&m68ki_cpu, a6), m68ki_read_16(&m68ki_cpu,a6)==0x4C4B ? "VALID(LK)":"*** NOT LK ***",
+	        m68ki_read_16(&m68ki_cpu,a6+0),m68ki_read_16(&m68ki_cpu,a6+2),m68ki_read_16(&m68ki_cpu,a6+4),m68ki_read_16(&m68ki_cpu,a6+6),
+	        m68ki_read_16(&m68ki_cpu,a6+8),m68ki_read_16(&m68ki_cpu,a6+0xA),m68ki_read_16(&m68ki_cpu,a6+0xC),m68ki_read_16(&m68ki_cpu,a6+0xE),
+	        m68ki_read_8(&m68ki_cpu,a6+0xA), m68ki_read_16(&m68ki_cpu,a6+0xB)); }
+	  }
 			  /* [BOOTCODE-WR] TEMP: pass-2 System startup code runs at $205xx (sys heap); its block
 			   * turned into "SICN" resource data mid-trap -> wild RTS -> Sad Mac F/3. Watch $20600
 			   * to catch the overwriter (figment move/purge of an executing block?). REMOVE AFTER USE. */
@@ -1364,7 +1382,11 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 					    }
 					    /* [FORCE-POLL] (A): redirect hugeSE's blind read (op5 -> $1A2F6) to
 					     * the POLLED read routine op4 ($1A388, read-with-Ticks-timeout) that
-					     * bigSE uses. Patch the op5 dispatch-table entry. */
+					     * bigSE uses. Patch the op5 dispatch-table entry.
+					     * 2026-07-09: tried ENABLED — the naive dispatch-table swap CRASHES
+					     * (WILD-JMP to $DB6D6DB6 fill): op4's routine runs with op5's context,
+					     * corrupting the stack. Real fix must be at the op-list BUILDER
+					     * ($40815Bxx/$40812DBC) so op4 is built with op4's context. Re-disabled. */
 					    if (0 && ovl_sysrom_pos >= 0x40000000) {
 					      uint32_t a4 = REG_DA[12]; int16_t d0 = (int16_t)(REG_DA[0] & 0xFFFF);
 					      if (d0 == 0x14) {
@@ -1680,6 +1702,17 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			          printf("  raw[+0..+$26]:");
 			          for (int k = 0; k < 0x28; k += 2) printf(" %04X", m68ki_read_16(state, base + k));
 			          printf("\n");
+			{ static int io_done=0; if(!io_done){ io_done=1;
+			  printf("[IOBASE] VIA($1D4)=$%08X SCCRd($1D8)=$%08X SCCWr($1DC)=$%08X ROMBase($2AE)=$%08X\n",
+			         m68ki_read_32(state,0x1D4), m68ki_read_32(state,0x1D8), m68ki_read_32(state,0x1DC), m68ki_read_32(state,0x2AE));
+			  printf("[IOBASE]   $40xxxxxx=remapped-OK ; bare $00xxxxxx 24-bit=hits RAM not HW (32-bit-dirty bug)\n");
+			  /* [TIMING] VIA-timer-calibrated speed globals that drive the SCSI blind/handshake
+			   * timeout counters. If born-32's emulated CPU speed vs the real-time VIA timer
+			   * miscalibrates these, the SCSI poll times out prematurely -> mount fails -> ?-floppy.
+			   * TimeDBRA $D00 (DBRA loops/ms), TimeSCCDB $D02, TimeSCSIDB $B24, TimeVIADB $D04. */
+			  printf("[TIMING] TimeDBRA($D00)=$%04X TimeSCCDB($D02)=$%04X TimeSCSIDB($B24)=$%04X TimeVIADB($D04)=$%04X\n",
+			         m68ki_read_16(state,0xD00), m68ki_read_16(state,0xD02),
+			         m68ki_read_16(state,0xB24), m68ki_read_16(state,0xD04)); } }
 			          if (++md >= 4) mdb_done = 1;
 			        }
 			      } else if (mdb_arm) {
@@ -1908,7 +1941,16 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 					 *   L2 for $40 (16 × 1MB): [0-7]=strip $40 → RAM
 					 *                          [8]=ROM+SCSI ($40800000, no CI)
 					 *                          [9-F]=I/O ($409-$40F, CI) */
-					if (is_huge_se && cpu_type == M68K_CPU_TYPE_68030) {
+					/* PMMU setup MOVED to the ROM (patch-rom.py), post-RAM-test.
+					 * The born-32 ROM now boots FLAT (config maps ROM@$40800000,
+					 * iomap for I/O, fast RAM@$0 — no PMMU needed to run), does the
+					 * RAM test unclobbered, THEN builds its own page tables in tested
+					 * RAM and PMOVEs them in. Enabling the PMMU here at $48 put the
+					 * tables at $01010000 — inside the RAM-test sweep — which the test
+					 * then overwrote, corrupting the next table walk. Set huge_se_emu_pmmu=1
+					 * to fall back to the old emulator-owned setup for debugging. */
+					extern int huge_se_emu_pmmu;
+					if (huge_se_emu_pmmu && is_huge_se && cpu_type == M68K_CPU_TYPE_68030) {
 						uint32_t level1_addr = 0x01010000;  /* 16MB+64K into RAM */
 						uint32_t level2_addr = 0x01010400;
 						uint32_t level1[256], level2[16];
@@ -2980,6 +3022,7 @@ switch_config:
     if (ram_idx != -1) {
       vnc_cfg.ram_base = cfg->map_data[ram_idx];
       vnc_cfg.ram_size = cfg->map_size[ram_idx];
+      vnc_cfg.emu_cfg = cfg;   /* so VNC can resolve the screen buffer (vidram) via the map table */
       vnc_start(&vnc_cfg);
     } else {
       printf("[VNC] No sysram mapped — VNC disabled\n");

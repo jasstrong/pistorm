@@ -14,9 +14,12 @@ struct vnc_key_event {
     uint16_t modifiers;    /* modifier state snapshot (Mac format) */
 };
 
+struct emulator_config;  /* fwd decl — VNC resolves the screen buffer via the map table */
+
 struct vnc_config {
-    uint8_t *ram_base;      /* pointer to emulated RAM */
+    uint8_t *ram_base;      /* pointer to emulated RAM (sysram map) */
     uint32_t ram_size;       /* size of emulated RAM in bytes */
+    struct emulator_config *emu_cfg;  /* for get_mapped_data_pointer_by_address (screen may be in a separate vidram map) */
     int port;                /* VNC listen port (default 5900) */
     int enabled;             /* set by config parser */
     int running;             /* set while VNC thread is alive */

@@ -1401,6 +1401,12 @@ void m68k_add_ram_range(uint32_t addr, uint32_t upper, unsigned char *ptr)
 				m68ki_cpu.write_data[i] = ptr;
 				changed = 1;
 			}
+			/* This is the FAST (non-WTC) mapping — a slot reused from a prior
+			 * WTC range must have its write-through cleared, else every write to
+			 * this "fast" range mirrors to the SE bus (slow). m68k_add_ram_range_wtc
+			 * re-sets write_through=1 afterward for genuine WTC ranges. */
+			m68ki_cpu.write_through[i] = 0;
+			m68ki_cpu.write_sebus[i] = 0xFFFFFFFF;
 			if (changed) {
 				printf("[MUSASHI] Adjusted mapped write range %d: %.8X-%.8X (%p)\n", m68ki_cpu.write_ranges, addr, upper, ptr);
 			}
@@ -1422,6 +1428,8 @@ void m68k_add_ram_range(uint32_t addr, uint32_t upper, unsigned char *ptr)
 		m68ki_cpu.write_addr[m68ki_cpu.write_ranges] = addr;
 		m68ki_cpu.write_upper[m68ki_cpu.write_ranges] = upper;
 		m68ki_cpu.write_data[m68ki_cpu.write_ranges] = ptr;
+		m68ki_cpu.write_through[m68ki_cpu.write_ranges] = 0;        /* fast range: not write-through (clear stale slot) */
+		m68ki_cpu.write_sebus[m68ki_cpu.write_ranges] = 0xFFFFFFFF;  /* no SE-bus mirror by default */
 		m68ki_cpu.write_ranges++;
 		printf("[MUSASHI] Mapped write range %d: %.8X-%.8X (%p)\n", m68ki_cpu.write_ranges, addr, upper, ptr);
 	}
@@ -1471,7 +1479,7 @@ void m68k_add_rom_range(uint32_t addr, uint32_t upper, unsigned char *ptr)
 	}
 }
 
-void m68k_add_ram_range_wtc(uint32_t addr, uint32_t upper, unsigned char *ptr)
+void m68k_add_ram_range_wtc(uint32_t addr, uint32_t upper, unsigned char *ptr, uint32_t sebus)
 {
 	m68k_add_ram_range(addr, upper, ptr);
 	m68ki_cpu.fc_write_translation_cache.lower = 0;
@@ -1479,7 +1487,8 @@ void m68k_add_ram_range_wtc(uint32_t addr, uint32_t upper, unsigned char *ptr)
 	for (int i = 0; i < m68ki_cpu.write_ranges; i++) {
 		if (m68ki_cpu.write_data[i] == ptr) {
 			m68ki_cpu.write_through[i] = 1;
-			printf("[MUSASHI] Write range %d marked write-through\n", i);
+			m68ki_cpu.write_sebus[i] = sebus;   /* SE-bus mirror target (or 0xFFFFFFFF = none) */
+			printf("[MUSASHI] Write range %d marked write-through (SE-bus mirror $%08X)\n", i, sebus);
 			break;
 		}
 	}

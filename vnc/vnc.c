@@ -2,6 +2,7 @@
 
 #define _GNU_SOURCE
 #include "vnc.h"
+#include "config_file/config_file.h"
 
 #include <pthread.h>
 #include <stdio.h>
@@ -37,17 +38,30 @@ static void write_be16(uint8_t *p, uint16_t v) {
 static uint8_t shadow_fb[MAC_SCREEN_STRIDE * MAC_SCREEN_H];
 static int shadow_valid = 0;
 
-static void expand_screen(const uint8_t *ram, uint32_t ram_size, char *framebuf) {
+static void expand_screen(const uint8_t *ram, uint32_t ram_size, struct emulator_config *emu, char *framebuf) {
+    /* Re-read ScrnBase ($0824) EVERY frame so VNC follows it if the OS moves the
+     * screen. It lives in low-mem, i.e. the sysram buffer VNC already holds. */
+    const uint32_t screen_bytes = MAC_SCREEN_STRIDE * MAC_SCREEN_H;
     uint32_t scrn_base = read_be32(ram + SCRNBASE_ADDR);
 
-    /* Sanity check: ScrnBase must fit within RAM */
-    if (scrn_base + MAC_SCREEN_STRIDE * MAC_SCREEN_H > ram_size) {
-        /* Screen pointer not valid yet — fill with white */
+    /* Resolve the screen bitmap from the CURRENT ScrnBase: it may live in a separate
+     * map (born-32: the write-through 'vidram' region at $01FF0000, above 'sysram'),
+     * so try the map table first; fall back to sysram+offset. Require the whole
+     * bitmap contiguous. */
+    const uint8_t *src = emu ? get_mapped_data_pointer_by_address(emu, scrn_base) : NULL;
+    if (src) {
+        const uint8_t *lastp = get_mapped_data_pointer_by_address(emu, scrn_base + screen_bytes - 1);
+        if (!lastp || (size_t)(lastp - src) != (size_t)(screen_bytes - 1))
+            src = NULL;  /* screen straddles a map boundary — reject */
+    }
+    if (!src && (uint64_t)scrn_base + screen_bytes <= ram_size)
+        src = ram + scrn_base;  /* sysram-resident screen */
+    if (!src) {
+        /* Screen pointer not valid / not mapped yet — fill with white */
         memset(framebuf, 0xFF, MAC_SCREEN_W * MAC_SCREEN_H);
+        shadow_valid = 0;
         return;
     }
-
-    const uint8_t *src = ram + scrn_base;
 
     for (int row = 0; row < MAC_SCREEN_H; row++) {
         const uint8_t *row_src = src + row * MAC_SCREEN_STRIDE;
@@ -276,7 +290,7 @@ static void *vnc_thread(void *arg) {
 
     while (cfg->running && rfbIsActive(screen)) {
         if (screen->clientHead) {
-            expand_screen(cfg->ram_base, cfg->ram_size, screen->frameBuffer);
+            expand_screen(cfg->ram_base, cfg->ram_size, cfg->emu_cfg, screen->frameBuffer);
             rfbMarkRectAsModified(screen, 0, 0, MAC_SCREEN_W, MAC_SCREEN_H);
         }
         rfbProcessEvents(screen, VNC_FRAME_MS * 1000);  /* timeout in microseconds */

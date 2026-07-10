@@ -36,6 +36,18 @@ uint32_t ovl_sysrom_pos = 0x400000;
 uint32_t ovl_decode_size = 0x20000; /* 128KB OVL overlay on Mac SE */
 uint32_t bigse_vbuf_virt = 0x7F0000;  /* video buffer virt addr, set by OVL handler */
 
+/* Runtime fake-revert of the on-disk 'gusd' gestalt patch (bigSE only).  The
+ * disk keeps machine 5/9 addressing-method = $0005 (the 32-bit-clean IIci
+ * method, which hugeSE's System needs).  bigSE is 24-bit (cpu 68030_24) and
+ * hangs at "Welcome to Macintosh" on that method, so we substitute the original
+ * SE/SE-30 methods ($0002/$0003) as the resource streams off SCSI — no disk edit
+ * needed, hugeSE unaffected.  Enabled by `setvar fake_gusd 1`. */
+int fake_gusd_enabled = 0;
+/* hugeSE: patch the loaded 'gusd' in RAM to the 32-bit methods (volume-independent
+ * sibling of fake_gusd — works even when the boot volume's gusd is stock/compressed).
+ * Enabled by `setvar patch_gusd 1`; the hook lives in emulator.c ([GUSD-RAM]). */
+int patch_gusd_enabled = 0;
+
 /*
  * SCSI driver ROM exclusion zone: addresses in this range bypass the
  * Musashi fast-path cache and go through real GPIO bus cycles, so the
@@ -123,6 +135,18 @@ void setvar_mac68k(struct emulator_config *cfg, char *var, char *val) {
         printf("[MAC68K] MODE32 trap enabled\n");
     }
 
+    if (CHKVAR("fake_gusd")) {
+        extern int fake_gusd_enabled;
+        fake_gusd_enabled = 1;
+        printf("[MAC68K] Runtime 'gusd' gestalt fake-revert enabled (bigSE 24-bit)\n");
+    }
+
+    if (CHKVAR("patch_gusd")) {
+        extern int patch_gusd_enabled;
+        patch_gusd_enabled = 1;
+        printf("[MAC68K] Runtime 'gusd' 32-bit-method patch enabled (hugeSE, in-RAM after load)\n");
+    }
+
     if (CHKVAR("figment")) {
         extern int figment_enabled;
         extern int figment_verbose;
@@ -171,72 +195,44 @@ void handle_ovl_mappings_mac68k(struct emulator_config *cfg) {
                cfg->map_offset[rom_index], ovl_sysrom_pos, ovl_sysrom_pos + cfg->map_size[rom_index]);
     }
 
+    /* sysram: plain fast Pi RAM (bulk).  Fast inline read+write, NO SE-bus
+     * write-through.  During OVL the ROM overlays $0..ovl_decode_size, so the
+     * fast RAM starts above the overlay. */
     index = get_named_mapped_item(cfg, "sysram");
     if (index != -1) {
-        /* Remove all RAM ranges: base pointer (from config parser)
-         * and tracked pointers (from previous OVL remap) */
         m68k_remove_range(cfg->map_data[index]);
-        if (ram_range_ptr && ram_range_ptr != cfg->map_data[index]) {
+        if (ram_range_ptr && ram_range_ptr != cfg->map_data[index])
             m68k_remove_range(ram_range_ptr);
-        }
-        if (ram_wtc_ptr && ram_wtc_ptr != cfg->map_data[index] && ram_wtc_ptr != ram_range_ptr) {
-            m68k_remove_range(ram_wtc_ptr);
-        }
         ram_range_ptr = NULL;
-        ram_wtc_ptr = NULL;
 
-        if (ovl) {
-            /* OVL on: ROM overlays $0 to ovl_decode_size (128KB on Mac SE).
-             * RAM above the overlay is still accessible.
-             * Keep config range zeroed so handle_mapped_write doesn't
-             * suppress write-through GPIO writes. */
-            uint32_t ram_start = ovl_decode_size;
-            uint32_t ram_end = cfg->map_size[index];
-
-            if (ram_start < ram_end) {
-                /* Born-32 huge SE: flat RAM to ram_end, WTC at the true top
-                 * of 32MB ($01FF0000).  (Was capped at $7F0000 for the old
-                 * IS=8 / MODE32 boot — no longer.) */
-                uint32_t wtc_start = ram_end - WTC_REGION_SIZE;
-                if (wtc_start > ram_start) {
-                    ram_range_ptr = cfg->map_data[index] + ram_start;
-                    m68k_add_ram_range(ram_start, wtc_start, ram_range_ptr);
-                    ram_wtc_ptr = cfg->map_data[index] + wtc_start;
-                    m68k_add_ram_range_wtc(wtc_start, wtc_start + WTC_REGION_SIZE, ram_wtc_ptr);
-                    printf("[MAC68K] RAM at %08X-%08X fast, %08X-%08X wtc (OVL covers 0-%08X)\n",
-                           ram_start, wtc_start, wtc_start, wtc_start + WTC_REGION_SIZE, ovl_decode_size);
-                } else {
-                    ram_range_ptr = cfg->map_data[index] + ram_start;
-                    m68k_add_ram_range_wtc(ram_start, ram_end, ram_range_ptr);
-                    printf("[MAC68K] RAM at %08X-%08X wtc (OVL covers 0-%08X)\n",
-                           ram_start, ram_end, ovl_decode_size);
-                }
-            }
-            cfg->map_offset[index] = 0;
-            cfg->map_high[index] = 0;
-        } else {
-            /* OVL off: RAM at 0x000000 */
-            uint32_t ram_end = cfg->map_size[index];
-            /* Born-32 huge SE: WTC at the true top of 32MB ($01FF0000).
-             * IS=0 PMMU identity-maps the whole flat space; RAM above $800000
-             * is now real (no longer shadowed by I/O).  (Was $7F0000 for the
-             * old IS=8 boot, with MODE32 expected to relocate it later.) */
-            uint32_t wtc_start = ram_end - WTC_REGION_SIZE;
-
-            /* Set video buffer virtual address — 24-bit masked, because
-             * custom_write sees addresses after slow-path 24-bit mask. */
-            if (ovl_sysrom_pos >= 0x800000)
-                bigse_vbuf_virt = wtc_start & 0x00FFFFFF;
-
-            ram_range_ptr = cfg->map_data[index];
-            cfg->map_offset[index] = 0x0;
-            cfg->map_high[index] = cfg->map_size[index];
-            m68k_add_ram_range(0x0, wtc_start, cfg->map_data[index]);
-            ram_wtc_ptr = cfg->map_data[index] + wtc_start;
-            m68k_add_ram_range_wtc(wtc_start, wtc_start + WTC_REGION_SIZE, ram_wtc_ptr);
-            printf("[MAC68K] RAM at 00000000-%08X fast, %08X-%08X wtc (born-32 flat)\n",
-                   wtc_start, wtc_start, wtc_start + WTC_REGION_SIZE);
+        uint32_t ram_start = ovl ? ovl_decode_size : 0;
+        uint32_t ram_end = cfg->map_size[index];
+        if (ram_start < ram_end) {
+            ram_range_ptr = cfg->map_data[index] + ram_start;
+            m68k_add_ram_range(ram_start, ram_end, ram_range_ptr);
         }
+        /* Zero the config range so handle_mapped_write doesn't intercept —
+         * the fast range above serves all sysram accesses. */
+        cfg->map_offset[index] = 0;
+        cfg->map_high[index] = 0;
+        printf("[MAC68K] sysram fast RAM %08X-%08X (OVL covers 0-%08X)\n",
+               ram_start, ram_end, ovl ? ovl_decode_size : 0);
+    }
+
+    /* vidram: 64KB write-through-cache; writes mirror to the configured SE-bus
+     * address (map_sebus) — the relocating WTC (emu top-of-RAM video window ->
+     * SE top-of-RAM video/sound buffer). */
+    index = get_named_mapped_item(cfg, "vidram");
+    if (index != -1) {
+        m68k_remove_range(cfg->map_data[index]);
+        if (ram_wtc_ptr && ram_wtc_ptr != cfg->map_data[index])
+            m68k_remove_range(ram_wtc_ptr);
+        ram_wtc_ptr = cfg->map_data[index];
+        m68k_add_ram_range_wtc(cfg->map_offset[index], cfg->map_high[index],
+                               ram_wtc_ptr, (uint32_t)cfg->map_sebus[index]);
+        bigse_vbuf_virt = cfg->map_offset[index];  /* for shutdown mute, etc. */
+        printf("[MAC68K] vidram WTC %08X-%08X -> SE bus %08X\n",
+               cfg->map_offset[index], cfg->map_high[index], (uint32_t)cfg->map_sebus[index]);
     }
 
     adjust_ranges_mac68k(cfg);
@@ -291,130 +287,171 @@ void shutdown_platform_mac68k(struct emulator_config *cfg) {
 #define BIGSE_VBUF_SIZE  0x010000
 #define BIGSE_VBUF_PHYS  0x3F0000
 
+/* SE-bus remap shim (configurable, underneath the core): translate a physical
+ * address to its real SE-bus address via the cfg `iomap` windows.
+ *   bus = bus_base + (phys - lo)   for phys in [lo, hi)
+ * No window matches → identity pass-through (ordinary SE needs no windows).
+ * This is an explicit affine remap, NOT a width mask — so a 68020 PiStorm
+ * with 32-bit bus targets is just a different window table, no special path.
+ *   ordinary SE : (no windows)                     identity
+ *   bigSE       : iomap 0x880000  0x900000  0x580000
+ *   hugeSE      : iomap 0x40000000 0x41000000 0x0
+ */
+static inline uint32_t se_bus_addr(struct emulator_config *cfg, uint32_t phys) {
+    for (unsigned int i = 0; i < cfg->io_remap_count; i++) {
+        if (phys >= cfg->io_remap_lo[i] && phys < cfg->io_remap_hi[i])
+            return (uint32_t)(cfg->io_remap_bus[i] + (phys - cfg->io_remap_lo[i]));
+    }
+    return phys;  /* identity — no remap configured for this range */
+}
+
+/* Sliding-window matcher over the SCSI data-register byte stream.  Recognizes
+ * the uncompressed 'gusd' resource by its 14-byte prefix (header + machine-4
+ * pair + machine-5 number) and rewrites the two method low-bytes that the
+ * 2026-06-18 patch changed:  machine-5 method @+$0F  $05 -> $02,
+ *                            machine-9 method @+$1F  $05 -> $03.
+ * Only the low byte differs ($0005 vs $0002/$0003); the high byte is $00 either
+ * way, so we touch nothing else.  Byte-at-a-time (5380 data reg is 8-bit). */
+static unsigned char gusd_filter_byte(unsigned char b) {
+    static const unsigned char A[14] =
+        {0x00,0x01,0xAE,0x5B,0x5E,0x75,0x00,0x6D,0x00,0x04,0x00,0x01,0x00,0x05};
+    static int m = 0;      /* anchor bytes matched so far */
+    static int post = -1;  /* >=0: byte index past a completed anchor */
+    if (post >= 0) {
+        unsigned char out = b;
+        if (post == 1 && b == 0x05) { out = 0x02; printf("[GUSD] machine5 method $05->$02\n"); }
+        else if (post == 17) {
+            if (b == 0x05) { out = 0x03; printf("[GUSD] machine9 method $05->$03\n"); }
+            post = -1; m = 0; return out;   /* last patched byte — done */
+        }
+        if (++post > 17) { post = -1; m = 0; }
+        return out;
+    }
+    if (b == A[m]) {
+        if (++m == (int)sizeof(A)) { m = 0; post = 0; }
+    } else {
+        m = (b == A[0]) ? 1 : 0;
+    }
+    return b;
+}
+
+/* Passive 'gusd' watcher (hugeSE diagnostics): same anchor as gusd_filter_byte
+ * but log-only — reports whether the methods streaming off SCSI are the
+ * 2026-06-18 patched values ($0005) or stock ($0002/$0003). */
+static void gusd_watch_byte(unsigned char b) {
+    static const unsigned char A[14] =
+        {0x00,0x01,0xAE,0x5B,0x5E,0x75,0x00,0x6D,0x00,0x04,0x00,0x01,0x00,0x05};
+    static int m = 0, post = -1;
+    if (post >= 0) {
+        if (post == 1)  printf("[GUSD-SEEN] machine5 method low-byte=$%02X (%s)\n", b, b==0x05?"PATCHED 32-bit":"stock/unpatched");
+        if (post == 17) { printf("[GUSD-SEEN] machine9 method low-byte=$%02X (%s)\n", b, b==0x05?"PATCHED 32-bit":"stock/unpatched"); post=-1; m=0; return; }
+        if (++post > 17) { post = -1; m = 0; }
+        return;
+    }
+    if (b == A[m]) { if (++m == (int)sizeof(A)) { m = 0; post = 0; } }
+    else m = (b == A[0]) ? 1 : 0;
+}
+
+#include <time.h>
+/* wall-clock microseconds since the first SCSI bus access — for the [GPIO-*]
+ * timing capture: measure inter-access gaps and spot interrupt-handler stalls
+ * (a big jump between two consecutive 5380 cycles = an IRQ ran mid-selection). */
+static double gpio_ts_us(void) {
+    static struct timespec t0; static int set = 0;
+    struct timespec tn; clock_gettime(CLOCK_MONOTONIC, &tn);
+    if (!set) { t0 = tn; set = 1; }
+    return (double)(tn.tv_sec - t0.tv_sec) * 1e6 + (double)(tn.tv_nsec - t0.tv_nsec) / 1e3;
+}
+
 int custom_read_mac68k(struct emulator_config *cfg, unsigned int addr,
                        unsigned int *val, unsigned char type) {
-    if (cfg) {}
-    /* SCSI/IWM I/O handler.
-     * Big SE:  ROM uses $880000+ → remap to $580000+ on SE bus.
-     * Huge SE: ROM uses $40580000+ → slow-path masks to $580000+ → direct.
-     * Both cases: phys ends up as $580000-$5FFFFF. */
-    /* Huge SE: ROM exclusion zone reads land here after 24-bit masking.
-     * $4081Axxx → masked $81Axxx. On big-se, handle_mapped_read catches
-     * these (ROM at $800000). On huge-se (ROM at $40800000), they fall
-     * through — serve from ROM buffer directly. */
-    if (ovl_sysrom_pos >= 0x40000000) {
-        uint32_t rom_masked = ovl_sysrom_pos & 0x00FFFFFF;  /* $800000 for $40800000 */
-        if (addr >= rom_masked && addr < rom_masked + 0x80000) {
-            /* Read from ROM buffer */
-            extern struct emulator_config *cfg;
-            int32_t rom_idx = get_named_mapped_item(cfg, "sysrom");
-            if (rom_idx >= 0) {
-                uint32_t off = addr - rom_masked;
-                unsigned char *rom_data = cfg->map_data[rom_idx];
-                if (type == 0) *val = rom_data[off];
-                else if (type == 1) *val = (rom_data[off] << 8) | rom_data[off+1];
-                else *val = (rom_data[off] << 24) | (rom_data[off+1] << 16) |
-                            (rom_data[off+2] << 8) | rom_data[off+3];
-                return 1;
-            }
+    /* SE-bus I/O: if a configured `iomap` window remaps this physical address,
+     * it's real hardware — read it from the SE bus.  ROM and RAM are served by
+     * the fast-path ranges before we ever get here, so a window hit is genuine
+     * I/O (e.g. hugeSE $405FF010 → SE bus $5FF010; bigSE $88xxxx → $58xxxx). */
+    uint32_t bus = se_bus_addr(cfg, addr);
+    if (bus != addr) {
+        /* SE-bus I/O ports are byte-wired: a real 68030 splits a word/long
+         * access to an 8-bit port into N sequential single-byte cycles at
+         * consecutive addresses (dynamic bus sizing), each asserting one byte
+         * strobe (UDS for even A0, LDS for odd).  The BBU pseudo-DMA pump counts
+         * exactly those per-byte strobes, so we MUST emit one ps_read_8 per byte
+         * ascending — a single ps_read_8, or a ps_read_16 word cycle, would
+         * under-strobe the pump and desync the transfer (→ $0035 catalog garbage
+         * on huge-se; big-se survives only because 24-bit masking discards the
+         * mis-pumped high byte). */
+        int nbytes = (type == 2) ? 4 : (type == 1) ? 2 : 1;
+        unsigned in_scsi = (bus >= 0x5FF000 && bus < 0x600000);
+        unsigned r = (bus >> 4) & 7;
+        int do_gusd = fake_gusd_enabled && in_scsi && (r == 0 || r == 6);
+        uint32_t v = 0;
+        for (int i = 0; i < nbytes; i++) {
+            unsigned char b = (unsigned char)ps_read_8(bus + i);
+            { extern uint32_t ovl_sysrom_pos;
+              if (ovl_sysrom_pos >= 0x800000 && (bus + i) >= 0x580000 && (bus + i) < 0x600000) {
+                /* SKIP the boring "waiting for BSY" poll reads ($5FF040==$03) so the
+                 * capture spans MANY selection attempts and shows the moment BSY (or a
+                 * phase change) actually appears — i.e. the SUCCESSFUL selection.
+                 * Range widened to $580000 (was $5FF000) to capture bigSE's SCSI at
+                 * bus $58xxxx AND the BBU pseudo-DMA region, for the bigSE-vs-hugeSE diff. */
+                int _boring = (((bus + i) & 0xFFF0FF) == 0x580040 && b == 0x03) ||
+                              ((bus + i) == 0x5FF040 && b == 0x03);
+                static int _gr = 0;
+                if (!_boring && _gr++ < 400) printf("[GPIO-RD] t=%10.1fus bus=$%06X val=$%02X  type=%d nb=%d i=%d  cpuaddr=$%08X PC=$%08X\n",
+                                        gpio_ts_us(), (bus + i), b, (int)type, nbytes, i, addr, m68k_get_reg(NULL, M68K_REG_PC)); } }
+            if (do_gusd) b = gusd_filter_byte(b);   /* runtime 'gusd' revert (big-se) */
+            else if (in_scsi && (r == 0 || r == 6)) gusd_watch_byte(b);  /* hugeSE: log-only */
+            v = (v << 8) | b;
         }
-    }
-
-    uint32_t phys = 0;
-    if (ovl_sysrom_pos >= 0x800000 &&
-        addr >= BIGSE_SCSI_VIRT && addr < BIGSE_SCSI_VIRT + BIGSE_SCSI_SIZE) {
-        phys = addr - BIGSE_SCSI_VIRT + BIGSE_SCSI_PHYS;
-    } else if (ovl_sysrom_pos >= 0x40000000 &&
-               addr >= 0x580000 && addr < 0x600000) {
-        phys = addr;
-    }
-    if (phys) {
-        if (phys >= 0x5FF000) {
-            /* IWM needs paced IO — BBU state machine must advance
-             * between accesses for the handshake to complete. */
-            static uint32_t iwm_poll_count = 0;
-            static uint32_t iwm_last_addr = 0;
-            static uint64_t iwm_total_reads = 0;
-            iwm_total_reads++;
-            { static uint32_t iwm_rd = 0;
-              if (++iwm_rd <= 10)
-                printf("[IWM-RD] addr=$%06X val=$%02X #%u\n", phys, *val, iwm_rd);
-            }
-            *val = ps_read_8_paced(phys);
-        } else {
-            *val = ps_read_8(phys);
-        }
-        (void)type;
+        *val = v;
+        (void)in_scsi;  /* [PUMP] data-pump health probe removed — it ran on every SCSI byte (major slowdown) */
         return 1;
     }
-    /* DEBUG: log addresses that fall through the remap in the I/O-ish high
-     * ranges, so we can see the exact (un-stripped, $40-prefixed) form the
-     * SCSI Manager hands us. */
-    {
-        static int ft = 0;
-        if (ft < 40 && ((addr & 0x00F00000) == 0x00800000 /* $8xxxxx */
-                        || (addr >= 0x40880000 && addr < 0x40900000) /* $408xxxxx high SCSI */
-                        || (addr >= 0x40DF0000 && addr < 0x40F00000))) {
-            printf("[REMAP-MISS] addr=$%08X type=%d PC=$%08X\n",
-                   addr, type, m68k_get_reg(NULL, M68K_REG_PC));
-            ft++;
-        }
-    }
-    return -1;
+    return -1;  /* not remapped I/O → fall through to mapped buffers (ROM/RAM) */
 }
 
 int custom_write_mac68k(struct emulator_config *cfg, unsigned int addr,
                         unsigned int val, unsigned char type) {
     if (cfg) {}
-    if (ovl_sysrom_pos >= 0x800000) {
-        /* SCSI + IWM write handler (same logic as custom_read) */
-        uint32_t phys = 0;
-        if (addr >= BIGSE_SCSI_VIRT && addr < BIGSE_SCSI_VIRT + BIGSE_SCSI_SIZE)
-            phys = addr - BIGSE_SCSI_VIRT + BIGSE_SCSI_PHYS;
-        else if (ovl_sysrom_pos >= 0x40000000 && addr >= 0x580000 && addr < 0x600000)
-            phys = addr;
-        if (phys) {
-            if (phys >= 0x5FF000) {
-                static uint32_t iwm_wr = 0;
-                if (++iwm_wr <= 10)
-                    printf("[IWM-WR] addr=$%06X val=$%02X #%u PC=$%08X\n", phys, val & 0xFF, iwm_wr, m68k_get_reg(NULL, M68K_REG_PC));
-                ps_write_8_paced(phys, val);
-            } else
-                ps_write_8(phys, val);
-            (void)type;
-            return 1;
+    /* SE-bus I/O write via the configured `iomap` window (same shim as the read). */
+    uint32_t bus = se_bus_addr(cfg, addr);
+    if (bus != addr) {
+        /* Byte-wired SE-bus I/O: split word/long writes into N sequential
+         * single-byte cycles (ascending addresses) so the BBU pump sees the
+         * right per-byte strobes — mirror of the read path above. */
+        int nbytes = (type == 2) ? 4 : (type == 1) ? 2 : 1;
+        for (int i = 0; i < nbytes; i++) {
+            uint8_t _b = (val >> (8 * (nbytes - 1 - i))) & 0xFF;
+            { extern uint32_t ovl_sysrom_pos;
+              if (ovl_sysrom_pos >= 0x800000 && (bus + i) >= 0x580000 && (bus + i) < 0x600000) {
+                static int _gw = 0;
+                if (_gw++ < 300) printf("[GPIO-WR] t=%10.1fus bus=$%06X val=$%02X  type=%d nb=%d i=%d  cpuaddr=$%08X PC=$%08X\n",
+                                        gpio_ts_us(), (bus + i), _b, (int)type, nbytes, i, addr, m68k_get_reg(NULL, M68K_REG_PC)); } }
+            ps_write_8(bus + i, _b);
         }
-        /* Video buffer remap — WTC already wrote to Pi RAM buffer;
-         * now send the write to the physical SE bus for the BBU/CRT. */
+        return 1;
+    }
+    if (ovl_sysrom_pos >= 0x800000) {
+        /* Video/sound buffer write-through: the WTC region already wrote the Pi
+         * RAM buffer; mirror it to the physical SE bus for the BBU/CRT (display/
+         * sound sit at the top of the 32 MB → SE bus $3F0000). */
         if (addr >= bigse_vbuf_virt && addr < bigse_vbuf_virt + BIGSE_VBUF_SIZE) {
             uint32_t phys = addr - bigse_vbuf_virt + BIGSE_VBUF_PHYS;
-            /* type: 0=byte, 1=word, 2=longword (enum map_op_types) */
-            if (type >= 2) {  /* longword */
-                ps_write_16(phys, val >> 16);
-                ps_write_16(phys + 2, val & 0xFFFF);
-            } else if (type == 1) {  /* word */
-                ps_write_16(phys, val);
-            } else {
-                ps_write_8(phys, val);
-            }
+            if (type >= 2) { ps_write_16(phys, val >> 16); ps_write_16(phys + 2, val & 0xFFFF); }
+            else if (type == 1) ps_write_16(phys, val);
+            else ps_write_8(phys, val);
             return 1;
         }
-        /* Block heap writes to physical video/sound buffer range.
-         * The Mac thinks $3F0000-$3FFFFF is regular heap (8MB space),
-         * but the BBU reads it for video DMA.  Video writes come
-         * through the $7F0000 path above; everything else is heap
-         * data that must NOT reach the physical display buffer. */
-        if (addr >= BIGSE_VBUF_PHYS && addr < BIGSE_VBUF_PHYS + BIGSE_VBUF_SIZE) {
-            return 1;  /* swallow — WTC buffer has it, don't corrupt CRT */
-        }
-        /* ROM write handler: apply writes to the ROM buffer.
-         * ROM is read-only in the fast-path, but the SE ROM's MM code
-         * does CLR.L to ROM addresses and expects reads to reflect the
-         * change.  On real hardware, the BBU aliases these to RAM. */
+        /* Swallow stray heap writes that land on the physical video/sound buffer. */
+        if (addr >= BIGSE_VBUF_PHYS && addr < BIGSE_VBUF_PHYS + BIGSE_VBUF_SIZE)
+            return 1;
+        /* ROM-write-to-buffer (bigSE): the 24-bit SE-ROM Memory Manager does
+         * CLR.L to ROM addresses and expects the read to reflect it (the BBU
+         * aliases ROM writes to RAM).  Apply to the ROM buffer.  bigSE only:
+         * hugeSE ROM writes ($40800000) hit the iomap window above first. */
         {
             uint32_t rom_masked = ovl_sysrom_pos & 0x00FFFFFF;
             if (addr >= rom_masked && addr < rom_masked + 0x80000) {
-                extern struct emulator_config *cfg;
                 int32_t ri = get_named_mapped_item(cfg, "sysrom");
                 if (ri >= 0 && cfg->map_data[ri]) {
                     uint32_t off = addr - rom_masked;

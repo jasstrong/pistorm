@@ -589,10 +589,24 @@ def patch_rom(infile, outfile):
         assert rom[0x26F0:0x26F4] == b'\x24\x48\x26\x09', "RAM-test entry mismatch"
         rom[0x25FA:0x2600] = struct.pack('>HI', 0x4EF9, boot32_vaddr + 0)  # sizing -> memsize
         rom[0x2928:0x292E] = struct.pack('>HI', 0x4EF9, boot32_vaddr + 6)  # aliasing -> ramtest
-        rom[0x26F0:0x26F6] = struct.pack('>HI', 0x4EF9, boot32_vaddr + 6)  # RAM test -> ramtest
+        # === REINSTATE the real RAM test ($26F0), 32-bit-patched (2026-07-09) ===
+        # Instead of stubbing it to a no-op (which left RAM in the boot32 blanket
+        # $6DB6DB6D fill — NOT bigSE's real 3-pattern march), run the ORIGINAL ROM
+        # RAM test via a stub that CLAMPS the low bound above the live vectors +
+        # low-mem (A0 = max(A0,$4000)) so it doesn't clobber $0-$3FF (the fatal
+        # $02C Line-F vector) or the born-32 low structures.  The test's 32-bit
+        # divide ($26FC/$270A via swap) already handles >4M ranges.  Stub lives in
+        # free mirror space; jumps back into the real test at $26F2.
+        RAMTEST_STUB_OFF = 0x6F000   # free mirror space (after combo $5D986, before boot32 $70000)
+        ramtest_stub_vaddr = 0x40800000 + RAMTEST_STUB_OFF
+        rom[0x26F0:0x26F6] = struct.pack('>HI', 0x4EF9, ramtest_stub_vaddr)  # RAM test -> clamp stub
+        # The PMMU is enabled off the LAST RAM-test call via the $26F0 stub above
+        # (A0==$00200000 → boot32 trampoline blob+12), NOT at a fixed seam — the
+        # earlier $1F3C attempt was the mem-test-FAILURE path, never taken healthily.
         patches += 3
-        print(f"=== boot32: $25FA->memsize(${boot32_vaddr:08X}), "
-              f"$2928->ramtest, $26F0->ramtest ===")
+        print(f"=== boot32: $25FA->memsize(${boot32_vaddr:08X}), $2928->ramtest, "
+              f"$26F0->REINSTATED-ramtest(clamp@${ramtest_stub_vaddr:08X}), "
+              f"PMMU-enable off last RAM-test call ($200000) ===")
     else:
         print(f"=== WARNING: boot32.bin not found ({boot32_path}) ===")
 
@@ -671,6 +685,45 @@ def patch_rom(infile, outfile):
     out[SERD_STUB_OFF:SERD_STUB_OFF + len(serd_stub)] = serd_stub
     print(f"=== SERD HLock stub embedded at ROM+${SERD_STUB_OFF:05X} ({len(serd_stub)} bytes) ===")
 
+    # Reinstated RAM-test clamp stub (mirror half; see the $26F0 redirect above).
+    # The $26F0 redirect is a 6-byte jmp that overwrites THREE original instructions:
+    #   $26F0 2448 movea.l a0,a2 ; $26F2 2609 move.l a1,d3 ; $26F4 9688 sub.l a0,d3
+    # (they compute the sweep length d3 = a1-a0). The stub MUST replicate all three
+    # and jump back to $26F6 (first intact instruction, move.w d3,d5) — NOT $26F2,
+    # which now lands inside the jmp operand and corrupts the registers.
+    if boot32:
+        # Use the DISPATCHER'S natural A0/A1 range (do NOT clamp): the real ROM
+        # sweeps up to MemTop including the screen buffer, which is why the RAM-test
+        # pattern is visible on a real SE. The earlier clamp was a workaround for
+        # "A0/A1 garbage above 32MB" — but that garbage was the stub's own jmp-back
+        # landing mid-operand (fixed below), not the dispatcher. So just replicate
+        # the 3 overwritten instructions and continue with the natural range.
+        # The RAM test runs across 4 calls (probed order): #1 $0-$400, #2 screen
+        # $1FFA700-$1FFFF00, #3 $40000-$200000, #4 $200000-$1FFA700 (LAST). We:
+        #  (a) CAP A1 at $01FFFF00 always — keeps A0 natural so the test still writes
+        #      the screen buffer ($1FFA700-$1FFFC80 → visible pattern), but stops below
+        #      the caller's stack-saved regs (~$1FFFFC0, under MemTop=SP=$2000000) that
+        #      it would otherwise overwrite → caller's `movem (sp)+; rts` wild-jumps.
+        #  (b) on the LAST call (A0==$00200000), save the diagnostic return in A3 and
+        #      point A6 at the boot32 PMMU-setup trampoline (blob+12): the test's
+        #      `jmp (a6)` lands there AFTER the final sweep, so it builds the page
+        #      tables + MMU globals + enables translation with nothing left to clobber
+        #      them, then restores A6 from A3 and returns to the POST — MMU now on.
+        _rts = (struct.pack('>HI', 0xB3FC, 0x01FFFF00)    # cmpa.l #$1FFFF00,a1
+              + struct.pack('>H', 0x6306)                 # bls.s +6 (a1<=cap: keep)
+              + struct.pack('>HI', 0x227C, 0x01FFFF00)    # movea.l #$1FFFF00,a1 (protect stack regs)
+              + struct.pack('>HI', 0xB1FC, 0x00200000)    # cmpa.l #$200000,a0  (LAST RAM-test call?)
+              + struct.pack('>H', 0x6608)                 # bne.s +8 (not last: skip A3/A6 redirect)
+              + struct.pack('>H', 0x264E)                 # movea.l a6,a3  (save diag return)
+              + struct.pack('>HI', 0x2C7C, boot32_vaddr + 12)  # movea.l #pmmu_trampoline,a6
+              + struct.pack('>H', 0x2448)                 # movea.l a0,a2  (orig $26F0)
+              + struct.pack('>H', 0x2609)                 # move.l a1,d3   (orig $26F2)
+              + struct.pack('>H', 0x9688)                 # sub.l a0,d3    (orig $26F4)
+              + struct.pack('>HI', 0x4EF9, 0x408026F6))   # jmp $408026F6  (continue at move.w d3,d5)
+        assert RAMTEST_STUB_OFF + len(_rts) <= len(out)
+        out[RAMTEST_STUB_OFF:RAMTEST_STUB_OFF + len(_rts)] = _rts
+        print(f"=== RAM-test clamp stub embedded at ROM+${RAMTEST_STUB_OFF:05X} ({len(_rts)} bytes) ===")
+
     # Embed boot32 blob in mirror half ($40870000)
     if boot32:
         assert BOOT32_ROM_OFF + len(boot32) <= len(out), "boot32 overflows ROM"
@@ -741,6 +794,37 @@ def patch_rom(infile, outfile):
         out[SCSIDRV_SHIM_OFF:SCSIDRV_SHIM_OFF + len(shim)] = shim
         print(f"=== .SCSIHD driver embedded at ROM+${SCSIDRV_ROM_OFF:05X} "
               f"({len(scsidrv)} bytes), shim at +${SCSIDRV_SHIM_OFF:05X} ===")
+
+    # === 6. 32-bit-clean the ROM's BARE 24-bit VIA I/O accesses ===
+    # The stock SE sound volume/enable routine (3 copies) uses `move.b`/`bclr`
+    # with a HARDCODED bare 24-bit VIA absolute address ($EFFFFE = Port A / sound
+    # volume, $EFE1FE = Port B / sndEnb).  The general opcode scan (§2) only
+    # remaps JMP/JSR/LEA/PEA/MOVE.L#imm operands, so these byte/bit accesses slip
+    # through.  Clean in 24-bit (bigSE masks the top byte); in flat-32 born-32 the
+    # bare $00EFxxxx hits the 32MB RAM instead of the VIA -> sound (and, since VIA
+    # Port A also carries PA5=floppy head-select, potentially the IWM) misbehave.
+    # Remap each operand's high byte $00 -> $40 (into the iomap window).  Offsets
+    # are in the FINAL assembled `out` (first-half copy is checksummed + mirrored;
+    # the live copy is in the embed-overwritten second half).  Recompute the
+    # first-half self-checksum afterward.
+    _bare_via_ops = [0x036D30, 0x036D44, 0x036D70,   # copy 1 (first half, checksummed)
+                     0x057AD6, 0x057AEA, 0x057B16,   # copy 2 (second half, LIVE)
+                     0x076D30, 0x076D44, 0x076D70]   # copy 3 (second half, mirror)
+    _fixed = 0
+    for _o in _bare_via_ops:
+        _v = struct.unpack_from('>I', out, _o)[0]
+        if (_v >> 24) == 0x00 and 0xEFE000 <= (_v & 0xFFFFFF) < 0xF00000:
+            struct.pack_into('>I', out, _o, 0x40000000 | _v)
+            _fixed += 1
+        else:
+            print(f"  WARNING: bare-VIA operand at +${_o:05X} = ${_v:08X} (unexpected; skipped)")
+    # Recompute the first-half self-checksum (sum of words from +4), since some
+    # patched operands ($036Dxx) live in the checksummed first half.
+    _ck = 0
+    for i in range(4, half, 2):
+        _ck = (_ck + struct.unpack_from('>H', out, i)[0]) & 0xFFFFFFFF
+    struct.pack_into('>I', out, 0, _ck)
+    print(f"=== 32-bit-clean: remapped {_fixed} bare-VIA I/O operands -> $40EFxxxx; checksum ${_ck:08X} ===")
 
     open(outfile, 'wb').write(out)
     print(f"Written to {outfile}")

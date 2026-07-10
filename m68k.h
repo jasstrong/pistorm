@@ -213,7 +213,7 @@ void m68k_write_memory_32(unsigned int address, unsigned int value);
 
 /* PiStorm speed hax */
 void m68k_add_ram_range(uint32_t addr, uint32_t upper, unsigned char *ptr);
-void m68k_add_ram_range_wtc(uint32_t addr, uint32_t upper, unsigned char *ptr);
+void m68k_add_ram_range_wtc(uint32_t addr, uint32_t upper, unsigned char *ptr, uint32_t sebus);
 void m68k_add_rom_range(uint32_t addr, uint32_t upper, unsigned char *ptr);
 void m68k_remove_range(unsigned char *ptr);
 void m68k_clear_ranges();

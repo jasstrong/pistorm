@@ -23,4 +23,10 @@ unsigned long boot32_memsize(void);
  * memory; report success (noErr) without touching it. */
 unsigned long boot32_ramtest(void);
 
+/* Build the born-32 (IS=0) PMMU page tables in tested RAM and enable
+ * translation.  Called after the ROM RAM test ($408026F0) so the destructive
+ * sweep can't clobber the tables (the old emulator-side setup at the $48 seam
+ * put them inside the swept range). */
+void boot32_pmmu_setup(void);
+
 #endif /* BOOT32_H */
