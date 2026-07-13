@@ -85,5 +85,9 @@ boot32_pmmu_setup_rom:
 	movem.l	%d0-%d7/%a0-%a5,-(%sp)
 	jsr	boot32_pmmu_setup	/* build tables + MMU globals + PMOVE CRP/SRP/TC (enable) */
 	movem.l	(%sp)+,%d0-%d7/%a0-%a5
+	.short	0xA0FD			/* paravirt: ARM the RAM-buffered trace HERE — right after the
+					 * RAM test, so the trace captures the post-RAM-test boot -> SCSI
+					 * -> stall and NOT the 100M-instruction RAM test. Emulator swallows
+					 * it (NOP) unless `setvar trace_all 1`. */
 	move.l	%a3,%a6			/* the real diagnostic return the stub saved in A3 */
 	jmp	(%a6)

@@ -1089,6 +1089,8 @@ int m68k_execute(m68ki_cpu_core *state, int num_cycles)
 
 			/* Read an instruction and call its handler */
 			REG_IR = m68ki_read_imm_16(state);
+			{ extern int trace_all_enabled; extern void trace_step(uint32_t, uint16_t);
+			  if (trace_all_enabled) trace_step(REG_PPC, REG_IR); }
 			m68ki_instruction_jump_table[REG_IR](state);
 			USE_CYCLES(CYC_INSTRUCTION[REG_IR]);
 

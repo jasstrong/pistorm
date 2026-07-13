@@ -134,6 +134,11 @@ void setvar_mac68k(struct emulator_config *cfg, char *var, char *val) {
         mode32_enabled = 1;
         printf("[MAC68K] MODE32 trap enabled\n");
     }
+    if (CHKVAR("trace_all")) {
+        extern int trace_all_enabled;
+        trace_all_enabled = 1;
+        printf("[MAC68K] TRACE-ALL enabled — armed on first loaded-code PC, dumps every instr + data access to /tmp/trace.txt\n");
+    }
 
     if (CHKVAR("fake_gusd")) {
         extern int fake_gusd_enabled;

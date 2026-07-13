@@ -1371,6 +1371,9 @@ static inline uint m68ki_read_16_fc(m68ki_cpu_core *state, uint address, uint fc
 	state->mmu_tmp_fc = fc;
 	state->mmu_tmp_rw = 1;
 	state->mmu_tmp_sz = M68K_SZ_WORD;
+	{ extern uint32_t ovl_sysrom_pos;  /* [DIRTY-DEREF] wild-address catch (see read_32) */
+	  if (ovl_sysrom_pos >= 0x40000000u && ((address >= 0x02000000u && address < 0x40000000u) || address >= 0x41000000u)) {
+	    static int wp16 = 0; if (wp16++ < 30) printf("[DIRTY-DEREF] R16 wild=$%08X PC=$%08X\n", address, REG_PPC); } }
 	m68ki_check_address_error_010_less(state, address, MODE_READ, fc); /* auto-disable (see m68kcpu.h) */
 
 #if M68K_EMULATE_PMMU
@@ -1393,26 +1396,26 @@ static inline uint m68ki_read_16_fc(m68ki_cpu_core *state, uint address, uint fc
 	address_translation_cache *cache = &state->fc_read_translation_cache;
 	if(cache->offset && address >= cache->lower && address < cache->upper)
 	{
-		return be16toh(((unsigned short *)(cache->offset + (address - cache->lower)))[0]);
+		{ extern int trace_armed; extern void trace_mem(char,uint32_t,uint32_t,int); uint _tv=(be16toh(((unsigned short *)(cache->offset + (address - cache->lower)))[0])); if(trace_armed) trace_mem('R',address,_tv,2); return _tv; }
 	}
 
 	for (int i = 0; i < state->read_ranges; i++) {
 		if(address >= state->read_addr[i] && address < state->read_upper[i]) {
 			SET_FC_TRANSLATION_CACHE_VALUES
-			return be16toh(((unsigned short *)(state->read_data[i] + (address - state->read_addr[i])))[0]);
+			{ extern int trace_armed; extern void trace_mem(char,uint32_t,uint32_t,int); uint _tv=(be16toh(((unsigned short *)(state->read_data[i] + (address - state->read_addr[i])))[0])); if(trace_armed) trace_mem('R',address,_tv,2); return _tv; }
 		}
 	}
 
 #ifdef CHIP_FASTPATH
 	if (!state->ovl && address < 0x200000) {
 		if (address & 0x01) {
-		    return ((ps_read_8(address) << 8) | ps_read_8(address + 1));
+		    { extern int trace_armed; extern void trace_mem(char,uint32_t,uint32_t,int); uint _tv=(((ps_read_8(address) << 8) | ps_read_8(address + 1))); if(trace_armed) trace_mem('R',address,_tv,2); return _tv; }
 		}
-		return ps_read_16(address);
+		{ extern int trace_armed; extern void trace_mem(char,uint32_t,uint32_t,int); uint _tv=(ps_read_16(address)); if(trace_armed) trace_mem('R',address,_tv,2); return _tv; }
 	}
 #endif
 
-	return m68k_read_memory_16(ADDRESS_68K(address));
+	{ extern int trace_armed; extern void trace_mem(char,uint32_t,uint32_t,int); uint _tv=(m68k_read_memory_16(ADDRESS_68K(address))); if(trace_armed) trace_mem('R',address,_tv,2); return _tv; }
 }
 
 // M68KI_READ_32_FC
@@ -1422,6 +1425,14 @@ static inline uint m68ki_read_32_fc(m68ki_cpu_core *state, uint address, uint fc
 	state->mmu_tmp_fc = fc;
 	state->mmu_tmp_rw = 1;
 	state->mmu_tmp_sz = M68K_SZ_LONG;
+	/* [DIRTY-DEREF] hugeSE flat IS=0 PMMU has no top-byte strip: a 24-bit-dirty
+	 * Master Pointer (flag bits in the high byte) deref'd flat = a WILD address above
+	 * RAM ($02000000..) that isn't ROM/iomap ($40800000/$40xxxxxx). Catch it. */
+	{ extern uint32_t ovl_sysrom_pos;
+	  if (ovl_sysrom_pos >= 0x40000000u && ((address >= 0x02000000u && address < 0x40000000u) || address >= 0x41000000u)) {
+	    extern void branch_ring_dump(const char*); static int wp32 = 0;
+	    if (wp32++ < 30) { printf("[DIRTY-DEREF] R32 wild=$%08X PC=$%08X\n", address, REG_PPC);
+	      if (wp32==1) branch_ring_dump("[DIRTY-DEREF] first wild R32"); } } }
 	m68ki_check_address_error_010_less(state, address, MODE_READ, fc); /* auto-disable (see m68kcpu.h) */
 
 	uint orig_addr = address;
@@ -1438,13 +1449,13 @@ static inline uint m68ki_read_32_fc(m68ki_cpu_core *state, uint address, uint fc
 	address_translation_cache *cache = &state->fc_read_translation_cache;
 	if(cache->offset && address >= cache->lower && address < cache->upper)
 	{
-		return be32toh(((unsigned int *)(cache->offset + (address - cache->lower)))[0]);
+		{ extern int trace_armed; extern void trace_mem(char,uint32_t,uint32_t,int); uint _tv=(be32toh(((unsigned int *)(cache->offset + (address - cache->lower)))[0])); if(trace_armed) trace_mem('R',address,_tv,4); return _tv; }
 	}
 
 	for (int i = 0; i < state->read_ranges; i++) {
 		if(address >= state->read_addr[i] && address < state->read_upper[i]) {
 			SET_FC_TRANSLATION_CACHE_VALUES
-			return be32toh(((unsigned int *)(state->read_data[i] + (address - state->read_addr[i])))[0]);
+			{ extern int trace_armed; extern void trace_mem(char,uint32_t,uint32_t,int); uint _tv=(be32toh(((unsigned int *)(state->read_data[i] + (address - state->read_addr[i])))[0])); if(trace_armed) trace_mem('R',address,_tv,4); return _tv; }
 		}
 	}
 
@@ -1454,13 +1465,13 @@ static inline uint m68ki_read_32_fc(m68ki_cpu_core *state, uint address, uint fc
 			uint32_t c = ps_read_8(address);
 			c |= (be16toh(ps_read_16(address+1)) << 8);
 			c |= (ps_read_8(address + 3) << 24);
-			return htobe32(c);
+			{ extern int trace_armed; extern void trace_mem(char,uint32_t,uint32_t,int); uint _tv=(htobe32(c)); if(trace_armed) trace_mem('R',address,_tv,4); return _tv; }
 		}
-		return ps_read_32(address);
+		{ extern int trace_armed; extern void trace_mem(char,uint32_t,uint32_t,int); uint _tv=(ps_read_32(address)); if(trace_armed) trace_mem('R',address,_tv,4); return _tv; }
 	}
 #endif
 
-	return m68k_read_memory_32(ADDRESS_68K(address));
+	{ extern int trace_armed; extern void trace_mem(char,uint32_t,uint32_t,int); uint _tv=(m68k_read_memory_32(ADDRESS_68K(address))); if(trace_armed) trace_mem('R',address,_tv,4); return _tv; }
 }
 
 /* Buffer snoop — detect when watched address becomes non-zero */
@@ -1490,6 +1501,7 @@ static inline void m68ki_write_8_fc(m68ki_cpu_core *state, uint address, uint fc
 	address = ADDRESS_68K(address);
 
 	R0_MARK_DIRTY(address);
+	{ extern int trace_armed; extern void trace_mem(char,uint32_t,uint32_t,int); if(trace_armed) trace_mem('W',address,value,1); }
 
 	/* [SCSI-WR8] hugeSE: any write whose 24-bit addr is the 5380 range — is it
 	 * the $40-prefixed I/O form (→custom_write→chip) or a bare $00 form that the
@@ -1607,20 +1619,8 @@ static inline void m68ki_write_16_fc(m68ki_cpu_core *state, uint address, uint f
 	/* 68000/010/EC020: mask to 24-bit before fast-path range checks */
 	address = ADDRESS_68K(address);
 	R0_MARK_DIRTY(address);
+	{ extern int trace_armed; extern void trace_mem(char,uint32_t,uint32_t,int); if(trace_armed) trace_mem('W',address,value,2); }
 
-	/* [RT-RANGE] TEMP: track the natural range the ROM RAM test writes ($2710-$2730
-	 * loop) — confirms whether it reaches the screen buffer ($01FFA700). */
-	{ uint32_t _rtpc = ADDRESS_68K(REG_PC);
-	  if (_rtpc >= 0x40802710 && _rtpc <= 0x40802730) {
-	    static uint32_t lo=0xFFFFFFFF, hi=0; static unsigned long n=0;
-	    if (address < lo) lo = address;
-	    if (address > hi) hi = address;
-	    if ((++n & 0xFFFFF)==0) printf("[RT-RANGE] RAM-test writes: $%08X..$%08X\n", lo, hi);
-	  } }
-	/* [SCRNBASE] TEMP: watch writes to ScrnBase ($0824) — if it stays 0, QuickDraw
-	 * draws to address 0 instead of the frame buffer ($01FFA700). */
-	if ((address & 0x00FFFFFF) == 0x0824)
-		printf("[SCRNBASE] $0824 <- $%08X  PC=$%08X\n", value, ADDRESS_68K(REG_PC));
 
 	/* [DIRTY-IO-WR] born-32: a WRITE to a BARE 24-bit SE I/O address (no $40 iomap
 	 * prefix) hits RAM not hardware — e.g. the ROM's `bclr #7,$EFE1FE.L`. */
@@ -1766,20 +1766,8 @@ static inline void m68ki_write_32_fc(m68ki_cpu_core *state, uint address, uint f
 	/* 68000/010/EC020: mask to 24-bit before fast-path range checks */
 	address = ADDRESS_68K(address);
 	R0_MARK_DIRTY(address);
+	{ extern int trace_armed; extern void trace_mem(char,uint32_t,uint32_t,int); if(trace_armed) trace_mem('W',address,value,4); }
 
-	/* [RT-RANGE] TEMP: track the natural range the ROM RAM test writes ($2710-$2730
-	 * loop) — confirms whether it reaches the screen buffer ($01FFA700). */
-	{ uint32_t _rtpc = ADDRESS_68K(REG_PC);
-	  if (_rtpc >= 0x40802710 && _rtpc <= 0x40802730) {
-	    static uint32_t lo=0xFFFFFFFF, hi=0; static unsigned long n=0;
-	    if (address < lo) lo = address;
-	    if (address > hi) hi = address;
-	    if ((++n & 0xFFFFF)==0) printf("[RT-RANGE] RAM-test writes: $%08X..$%08X\n", lo, hi);
-	  } }
-	/* [SCRNBASE] TEMP: watch writes to ScrnBase ($0824) — if it stays 0, QuickDraw
-	 * draws to address 0 instead of the frame buffer ($01FFA700). */
-	if ((address & 0x00FFFFFF) == 0x0824)
-		printf("[SCRNBASE] $0824 <- $%08X  PC=$%08X\n", value, ADDRESS_68K(REG_PC));
 
 	/* [DIRTY-IO-WR] born-32: a WRITE to a BARE 24-bit SE I/O address (no $40 iomap
 	 * prefix) hits RAM not hardware — e.g. the ROM's `bclr #7,$EFE1FE.L`. */
@@ -2973,6 +2961,21 @@ static inline void m68ki_exception_1010(m68ki_cpu_core *state)
 				printf("[FIGMENT] %s $%08X\n", buf, val);
 			return;
 		}
+	}
+
+	/* Trace-control paravirt traps: $A0FD arms the RAM-buffered trace, $A0FC disarms
+	 * + flushes. Placed in the boot32 trampoline right after the RAM test so tracing
+	 * is scoped to the post-RAM-test boot. Gated by trace_all_enabled (setvar trace_all)
+	 * so the trap is a harmless NOP when tracing is off. */
+	if (REG_IR == 0xA0FD) {
+		extern int trace_all_enabled; extern void trace_arm(void);
+		if (trace_all_enabled) trace_arm();
+		return;
+	}
+	if (REG_IR == 0xA0FC) {
+		extern int trace_all_enabled; extern void trace_disarm(void);
+		if (trace_all_enabled) trace_disarm();
+		return;
 	}
 
 	/* _StripAddress ($A055) — identity in 32-bit mode.

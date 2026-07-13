@@ -479,7 +479,9 @@ int gestalt_trap_intercept(void) {
     else if (is_030) result = 2;
     else return 0;
   } else if (selector == 0x61646472) {  // 'addr' (gestaltAddressingModeAttr)
-    if (cpu_type == M68K_CPU_TYPE_68030) {
+    if (ovl_sysrom_pos >= 0x40000000) {
+      result = 0x07;  /* born-32 hugeSE: always 32-bit (32BitCapable+SysZone+Addressing) */
+    } else if (cpu_type == M68K_CPU_TYPE_68030) {
       extern int mode32_active;
       result = mode32_active ? 0x07 : 0x04;
     } else if (is_030)
@@ -515,6 +517,95 @@ int figment_enabled = 0;  /* set when Figment is embedded in ROM */
 int huge_se_emu_pmmu = 0; /* 1 = old emulator-owned PMMU setup at $48 (debug fallback);
                              0 = ROM builds its own tables post-RAM-test (default) */
 int figment_verbose = 0;  /* set from HUGESE_VERBOSE env; gates debug printfs only */
+
+/* ---- TRACE-ALL: full instruction + data-access trace (RAM-buffered) ------
+ * `setvar trace_all 1`. Records into a preallocated RAM buffer (no per-insn SD
+ * I/O, so it doesn't perturb the timing-sensitive 5380 handshake) and dumps to
+ * /home/jas/trace.txt at exit: "I <rom_off> <opcode>" per instr, "W<sz>/R<sz>
+ * <addr> <val>" per data access. See trace_step/trace_flush below. */
+int trace_all_enabled = 0;   /* config gate (setvar trace_all): when set, trace_step is
+                              * CALLED every instruction, but only RECORDS while armed. */
+int trace_armed = 0;         /* set/cleared by the $A0FD/$A0FC paravirt traps */
+int trace_in_insn = 0;       /* 1 only during instruction execution — so trace_mem records
+                              * the INSTRUCTION's reads/writes, NOT the per-instruction
+                              * diagnostic probes (which read fixed addrs every insn). */
+static unsigned long trace_count = 0;
+
+/* RAM-BUFFERED trace, armed by a paravirt trap ($A0FD arms, $A0FC disarms+flushes).
+ * The $A0FD trap is placed in the boot32 trampoline right AFTER the RAM test, so the
+ * trace captures the post-RAM-test boot -> SCSI -> stall WITHOUT recording the ~100M-
+ * instruction RAM test, and without the fragile PC-range arm heuristic. Records into a
+ * preallocated RAM buffer (a couple of stores/event, NO I/O in the hot path — ~ns vs
+ * the GPIO poll's ~us, so it should NOT wedge the real 5380) and dumps to
+ * /home/jas/trace.txt at exit / on disarm. Each event = 3 uint32 slots: [tag,x,y].
+ *   instr: tag='I'<<24, x=pc, y=ir.   data: tag=(rw<<24)|size, x=addr&FFFFFF, y=val. */
+static uint32_t *trace_buf = NULL;
+static size_t    trace_bpos = 0, trace_bcap = 0;
+#define TRACE_WORDS   (128UL*1024*1024)      /* 128M slots = 512MB, ~42M events */
+void trace_flush(void);
+
+void trace_arm(void) {
+  if (!trace_buf) {
+    trace_buf = (uint32_t *)malloc(TRACE_WORDS * sizeof(uint32_t));
+    trace_bcap = trace_buf ? TRACE_WORDS : 0;
+    atexit(trace_flush);
+  }
+  trace_armed = 1;
+  printf("[TRACE] ARMED via $A0FD (RAM buffer %luMB, buf=%p)\n",
+         (unsigned long)((TRACE_WORDS * sizeof(uint32_t)) >> 20), (void *)trace_buf);
+}
+
+void trace_disarm(void) {
+  trace_armed = 0;
+  printf("[TRACE] DISARMED via $A0FC (count=%lu)\n", trace_count);
+  trace_flush();
+}
+
+void trace_step(uint32_t pc, uint16_t ir) {
+  if (!trace_armed || trace_bpos + 3 > trace_bcap) return;
+  /* Suppress the SCSI transfer/poll inner loops ($1A810-$1A8D2 = the BSY/REQ polls
+   * $1A862/$1A868/$1A8CA/$1A8D0 that spin forever) so the RAM buffer captures the
+   * higher-level boot + SCSI-op FLOW and the stall-ENTRY, not the infinite poll.
+   * Data reads at $1A5xx and the setup/dispatch stay visible. */
+  { extern uint32_t ovl_sysrom_pos; uint32_t _ro = pc - ovl_sysrom_pos;
+    if (_ro >= 0x1A810u && _ro <= 0x1A8D2u) return; }
+  trace_buf[trace_bpos++] = ((uint32_t)'I') << 24;
+  trace_buf[trace_bpos++] = pc;
+  trace_buf[trace_bpos++] = ir;
+  trace_count++;
+}
+
+void trace_mem(char rw, uint32_t addr, uint32_t val, int size) {
+  if (!trace_armed || !trace_in_insn || !trace_buf || trace_bpos + 3 > trace_bcap) return;
+  trace_buf[trace_bpos++] = (((uint32_t)(unsigned char)rw) << 24) | (uint32_t)size;
+  trace_buf[trace_bpos++] = addr & 0x00FFFFFFu;
+  trace_buf[trace_bpos++] = val;
+  trace_count++;
+}
+
+/* Dump the RAM buffer to /home/jas/trace.txt at exit (rom-relative PCs, 24-bit addrs). */
+void trace_flush(void) {
+  extern uint32_t ovl_sysrom_pos;
+  static int flushed = 0;
+  if (flushed || !trace_buf || trace_bpos == 0) return;
+  flushed = 1;
+  FILE *fp = fopen("/home/jas/trace.txt", "w");
+  if (!fp) { printf("[TRACE] flush: fopen failed\n"); return; }
+  for (size_t i = 0; i + 3 <= trace_bpos; i += 3) {
+    uint32_t tag = trace_buf[i], x = trace_buf[i + 1], y = trace_buf[i + 2];
+    char t = (char)(tag >> 24);
+    if (t == 'I') {
+      uint32_t ro = x - ovl_sysrom_pos;
+      if (ro < 0x80000u) fprintf(fp, "I %05X %04X\n", ro, y & 0xFFFF);
+      else               fprintf(fp, "i %08X %04X\n", x & 0x00FFFFFFu, y & 0xFFFF);
+    } else {
+      int sz = (int)(tag & 0xFF);
+      fprintf(fp, "%c%d %06X %0*X\n", t, sz, x, sz * 2, y);
+    }
+  }
+  fclose(fp);
+  printf("[TRACE] FLUSHED %lu events -> /home/jas/trace.txt\n", trace_count);
+}
 int dbg_codewin = 0;            /* DISABLED 2026-07-09: the $17600-$17E00 window was a
                                 * STALE hardcoded range — FIG-ALLOC proved it now sits inside
                                 * legit contiguous Ptr blocks ($017958..$017E7C is the SCSI
@@ -1032,6 +1123,27 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			  if (rom_off == 0x5CA) { static int s=0; if(s++<2) printf("[SCRNBASE-SET] $0824 <- *(0x10C)=$%08X PC=$%08X\n", m68ki_read_32(state,0x10C), REG_PC); }
 			  if (rom_off == 0xF4A) { static int f=0; if(f==0) branch_ring_dump("floppy-X bail (1st give-up)"); if(f++<3) printf("[ICON-F4A] ScrnBase($0824)=$%08X PC=$%08X\n", m68ki_read_32(state,0x0824), REG_PC); }
 			  if (rom_off == 0x1176) { static int h=0; if(h++<3) printf("[HAPPYMAC] ScrnBase($0824)=$%08X PC=$%08X\n", m68ki_read_32(state,0x0824), REG_PC); }
+			  /* [VECDUMP] autovector / exception-vector sanity: born-32 handlers MUST be in ROM
+			   * ($40800000-$40880000). A vector holding $008xxxxx = 24-bit-DIRTY -> an IRQ
+			   * auto-vectors into RAM instead of the ROM ISR -> SCSI completion never serviced. */
+			  if (rom_off == 0x1A206) { static int vd=0; if (vd++==0) {
+			    static const int voff[] = {0x08,0x0C,0x10,0x24,0x28,0x2C,0x60,0x64,0x68,0x6C,0x70,0x74,0x78,0x7C,-1};
+			    static const char* vnm[] = {"busErr","addrErr","illegal","trace","lineA","lineF","spurious","L1-VIA","L2-SCC","L3-VIASCC","L4","L5","L6","L7-NMI"};
+			    printf("[VECDUMP] at SCSI Mgr $1A206  SR=$%04X (IPLmask=%d):\n", (unsigned)m68k_get_reg(NULL,M68K_REG_SR), ((unsigned)m68k_get_reg(NULL,M68K_REG_SR)>>8)&7);
+			    for (int k=0; voff[k]>=0; k++) {
+			      uint32_t a = m68ki_read_32(state, voff[k]);
+			      const char* w = (a>=0x40800000&&a<0x40880000)?"ROM-ok":(a>=0x40000000&&a<0x41000000)?"40-io/other":(a>=0x800000&&a<0x40000000)?"** 24bit-DIRTY **":(a<0x800000)?"lowRAM":"?";
+			      printf("   $%03X %-9s = $%08X  %s\n", voff[k], vnm[k], a, w);
+			    }
+			  } }
+			  /* [TERM-ENTRY] first entry to the terminal SCC serial-monitor routine ($1F4A):
+			   * dump regs + stack + branch ring to see WHAT dropped the boot here (exception
+			   * vector? DebugStr trap? bad opcode?). d7 = the routine flag bitmask. */
+			  if (rom_off == 0x1F4A) { static int t=0; if (t++==0) {
+			    printf("[TERM-ENTRY] $1F4A D0-D7:"); for (int i=0;i<8;i++) printf(" %08X", REG_DA[i]);
+			    printf("\n[TERM-ENTRY] A0-A7:"); for (int i=8;i<16;i++) printf(" %08X", REG_DA[i]);
+			    printf("\n[TERM-ENTRY] stack:"); for (int i=0;i<10;i++) printf(" %08X", m68ki_read_32(state,(REG_DA[15]+i*4)&0xFFFFFF));
+			    printf("\n"); branch_ring_dump("[TERM-ENTRY] how we reached the serial-monitor hang"); } }
 			  /* [ROVR-GET] InitResources' GetResource('ROvr',0) returns a bogus non-nil handle
 			   * whose master ptr = a resource map base -> ROM executes the map (Sad Mac F/3).
 			   * $48234 = insn right after _GetResource pops the handle into D0. Log the handle,
@@ -1051,7 +1163,7 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			        for (int w=0; w<16; w+=2) printf(" %04X", m68ki_read_16(state,a0+off+w)); printf("\n"); } } }
 			  /* [ROVRMP-WR] TEMP: watch the 'ROvr' master pointer slot ($22B8) — catch the
 			   * relocation of the executing block (who moves it, from which trap). */
-			  { static uint32_t p=0xDEADBEEF; uint32_t v=m68ki_read_32(state,0x22B8); if(v!=p){ static int n=0; if(p!=0xDEADBEEF && n++<14) { uint32_t ob=p&0x1FFFFFF, nb=v&0x1FFFFFF;
+			  if(!trace_all_enabled){ static uint32_t p=0xDEADBEEF; uint32_t v=m68ki_read_32(state,0x22B8); if(v!=p){ static int n=0; if(p!=0xDEADBEEF && n++<14) { uint32_t ob=p&0x1FFFFFF, nb=v&0x1FFFFFF;
 			      printf("[ROVRMP-WR] $22B8(MP): $%08X -> $%08X @PPC=$%08X PC=$%08X SP=$%08X | old tags=$%02X first: %04X %04X %04X %04X | new tags=$%02X\n",
 			             p, v, REG_PPC, REG_PC, REG_DA[15],
 			             (ob>0x2000&&ob<0x1F00000)?m68ki_read_8(state,ob-16+4):0xEE,
@@ -1109,7 +1221,7 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			  /* [BOOTCODE-WR] TEMP: pass-2 System startup code runs at $205xx (sys heap); its block
 			   * turned into "SICN" resource data mid-trap -> wild RTS -> Sad Mac F/3. Watch $20600
 			   * to catch the overwriter (figment move/purge of an executing block?). REMOVE AFTER USE. */
-			  { static uint32_t p=0xDEADBEEF; uint32_t v=m68ki_read_32(state,0x20600); if(v!=p){ static int n=0; if(p!=0xDEADBEEF && n++<10) printf("[BOOTCODE-WR] $20600: $%08X -> $%08X @PPC=$%08X PC=$%08X A0=$%08X A1=$%08X SP=$%08X\n", p, v, REG_PPC, REG_PC, REG_DA[8], REG_DA[9], REG_DA[15]); p=v; } }
+			  if(!trace_all_enabled){ static uint32_t p=0xDEADBEEF; uint32_t v=m68ki_read_32(state,0x20600); if(v!=p){ static int n=0; if(p!=0xDEADBEEF && n++<10) printf("[BOOTCODE-WR] $20600: $%08X -> $%08X @PPC=$%08X PC=$%08X A0=$%08X A1=$%08X SP=$%08X\n", p, v, REG_PPC, REG_PC, REG_DA[8], REG_DA[9], REG_DA[15]); p=v; } }
 			  /* [CHKHEAP] figment _CheckHeap walk advance ($40846610: adda.l $8(a2),a2 =
 			   * workBlock += workBlock->size@+8). If size==0 (or a2 doesn't advance) the walk
 			   * loops forever — that malformed block is the heap-corruption root the $A02F
@@ -1206,6 +1318,7 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			  if (rom_off == 0x481F0) { static int w=0; if(w++<14) printf("[MNEXT-WR] $481F0 map(a1)=$%06X <- *($A54)=$%08X\n", REG_DA[9]&0x1FFFFFF, m68ki_read_32(state,0xA54)); }
 			  /* [PCHIST] where do the (scarce) instructions go? coarse PC buckets. */
 			  { static unsigned long long tot=0, b_chk=0, b_fig=0, b_rm=0, b_scsi=0, b_drv=0, b_rom=0, b_oth=0;
+			    static unsigned long pg[2048];  /* 256-byte buckets over $40800000-$40880000 (the ROM) */
 			    uint32_t pc=REG_PC; tot++;
 			    if (pc>=0x40846580 && pc<0x40846b00) b_chk++;
 			    else if (pc>=0x40840000 && pc<0x40848000) b_fig++;
@@ -1214,7 +1327,10 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			    else if (pc>=0x00013000 && pc<0x00016000) b_drv++;
 			    else if (pc>=0x40800000 && pc<0x40880000) b_rom++;
 			    else b_oth++;
-			    if ((tot % 20000000ULL)==0) printf("[PCHIST] %lluM instr: chkheap=%.0f%% fig=%.0f%% resmgr=%.0f%% scsiMgr=%.0f%% driver=%.0f%% otherROM=%.0f%% other=%.0f%%\n", tot/1000000ULL, 100.0*b_chk/tot, 100.0*b_fig/tot, 100.0*b_rm/tot, 100.0*b_scsi/tot, 100.0*b_drv/tot, 100.0*b_rom/tot, 100.0*b_oth/tot); }
+			    if (pc>=0x40800000 && pc<0x40880000) pg[(pc-0x40800000)>>8]++;
+			    if ((tot % 20000000ULL)==0) { printf("[PCHIST] %lluM instr: chkheap=%.0f%% fig=%.0f%% resmgr=%.0f%% scsiMgr=%.0f%% driver=%.0f%% otherROM=%.0f%% other=%.0f%%\n", tot/1000000ULL, 100.0*b_chk/tot, 100.0*b_fig/tot, 100.0*b_rm/tot, 100.0*b_scsi/tot, 100.0*b_drv/tot, 100.0*b_rom/tot, 100.0*b_oth/tot);
+			      /* dump the 8 hottest 256-byte ROM windows to localize the spin loop */
+			      for (int k=0;k<8;k++){ int mx=-1; unsigned long mv=0; for(int j=0;j<2048;j++) if(pg[j]>mv){mv=pg[j];mx=j;} if(mx<0||mv==0)break; printf("    [PCHOT] $%08X  %lu (%.0f%%)\n", 0x40800000u+((uint32_t)mx<<8), mv, 100.0*mv/tot); pg[mx]=0; } } }
 			  /* [253C-CLOBBER] removed 2026-06-27: debunked (was reading stale D0); also it
 			   * did an m68ki_read_32 EVERY instruction — a major throttle. */
 			  if (rom_off == 0x9384) {
@@ -1500,6 +1616,15 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			           pb, m68ki_read_32(state, pb), m68ki_read_32(state, pb + 4),
 			           m68ki_read_16(state, pb + 8), REG_PC);
 			  }
+		  /* [RAMTEST] RAM-test real entry ($26F6, after the $26F0->$6F000 stub). Log tested
+		   * range (a0=start,a1=end) + call count: ONE giant slow pass or the dispatcher
+		   * RE-RUNNING the test in a loop (never proceeding to boot)? */
+		  if (rom_off == 0x26F6) {
+		    static unsigned rc = 0; rc++;
+		    if (rc <= 40)
+		      printf("[RAMTEST] call #%u  a0=$%08X a1=$%08X size=$%08X\n",
+		             rc, REG_DA[8], REG_DA[9], REG_DA[9]-REG_DA[8]);
+		  }
 			  /* KillBlock runaway downward-scan trace (MemMgrInternal.c:2714).
 			   * Reset per-call at entry ($433CA); count loop iters at $43570
 			   * (a4=workBlock, a2=curHeap). Dump the chain once it runs away. */
@@ -2115,8 +2240,11 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 #endif
 
 			/* Read an instruction and call its handler */
-			REG_IR = m68ki_read_imm_16(state);
+			{ uint32_t _tpc = REG_PC; REG_IR = m68ki_read_imm_16(state);
+			  if (trace_all_enabled) trace_step(_tpc, REG_IR); }
+			trace_in_insn = 1;
 			m68ki_instruction_jump_table[REG_IR](state);
+			trace_in_insn = 0;
 			USE_CYCLES(CYC_INSTRUCTION[REG_IR]);
 
 			/* Trace m68k_exception, if necessary */
