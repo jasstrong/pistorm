@@ -1903,6 +1903,48 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			      printf("[SONY-PC] PC=$%08X (driver+$%04X)\n",
 			             REG_PC, rom_off - 0x34684);
 			  }
+			  /* [BLKREAD] block-read orchestrator ($4200): the retry logic "sees" the RESULT of
+			   * the read, not the raw 5380 bytes we watch. Dump per call: the requested block/LBA
+			   * + buffer (regs) + the FIRST 8 bytes actually at the buffer (did the data land?) +
+			   * ioResult so far. Same LBA repeating = retry; different = progress. */
+			  if (rom_off == 0x4200) { static int br=0; if (br++ < 20) {
+			    uint32_t a0=REG_DA[8], a1=REG_DA[9], a2=REG_DA[10], a3=REG_DA[11];
+			    printf("[BLKREAD] #%d D0=%08X D1=%08X D2=%08X D3=%08X D4=%08X\n", br, REG_DA[0],REG_DA[1],REG_DA[2],REG_DA[3],REG_DA[4]);
+			    printf("          A0=%08X A1=%08X A2=%08X A3=%08X A4=%08X A5=%08X\n", a0,a1,a2,a3,REG_DA[12],REG_DA[13]);
+			    /* dump 8 bytes at the likely buffer pointers (a0/a2, masked to RAM) to see if data is there */
+			    uint32_t bp=a2 & 0x01FFFFFF; printf("          [a2&RAM=%08X]:", bp); for(int k=0;k<8;k++) printf(" %02X", m68ki_read_8(state, bp+k)); printf("\n");
+				    printf("          ret*sp=%08X A6=%08X\n", m68ki_read_32(state, REG_DA[15] & 0x01FFFFFF), REG_DA[14]);
+				    if (br == 10) { extern void branch_ring_dump(const char*); branch_ring_dump("[BLKREAD] parse decided to RE-READ block 0"); }
+				    if (br == 10) { printf("[BLKREAD] A6 frame chain (return addrs = the looping caller):\n");
+				      uint32_t fp=REG_DA[14]&0x01FFFFFF; for(int d=0; d<8 && fp>=0x1000 && fp<0x2000000; d++){
+				        uint32_t ra=m68ki_read_32(state, fp+4); printf("   [fp=%08X] ret=%08X\n", fp, ra); fp=m68ki_read_32(state, fp)&0x01FFFFFF; } }
+			  } }
+			  /* [DDR-SCAN] boot device-scan ($4080): why does it bail per device -> re-scan loop? */
+			  if (rom_off == 0x4080) { static int n=0; if(n++<10) printf("[DDR-SCAN] $4080 enter A6=%08X\n", REG_DA[14]); }
+			  if (rom_off == 0x4096) { static int n=0; if(n++<10) printf("[DDR-SCAN]  DDR sig read: (a7)=%04X (want $4552 ER)\n", m68ki_read_16(state, REG_DA[15]&0x1FFFFFF)); }
+			  if (rom_off == 0x40A0) { static int n=0; if(n++<10) printf("[DDR-SCAN]  sbDrvrCount@$10(a7)=%04X blkSize@$2=%04X\n", m68ki_read_16(state,(REG_DA[15]+0x10)&0x1FFFFFF), m68ki_read_16(state,(REG_DA[15]+2)&0x1FFFFFF)); }
+			  if (rom_off == 0x40D8) { static int n=0; if(n++<10) printf("[DDR-SCAN]  _NewPtr($40D6) D0=%08X A0=%08X %s\n", REG_DA[0], REG_DA[8], (REG_DA[0]&0xFFFF)?"** FAILED **":"ok"); }
+			  if (rom_off == 0x40BC) { static int n=0; if(n++<10) printf("[DDR-SCAN]  BAIL $40BC: no ddType==1 Mac driver in descriptors\n"); }
+			  if (rom_off == 0x411A) { static int n=0; if(n++<10) printf("[DDR-SCAN]  BAIL $411A (DDR parse reject)\n"); }
+			  if (rom_off == 0x4112) { static int n=0; if(n++<10) printf("[DDR-SCAN]  BAIL $4112 (block read error)\n"); }
+			  /* [PART] partition-map parse: does hugeSE match the "Apple" partition type? ($4120) */
+			  if (rom_off == 0x40FE) { static int n=0; if(n++<8){ uint32_t a2=REG_DA[10]&0x1FFFFFF; printf("[PART] blk read sig(a2)=%04X (PM=$504D) pmMapBlkCnt@4=%08X\n", m68ki_read_16(state,a2), m68ki_read_32(state,a2+4)); } }
+			  if (rom_off == 0x4120) { static int n=0; if(n++<12){ uint32_t a2=REG_DA[10]&0x1FFFFFF; char t[34]; for(int k=0;k<32;k++){ uint8_t c=m68ki_read_8(state,a2+0x30+k); t[k]=(c>=32&&c<127)?c:0; } t[32]=0; printf("[PART] a2raw=%08X masked=%08X type(masked)=\"%s\" CPU-reads $30(a2raw)=%08X\n", REG_DA[10], a2, t, m68ki_read_32(state, (REG_DA[10]+0x30))); } }
+			  if (rom_off == 0x416E) { static int n=0; if(n++<12) printf("[PART] entry REJECTED (not Apple) -> $416E\n"); }
+				  /* [PART2] reached $413E = passed "Apple_Driver" type => THIS is the driver partition.
+				   * Dump the fields it now checks (name/start/size/bootsize/cksum) + a2 raw-vs-masked. */
+				  if (rom_off == 0x413E) { static int n=0; if(n++<6){ uint32_t a2r=REG_DA[10], a2=a2r&0x1FFFFFF; char nm[8]; for(int k=0;k<4;k++){uint8_t c=m68ki_read_8(state,a2+0x10+k); nm[k]=(c>=32&&c<127)?c:46;} nm[4]=0;
+				    printf("[PART2] DRIVER partition! a2raw=%08X masked=%08X pmPartName@$10=\"%s\"(want Maci) start@$8=%08X size@$C=%08X bootSize@$60=%08X cksum@$74=%04X\n",
+				      a2r, a2, nm, m68ki_read_32(state,a2+8), m68ki_read_32(state,a2+0xC), m68ki_read_32(state,a2+0x60), m68ki_read_16(state,a2+0x74)); } }
+				  if (rom_off == 0x4148) { static int n=0; if(n++<6) printf("[PART2]  passed name check; d0(ddBlock)=%08X vs pmPyPartStart@$8=%08X\n", REG_DA[0], m68ki_read_32(state,(REG_DA[10]&0x1FFFFFF)+8)); }
+				  if (rom_off == 0x4166) { static int n=0; if(n++<6) printf("[PART2]  reached CKSUM cmp: computed d0=%08X vs pmBootCksum@$74=%04X\n", REG_DA[0], m68ki_read_16(state,(REG_DA[10]&0x1FFFFFF)+0x74)); }
+				  if (rom_off == 0x418E) { static int n=0; if(n++<4) printf("[PART2]  *** ACCEPTED driver partition -> $418E ***\n"); }
+				  if (rom_off == 0x416C) { static int n=0; if(n++<6) printf("[PART2]  REJECTED at boot-checksum ($416C) despite type/name match!\n"); }
+			  /* [RDRESULT] the block read $41D4 just returned to $4080 ($4092 checks it). d7=SCSI
+			   * result. Capture it: the read got correct DATA but returns a spurious ERROR here. */
+			  if (rom_off == 0x4092) { static int n=0; if(n++<12) printf("[RDRESULT] read returned: d7=%08X d0=%08X SR=%04X %s\n", REG_DA[7], REG_DA[0], (unsigned)m68k_get_reg(NULL,M68K_REG_SR), (m68k_get_reg(NULL,M68K_REG_SR)&4)?"(Z=1 ok)":"(Z=0 ERROR->bail)"); }
+			  if (rom_off == 0x4200) { static int n=0; if(n++<12) printf("[RDRESULT] sel1 dispatch result (a7)=%04X\n", m68ki_read_16(state, REG_DA[15]&0x1FFFFFF)); }
+			  if (rom_off == 0x420C) { static int n=0; if(n++<12) printf("[RDRESULT] sel2(select) dispatch result (a7)=%04X\n", m68ki_read_16(state, REG_DA[15]&0x1FFFFFF)); }
 			  /* .Sony driver dispatch trace */
 			  if (rom_off == 0x4332) {
 			    static int poll_dbg = 0;
