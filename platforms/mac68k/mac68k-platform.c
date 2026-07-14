@@ -36,6 +36,12 @@ uint32_t ovl_sysrom_pos = 0x400000;
 uint32_t ovl_decode_size = 0x20000; /* 128KB OVL overlay on Mac SE */
 uint32_t bigse_vbuf_virt = 0x7F0000;  /* video buffer virt addr, set by OVL handler */
 
+/* Big/Huge SE: the SE video/sound buffer occupies the top 64KB of visible RAM;
+ * its writes mirror to the SE-bus physical video/sound at $3F0000 (the real CRT
+ * + BBU audio). */
+#define BIGSE_VBUF_SIZE  0x010000
+#define BIGSE_VBUF_PHYS  0x3F0000
+
 /* Runtime fake-revert of the on-disk 'gusd' gestalt patch (bigSE only).  The
  * disk keeps machine 5/9 addressing-method = $0005 (the 32-bit-clean IIci
  * method, which hugeSE's System needs).  bigSE is 24-bit (cpu 68030_24) and
@@ -212,7 +218,33 @@ void handle_ovl_mappings_mac68k(struct emulator_config *cfg) {
 
         uint32_t ram_start = ovl ? ovl_decode_size : 0;
         uint32_t ram_end = cfg->map_size[index];
-        if (ram_start < ram_end) {
+        /* bigSE declares the WHOLE 8MB as one wtcram map with NO separate vidram
+         * map.  Carve the top 64KB (the SE video/sound window; ScrnBase =
+         * MemTop-$5900 lives here) as a relocating WTC that mirrors to the SE-bus
+         * physical video/sound at $3F0000, so the framebuffer reaches the real
+         * CRT (else the BBU shows garbage = "simasimac").  The rest stays plain
+         * fast RAM.  This is CODE-SIDE (not a config split), and
+         * m68k_add_ram_range_wtc sets a fast READABLE range, so the stock SE RAM
+         * test still reads it back and counts it into MemTop (a config-level
+         * vidram split does drop MemTop; this does not).  hugeSE is untouched:
+         * its sysram is plain MAPTYPE_RAM and its video uses a separate vidram
+         * map handled below, so this branch never fires for it. */
+        int wtc_sysram = (cfg->map_type[index] == MAPTYPE_RAM_WTC)
+                         && (get_named_mapped_item(cfg, "vidram") == -1);
+        uint32_t vid_start = (ram_end >= BIGSE_VBUF_SIZE) ? ram_end - BIGSE_VBUF_SIZE : ram_end;
+        if (wtc_sysram && ram_start < vid_start) {
+            if (ram_wtc_ptr && ram_wtc_ptr != cfg->map_data[index]) {
+                m68k_remove_range(ram_wtc_ptr);   /* drop a prior carve (reset re-run) */
+                ram_wtc_ptr = NULL;
+            }
+            ram_range_ptr = cfg->map_data[index] + ram_start;
+            m68k_add_ram_range(ram_start, vid_start, ram_range_ptr);
+            ram_wtc_ptr = cfg->map_data[index] + vid_start;
+            m68k_add_ram_range_wtc(vid_start, ram_end, ram_wtc_ptr, BIGSE_VBUF_PHYS);
+            bigse_vbuf_virt = vid_start;
+            printf("[MAC68K] bigSE video WTC %08X-%08X -> SE bus %08X (CRT mirror)\n",
+                   (unsigned)vid_start, (unsigned)ram_end, (unsigned)BIGSE_VBUF_PHYS);
+        } else if (ram_start < ram_end) {
             ram_range_ptr = cfg->map_data[index] + ram_start;
             m68k_add_ram_range(ram_start, ram_end, ram_range_ptr);
         }
@@ -288,9 +320,7 @@ void shutdown_platform_mac68k(struct emulator_config *cfg) {
 #define BIGSE_SCSI_SIZE  0x080000
 #define BIGSE_SCSI_PHYS  0x580000
 
-/* Big/Huge SE: video buffer remap — see bigse_vbuf_virt declared above */
-#define BIGSE_VBUF_SIZE  0x010000
-#define BIGSE_VBUF_PHYS  0x3F0000
+/* Big/Huge SE: video buffer remap — BIGSE_VBUF_SIZE/PHYS defined near the top */
 
 /* SE-bus remap shim (configurable, underneath the core): translate a physical
  * address to its real SE-bus address via the cfg `iomap` windows.
