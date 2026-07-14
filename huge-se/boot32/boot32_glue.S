@@ -11,6 +11,7 @@
  *   blob+0 -> RAM sizing replacement  (patched over $40802928)
  *   blob+6 -> RAM test   replacement  (patched over $408026F0)
  */
+#include "boot32.h"		/* BOOT32_MEMTOP / BOOT32_L1 (configurable RAM top) */
 	.text
 	.even
 
@@ -40,13 +41,13 @@ boot32_memsize_rom:
 	 * live stack. */
 	move.l	%sp,%d2
 	sub.l	#0x20000,%d2		/* d2 = SP - 128KB (preserve stack) */
-	cmp.l	#0x01FE0000,%d2
+	cmp.l	#BOOT32_L1,%d2
 	bcs.s	0f
-	/* Cap at $01FE0000: the 64KB below the $01FF0000 WTC video buffer is
+	/* Cap at BOOT32_L1 (MemTop-128KB): the 64KB below the WTC video buffer is
 	 * reserved for the born-32 PMMU page tables (boot32_pmmu_setup builds them
-	 * at $01FE0000).  The RAM test caps at the same boundary.  Filling above it
+	 * at BOOT32_L1).  The RAM test caps at the same boundary.  Filling above it
 	 * would corrupt the descriptors (the POST re-sizes after the tables exist). */
-	move.l	#0x01FE0000,%d2
+	move.l	#BOOT32_L1,%d2
 0:	move.l	#0x4000,%a0
 	move.l	#0x6DB6DB6D,%d1		/* authentic Mac RAM-test fill pattern */
 1:	cmp.l	%d2,%a0

@@ -34,6 +34,23 @@ MEMTOP   = 0x800000               # Visible MemTop during 24-bit boot (8MB)
 VBUF_OLD  = 0x3F0000              # Original SE video/sound base
 VBUF_NEW  = MEMTOP - 0x10000     # $7F0000 (just below 8MB MemTop)
 
+# Late (post-boot32, OS-visible) MemTop.  boot32's RAM-sizing routine installs
+# this as SP/MemTop after the early POST, and the born-32 PMMU maps the WTC
+# video to its top-64KB.  Parsed from boot32.h so the ROM patches here, the
+# boot32 C/asm, and the emulator's MemTop force all agree on ONE value — change
+# BOOT32_MEMTOP in boot32.h (and the sysram/vidram sizes in huge-se.cfg) to
+# reconfigure the born-32 RAM size.
+def _parse_boot32_memtop():
+    import os, re
+    hdr = os.path.join(os.path.dirname(__file__), 'boot32', 'boot32.h')
+    m = re.search(r'#define\s+BOOT32_MEMTOP\s+(0x[0-9A-Fa-f]+)', open(hdr).read())
+    if not m:
+        raise RuntimeError("could not parse BOOT32_MEMTOP from boot32.h")
+    return int(m.group(1), 16)
+BOOT32_MEMTOP   = _parse_boot32_memtop()      # e.g. $02000000 (32MB)
+B32_VIDEO       = BOOT32_MEMTOP - 0x10000     # late WTC video base (top-64KB)
+B32_RAMTEST_CAP = BOOT32_MEMTOP - 0x100       # RAM-test A1 cap (protect stack regs)
+
 def build_combo_resources(rom, combo_rom_off):
     """Convert old-format ROM resources into SuperMario HiRAM combo format.
 
@@ -557,14 +574,14 @@ def patch_rom(infile, outfile):
     ]
     _icon_done = 0
     for _site, _op, _old in _icon_sites:
-        _new = (_old & 0x0000FFFF) | 0x01FF0000
+        _new = (_old & 0x0000FFFF) | B32_VIDEO
         if rom[_site:_site+6] == struct.pack('>HI', _op, _old):
             rom[_site:_site+6] = struct.pack('>HI', _op, _new)
             _icon_done += 1
             patches += 1
         else:
             print(f"  WARN: screen site ${_site:05X} mismatch (got {rom[_site:_site+6].hex()}), skipped")
-    print(f"=== Boot/Sad-Mac screen dests → $01FFxxxx: {_icon_done}/{len(_icon_sites)} sites ===")
+    print(f"=== Boot/Sad-Mac screen dests → ${B32_VIDEO:07X}xxx: {_icon_done}/{len(_icon_sites)} sites ===")
 
     # === boot32: replace the SE ROM's 24-bit RAM test / sizing (first-half) ===
     # The power-on diagnostic dispatcher (entered via $40800044 -> $40801BDE)
@@ -709,9 +726,9 @@ def patch_rom(infile, outfile):
         #      `jmp (a6)` lands there AFTER the final sweep, so it builds the page
         #      tables + MMU globals + enables translation with nothing left to clobber
         #      them, then restores A6 from A3 and returns to the POST — MMU now on.
-        _rts = (struct.pack('>HI', 0xB3FC, 0x01FFFF00)    # cmpa.l #$1FFFF00,a1
+        _rts = (struct.pack('>HI', 0xB3FC, B32_RAMTEST_CAP)  # cmpa.l #cap,a1
               + struct.pack('>H', 0x6306)                 # bls.s +6 (a1<=cap: keep)
-              + struct.pack('>HI', 0x227C, 0x01FFFF00)    # movea.l #$1FFFF00,a1 (protect stack regs)
+              + struct.pack('>HI', 0x227C, B32_RAMTEST_CAP)  # movea.l #cap,a1 (protect stack regs)
               + struct.pack('>HI', 0xB1FC, 0x00200000)    # cmpa.l #$200000,a0  (LAST RAM-test call?)
               + struct.pack('>H', 0x6608)                 # bne.s +8 (not last: skip A3/A6 redirect)
               + struct.pack('>H', 0x264E)                 # movea.l a6,a3  (save diag return)

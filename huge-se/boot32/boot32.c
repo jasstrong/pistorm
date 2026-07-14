@@ -41,8 +41,7 @@ unsigned long boot32_ramtest(void)
  *     [8]=ROM+SCSI ($40800000, no CI)   [9-F]=I/O ($409-$40F, CI)
  *   TC = $80F08450: E=1, PS=15(32KB), IS=0, TIA=8 TIB=4 TIC=5
  *   CRP/SRP = (limit $7FFF0002, aptr $01FE0000) */
-#define BOOT32_L1 0x01FE0000UL
-#define BOOT32_L2 0x01FE0400UL
+/* BOOT32_L1 / BOOT32_L2 now derived from BOOT32_MEMTOP in boot32.h. */
 void boot32_pmmu_setup(void)
 {
 	volatile unsigned long *l1 = (volatile unsigned long *)BOOT32_L1;

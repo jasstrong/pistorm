@@ -1317,7 +1317,7 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			  if (rom_off == 0x48EEC) { static int w=0; if(w++<14) printf("[MNEXT-WR] $48EEC map(a1)=$%06X <- a0=$%08X\n", REG_DA[9]&0x1FFFFFF, REG_DA[8]); }
 			  if (rom_off == 0x481F0) { static int w=0; if(w++<14) printf("[MNEXT-WR] $481F0 map(a1)=$%06X <- *($A54)=$%08X\n", REG_DA[9]&0x1FFFFFF, m68ki_read_32(state,0xA54)); }
 			  /* [PCHIST] where do the (scarce) instructions go? coarse PC buckets. */
-			  { static unsigned long long tot=0, b_chk=0, b_fig=0, b_rm=0, b_scsi=0, b_drv=0, b_rom=0, b_oth=0;
+			  if (0) { static unsigned long long tot=0, b_chk=0, b_fig=0, b_rm=0, b_scsi=0, b_drv=0, b_rom=0, b_oth=0;
 			    static unsigned long pg[2048];  /* 256-byte buckets over $40800000-$40880000 (the ROM) */
 			    uint32_t pc=REG_PC; tot++;
 			    if (pc>=0x40846580 && pc<0x40846b00) b_chk++;
@@ -2088,9 +2088,24 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 					uint32_t ram_size = (ram_idx >= 0) ? cfg->map_size[ram_idx] : 0x800000;
 					int is_huge_se = (ovl_sysrom_pos >= 0x40000000);
 
-					/* Huge SE: born-32-bit. Full 32MB visible, IS=0 PMMU.
+					/* Huge SE: born-32-bit, IS=0 PMMU.  MemTop = the top of the
+					 * born-32 RAM, derived from the config's vidram map (its WTC
+					 * video buffer sits in the top 64KB of visible RAM) so a
+					 * reconfigured RAM size in huge-se.cfg flows through here with
+					 * no code change.  Falls back to sysram top, then 32MB.
 					 * Big SE: use actual RAM size. */
-					uint32_t memtop = is_huge_se ? 0x02000000 : ram_size;
+					uint32_t memtop;
+					if (is_huge_se) {
+						int32_t vid_idx = get_named_mapped_item(cfg, "vidram");
+						if (vid_idx >= 0)
+							memtop = (uint32_t)(cfg->map_offset[vid_idx] + cfg->map_size[vid_idx]);
+						else if (ram_idx >= 0)
+							memtop = ram_size + 0x10000;
+						else
+							memtop = 0x02000000;
+					} else {
+						memtop = ram_size;
+					}
 					REG_DA[14] = memtop;
 					printf("[%s] MemTop forced: A6=$%08X → $%08X\n",
 					       is_huge_se ? "HUGE-SE" : "BIG-SE", old, memtop);
