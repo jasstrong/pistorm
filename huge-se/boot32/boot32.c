@@ -48,10 +48,24 @@ void boot32_pmmu_setup(void)
 	volatile unsigned long *l2 = (volatile unsigned long *)BOOT32_L2;
 	int i;
 
+	/* Default every L1 entry to a base-$0 early-termination page descriptor: a
+	 * "dirty alias" that maps its 16MB slot onto physical $0-$16MB, i.e. STRIPS
+	 * the top byte of any address landing there (born-32's 24-bit-dirty-pointer
+	 * tolerance). */
 	for (i = 0; i < 256; i++)
 		l1[i] = 0x00000019UL;                 /* DT=1, base $0 (dirty alias) */
-	l1[0x00] = 0x00000019UL;                  /* RAM 0-16M identity */
-	l1[0x01] = 0x01000019UL;                  /* RAM 16-32M identity */
+	/* Identity-map exactly the L1 slots backed by REAL RAM — one 16MB slot per
+	 * $01000000 of MemTop — so accesses to real RAM pass straight through.
+	 * Everything above stays a base-$0 alias, so a dirty (bit-24+) pointer over
+	 * the RAM top is stripped into low RAM rather than hitting non-existent
+	 * physical.  Derived from BOOT32_MEMTOP so 16MB/32MB are both correct
+	 * (16MB: only slot 0 identity; 32MB: slots 0-1).  For MemTop < 16MB the loop
+	 * is empty and slot 0's base-$0 alias already identity-maps the low 16MB. */
+	{
+		int ram_slots = (int)(BOOT32_MEMTOP >> 24);
+		for (i = 0; i < ram_slots; i++)
+			l1[i] = ((unsigned long)i << 24) | 0x19UL;   /* RAM identity */
+	}
 	l1[0x40] = (BOOT32_L2 & 0xFFFFFFFCUL) | 0x02UL;  /* DT=2 -> L2 */
 
 	for (i = 0; i < 8; i++)
