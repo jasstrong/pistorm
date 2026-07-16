@@ -51,6 +51,11 @@ BOOT32_MEMTOP   = _parse_boot32_memtop()      # e.g. $02000000 (32MB)
 B32_VIDEO       = BOOT32_MEMTOP - 0x10000     # late WTC video base (top-64KB)
 B32_RAMTEST_CAP = BOOT32_MEMTOP - 0x100       # RAM-test A1 cap (protect stack regs)
 
+# hugeSE video/sound buffer is just below the born-32 MemTop (16MB->$00FF0000),
+# NOT bigSE's 8MB $7F0000.  Override VBUF_NEW (stale 8MB value) to the config-
+# derived base so the absolute video/sound operands agree with ScrnBase/the WTC.
+VBUF_NEW = B32_VIDEO
+
 def build_combo_resources(rom, combo_rom_off):
     """Convert old-format ROM resources into SuperMario HiRAM combo format.
 
