@@ -2110,6 +2110,31 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 					printf("[%s] MemTop forced: A6=$%08X → $%08X\n",
 					       is_huge_se ? "HUGE-SE" : "BIG-SE", old, memtop);
 
+					/* Born-32 boot stack: move SP off the top of RAM (where the RAM
+					 * sizing routine left it) down to the top of plain RAM just below
+					 * the WTC video/sound window.  The dispatcher installed SP at
+					 * MemTop, but MemTop-$5900..MemTop is the WTC buffer that mirrors
+					 * every write to the SE bus — so each stack push distorts the CRT
+					 * and buzzes the sound.  The WTC now covers only the video+sound
+					 * buffers ([vidram map_offset, map_high)); map_offset is the first
+					 * WTC byte, i.e. the ceiling of the plain-RAM region below it, so
+					 * it's the natural stack top (empty-descending: the first push
+					 * lands one long below, in plain RAM).  Safe here because $48 is
+					 * reached by JMP from the dispatcher (fresh boot stack — nothing
+					 * expects to unwind a pre-$48 frame), the RAM test already ran with
+					 * the high stack (its saved-reg cap is unaffected), and this new
+					 * stack sits in the fill-preserved band above BOOT32_L1.  StartBoot
+					 * later relocates the stack to BufPtr as usual.  Config-derived so
+					 * any WTC size flows through with no code change. */
+					if (is_huge_se) {
+						int32_t vsp_idx = get_named_mapped_item(cfg, "vidram");
+						if (vsp_idx >= 0) {
+							REG_DA[15] = (uint32_t)cfg->map_offset[vsp_idx];
+							printf("[HUGE-SE] Boot SP moved off WTC: A7=$%08X (top of plain RAM below video buffer)\n",
+							       REG_DA[15]);
+						}
+					}
+
 					/* Huge SE: born-32-bit (IS=0) PMMU set up at the $48 seam.
 					 * No 24-bit window — the SE ROM runs full 32-bit from here on,
 					 * so high I/O ($40xxxxxx) and RAM coexist without the high-byte
