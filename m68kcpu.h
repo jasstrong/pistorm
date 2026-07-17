@@ -1015,6 +1015,7 @@ typedef struct m68ki_cpu_core
 	uint mmu_sr_040;
 	uint mmu_atc_tag[MMU_ATC_ENTRIES], mmu_atc_data[MMU_ATC_ENTRIES];
 	uint mmu_atc_rr;
+	uint mmu_atc_mru;   /* most-recently-used entry: start ATC scan here (O(1) hot path) */
 	uint mmu_tt0, mmu_tt1;
 	uint mmu_itt0, mmu_itt1, mmu_dtt0, mmu_dtt1;
 	uint mmu_acr0, mmu_acr1, mmu_acr2, mmu_acr3;

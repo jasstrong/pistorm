@@ -270,14 +270,23 @@ uint16 pmmu_atc_lookup(m68ki_cpu_core *state, uint32 addr_in, int fc, uint16 rw,
 	unsigned int ps = (state->mmu_tc >> 20) & 0xf;
 	uint32 atc_tag = M68K_MMU_ATC_VALID | ((fc & 7) << 24) | ((addr_in >> ps) << (ps - 8));
 
-	for (int i = 0; i < MMU_ATC_ENTRIES; i++)
+	/* O(1) hot path: the real 68030 ATC is content-addressable (all 22 entries
+	 * compared in one cycle).  Emulating that as a from-index-0 linear scan on
+	 * EVERY translation is the born-32 slowdown.  Start the scan at the
+	 * most-recently-used entry instead: spatial locality (a tight loop, a data
+	 * buffer, an I/O poll) keeps hitting the same page/entry, so we return on
+	 * the first probe.  A miss still scans all entries, same as before. */
+	for (int j = 0; j < MMU_ATC_ENTRIES; j++)
 	{
+		int i = state->mmu_atc_mru + j;
+		if (i >= MMU_ATC_ENTRIES) i -= MMU_ATC_ENTRIES;
 
 		if (state->mmu_atc_tag[i] != atc_tag)
 		{
 			continue;
 		}
-		
+		state->mmu_atc_mru = i;
+
 		uint32 atc_data = state->mmu_atc_data[i];
 
 		if (!ptest && !rw)
@@ -642,8 +651,20 @@ uint32 pmmu_translate_addr_with_fc(m68ki_cpu_core *state, uint32 addr_in, uint8 
 	// it seems like at least the 68030 sets the M bit in the MMU SR
 	// if the root descriptor is of PAGE type, so do a logical and
 	// between RW and the root type.
-	// Skip ATC for CI (Cache Inhibit) pages — bit 14 of mmu_tmp_sr set by walk.
-	if (!m_side_effects_disabled && !(state->mmu_tmp_sr & 0x4000))
+	//
+	// Cache the TRANSLATION for CI (cache-inhibit) pages too, exactly like the
+	// real 68030 ATC/TLB: the CI bit inhibits caching the DATA, not the address
+	// mapping (which is a stable logical->physical map, always safe to cache).
+	// Our emulator has no data cache and never serves I/O data from a RAM buffer
+	// (custom_read_mac68k reads the SE bus fresh; SCSI/VIA aren't in any
+	// read_range), so caching the CI translation is safe — and it stops the
+	// full table re-walk on EVERY I/O access, which was making hugeSE's I/O ~an
+	// order of magnitude slower than a real 68030 and skewing the ROM's boot
+	// timing calibration (TimeSCCDB).  The old `!(mmu_tmp_sr & 0x4000)` CI-skip
+	// was scar tissue from before CI was modeled: this Musashi core came from
+	// the Amiga, whose OS never exercised the PMMU, so the ATC path was never
+	// stress-tested until born-32.
+	if (!m_side_effects_disabled)
 	{
 		pmmu_atc_add(state, addr_in, addr_out, fc, rw && type != 1);
 	}
