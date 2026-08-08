@@ -4944,6 +4944,16 @@ DoRomEntry:
     move.l %d0,%a1 // Save off for later
     move.l RomMapHndl,%a0 // get a pointer to the start of ROZ Zone
     _handlezone //
+// BORN-32 FIX (2026-08-08): the ROZ generator (ReDoMap, ~line 1473) was already
+// born-32-patched to place ROM-resource master pointers from a saved MP-block base
+// ([0x1F40]) rather than the ROM-baked RelHandle. DoRomEntry was NOT — it still adds
+// the baked 24-bit RelHandle to _handlezone's base. figment's ROZ layout puts the real
+// MP block a CONSTANT $E0 below what _handlezone returns, so the baked RelHandle
+// overshoots by $E0 into the map's TYPE LIST, corrupting the type entry $E0 past each
+// MP slot (KMAP/SERD/... return NIL → boot bails to ?-floppy). Measured gap = +$E0 for
+// every ROM resource (KCHR: computed $2794 vs actual $26B4, etc.). Correct the base so
+// DoRomEntry targets the generator's real slots.
+    suba.l #0xE0,%a0 // born-32: MP block sits $E0 below _handlezone's ROZ base
     move.l -4(%a1),%d0 // Rel handle may have useful hi byte	<C169>
     and.l Lo3Bytes,%d0 // Restrict to 24MB range off header		<C169>
     adda.l %d0,%a0 // Add in offset to MP [-4(A1) is the RelHandle] <C169>
