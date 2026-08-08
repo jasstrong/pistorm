@@ -250,6 +250,16 @@ def patch_rom(infile, outfile):
         0x4879: 'PEA',
     }
 
+    # TST.<sz> abs.L — the classic I/O-poll/strobe idiom (e.g. the ROM's
+    # `tst.b $00DFF1FF` = IWM register 8, the drive-enable line).  Same operand
+    # layout as JMP (abs.L at off+2).  Without relocation the bare 24-bit I/O
+    # address hits 32MB RAM instead of the hardware — a no-op strobe (and a
+    # stray [DIRTY-IO-RD]).  Handled SEPARATELY from abs_opcodes because TST
+    # must NOT relocate the VBUF ($3F0000) range: the ROM reuses the top of it
+    # ($3FFCxx) as the exception-time register-save area (MOVEM %d0-%sp,$3FFC80
+    # etc., which stay un-relocated), and relocating a TST there would split it.
+    tst_opcodes = {0x4A39: 'TST.B', 0x4A79: 'TST.W', 0x4AB9: 'TST.L'}
+
     moveq_imm = {}
     for dn in range(8):
         moveq_imm[0x203C + dn * 0x200] = f'MOVE.L#,D{dn}'
@@ -283,6 +293,22 @@ def patch_rom(infile, outfile):
             if patch32(off + 2, VBUF_OLD, VBUF_NEW, size=0x10000):
                 log[-1] = f"  {name:10s} " + log[-1].split(': ', 1)[1]
 
+        elif opcode in tst_opcodes:
+            # Hardware I/O ranges ONLY — deliberately no VBUF (see tst_opcodes
+            # note above: $3FFCxx is the exception register-save area).
+            name = tst_opcodes[opcode]
+            if patch32(off + 2, 0x400000, 0x40800000, size=rom_size * 2):
+                log[-1] = f"  {name:10s} " + log[-1].split(': ', 1)[1]
+            if patch32(off + 2, 0x580000, 0x40580000, size=0x80000):
+                log[-1] = f"  {name:10s} " + log[-1].split(': ', 1)[1]
+            if patch32(off + 2, 0xDFE000, 0x40DFE000, size=0x2000):
+                log[-1] = f"  {name:10s} " + log[-1].split(': ', 1)[1]
+            if patch32(off + 2, 0xEFE000, 0x40EFE000, size=0x2000):
+                log[-1] = f"  {name:10s} " + log[-1].split(': ', 1)[1]
+            if patch32(off + 2, 0x9F0000, 0x409F0000, size=0x10000) or \
+                patch32(off + 2, 0xBF0000, 0x40BF0000, size=0x10000):
+                log[-1] = f"  {name:10s} " + log[-1].split(': ', 1)[1]
+
         elif opcode in moveq_imm:
             name = moveq_imm[opcode]
             if patch32(off + 2, 0x400000, 0x40800000, size=rom_size * 2):
@@ -301,6 +327,42 @@ def patch_rom(infile, outfile):
 
     for l in log:
         print(l)
+    log.clear()
+
+    # === 2c. Save-area consistency — relocate the DIRECT absolute accesses to
+    # the exception/scratch save area up to VBUF_NEW, matching the LEA pointers
+    # the abs_opcodes pass already relocated (and the born-32 layout: the save
+    # area belongs just below the REAL 16MB MemTop, not the stock ROM's 4MB slot).
+    #
+    # The stock SE ROM's exception dispatcher saves/restores regs to a fixed
+    # absolute area at $3FFC80.. ( = $400000-$380, the "just below MemTop" slot
+    # for a 4MB machine).  LEA computations of pointers into it ($41F9 etc.) are
+    # in abs_opcodes and were relocated to VBUF_NEW ($00FFFC80..); but the DIRECT
+    # data accesses (MOVEM/MOVE/CLR/NOT/TST/ADDA abs.L) use opcodes not scanned
+    # above, so they stayed at $3FFCxx.  That SPLIT makes the dispatcher save
+    # regs at 4MB but reload (e.g.) a0 through a 16MB pointer -> garbage -> the
+    # `jmp (a0)` bus error.  Relocate the direct accesses so the whole save area
+    # is consistently at $00FFFCxx.  Gated on the operand landing in the tiny
+    # save-area range, so only these slots are touched.
+    print("\n=== Save-area direct accesses -> VBUF_NEW ($00FFFCxx) ===")
+    SA_OLD, SA_NEW, SA_SIZE = 0x3FFC00, VBUF_NEW + 0xFC00, 0x200
+    # opcode -> byte offset of its abs.L operand (MOVEM has a reg-mask word
+    # before the operand; MOVE.L #imm,abs.L has the 4-byte immediate first).
+    SA_OFF2 = {0x40F9, 0x33DF, 0x33D8, 0x23DF, 0x23C0, 0x23CB, 0x23CF,
+               0x2F39, 0x3F39, 0x2039, 0x2239, 0x42B9, 0x4279, 0x4639,
+               0x4A39, 0xDEF9}
+    SA_OFF4 = {0x48F9, 0x4CF9}   # MOVEM.L reg,abs.L / abs.L,reg
+    for off in range(0, half - 11, 2):
+        opcode = struct.unpack_from('>H', rom, off)[0]
+        if opcode in SA_OFF2:
+            patch32(off + 2, SA_OLD, SA_NEW, size=SA_SIZE)
+        elif opcode in SA_OFF4:
+            patch32(off + 4, SA_OLD, SA_NEW, size=SA_SIZE)
+        elif opcode == 0x23FC:   # MOVE.L #imm,abs.L — dest abs.L at off+6
+            patch32(off + 6, SA_OLD, SA_NEW, size=SA_SIZE)
+    for l in log:
+        print(l)
+    log.clear()
 
     # === 3. Exception vector data table at $19E8 (64 longwords) ===
     print("\n=== Exception vector table at $19E8 ===")
@@ -556,9 +618,16 @@ def patch_rom(infile, outfile):
     SERD_STUB_OFF = 0x46000  # free mirror space between installer and RESMGR
     serd_stub_vaddr = 0x40800000 + SERD_STUB_OFF
     assert rom[0x07B4:0x07BA] == b'\x20\x40\x20\x50\x4E\x90', "SERD call site mismatch"
-    rom[0x07B4:0x07BA] = struct.pack('>HI', 0x4EB9, serd_stub_vaddr)  # JSR stub.l
-    patches += 1
-    print(f"=== SERD HLock: JSR ${serd_stub_vaddr:08X} at $07B4 ===")
+    # SERD-HLock redirect DISABLED (2026-08-08).  Once the DoRomEntry ROM-resource fix
+    # lets SERD resolve, it comes from the combo ROM (handle -> ROM data $4085xxxx), i.e.
+    # a NON-movable ROM resource that needs no HLock.  The June HLock band-aid was for a
+    # SERD loaded from DISK as a movable handle; here _HLock instead runs on the ROZ
+    # pseudo-handle, driving figment _CheckHeap into the RM-built ROZ/map blocks it can't
+    # validate -> RTS into RAM-fill -> Sad Mac.  Keep the original HLock-free call
+    # (MOVEA.L D0,A0; MOVEA.L (A0),A0; JSR (A0)); the boot then clears the crash and
+    # reaches the SCSI mount phase.  (Revisit only if SERD is ever served from disk.)
+    # rom[0x07B4:0x07BA] = struct.pack('>HI', 0x4EB9, serd_stub_vaddr)  # JSR stub.l
+    print(f"=== SERD HLock: disabled (SERD is a ROM resource; original HLock-free call at $07B4) ===")
 
     # === Boot-icon screen dest: use runtime ScrnBase, not the IS=8 video base ===
     # HAPPYMAC/boot-icon blits hardcode the screen dest as an absolute address
