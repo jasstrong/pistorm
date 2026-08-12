@@ -69,7 +69,7 @@
 .equ IORefNum,      ioRefNum
 .equ IOVRefNum,     ioVRefNum
 .equ IOOwnBuf,      ioBuffer
-.equ IOLEOF,        46      /* logical EOF offset in PB */
+.equ IOLEOF,        28      /* logical EOF offset in PB = ioMisc (SE ROM File Mgr _GetEOF returns EOF here, NOT ioPosOffset 46) */
 .equ ioQElSize,     ioHQElSize
 .equ dirID,         48
 .equ ioDirID,       48
