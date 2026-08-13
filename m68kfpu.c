@@ -377,7 +377,10 @@ static inline int TEST_CONDITION(m68ki_cpu_core *state, int condition)
 		case 0x1f:
 		case 0x0f:		return 1;					// True
 
-		default:		fatalerror("M68kFPU: test_condition: unhandled condition %02X\n", condition);
+		default:		/* [robustness] unknown/signaling FPU condition: treat as false instead of
+				 * killing the emulator (fatalerror exits). $20-$3F signaling variants land here,
+				 * as does garbage decoded as FBcc/FScc (e.g. the born-32 24-bit-dirty $405F). */
+				{ static int _uc=0; if (_uc++ < 12) printf("[FPU] unhandled test condition $%04X -> false (not fatal)\n", condition); return 0; }
 	}
 
 	return r;
