@@ -629,6 +629,19 @@
 	#endif
 #endif
 
+/* [BORN32-FIX] The thresholds above (20/24/32) assume 16-byte (small) free-block headers.
+ * This build never defines small_freeBlock_headers, so freeBlock is 32 bytes and
+ * kMinFreeBlockSize==32.  A split remainder below that is malformed: its prevFree field
+ * (at block+0x1C) lands in the NEXT block, corrupting the chain -> figment's later free
+ * walk hits a sub-min block -> memSCErr -> _NewPtr fails -> SysError $7FFF ("Sorry, a
+ * system error occurred").  Observed: ConsumeFreeSpaceLow split a 28-byte ($1C) remainder
+ * because kMinFreeSplitSize was 24.  A split remainder must itself be a valid free block,
+ * so force the threshold to kMinFreeBlockSize for 32-byte-header builds. */
+#ifndef small_freeBlock_headers
+	#undef  kMinFreeSplitSize
+	#define kMinFreeSplitSize	kMinFreeBlockSize
+#endif
+
 	 
 #if 0
 	/* jeffs try, it does not work */
