@@ -446,6 +446,20 @@ def patch_rom(infile, outfile):
     patches += 1
     print(f"=== NOP'd old RM back-pointer write at +$E736 ===")
 
+    # === StripAddress ($A055) -> no-op (born-32 is always 32-bit) ===
+    # OS trap $55 (StripAddress) dispatches to $4080A7D0 = `and.l ($031A),d0; rts`
+    # (an UNCONDITIONAL 24-bit strip; the stock 68000 SE ROM has no 32-bit mode).
+    # In 32-bit mode StripAddress MUST be a no-op (as on a real 32-bit Mac / MODE32);
+    # here it strips live $40808xxx ROM pointers down to $008xxxxx, which land in RAM.
+    # STRIP-FIX in the emulator was a band-aid over exactly this; neuter the source
+    # instead so the strip never happens and STRIP-FIX can be removed. Replace the
+    # `and.l ($031A),d0` (c0b8 031a) with two NOPs, leaving the following RTS -> D0
+    # is returned unchanged (identity), which is the correct 32-bit StripAddress.
+    assert rom[0xA7D0:0xA7D6] == b'\xc0\xb8\x03\x1a\x4e\x75', "StripAddress site mismatch"
+    rom[0xA7D0:0xA7D4] = bytes([0x4E, 0x71, 0x4E, 0x71])  # NOP NOP (keep RTS at $A7D4)
+    patches += 1
+    print(f"=== StripAddress ($A055 @ $A7D0) neutered to a 32-bit no-op ===")
+
     # Clear address 0 so nil-terminated linked list walks work correctly.
     # The ROM's File Manager search at $932E does MOVEA.L A3,A4; MOVEA.L (A4),A4
     # with A3=0 (nil list head). *(0) is the reset SSP vector (non-zero),

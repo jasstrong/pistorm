@@ -1102,7 +1102,11 @@ void c_GrowSysZone(stdHeap* curHeap, void* newEnd)
 	 *	grow-request is then <= the current top and becomes a no-op, so ApplZone is
 	 *	never re-placed low and no stale headers ever land in SysZone's range.
 	 */
-	#define kBornSysZoneCeiling ((void*)0x00100000UL)	/* 1 MB — ApplZone lands just above this */
+	#define kBornSysZoneCeiling ((void*)0x00400000UL)	/* 4 MB — ApplZone lands just above this.
+		 * Was 1 MB, but System 7.5's startup/extension-load exhausted it → dsMemFullErr(25)
+		 * "Not enough memory" bomb during "Starting up…". 16 MB RAM total, so a 4 MB system
+		 * zone still leaves ~12 MB for the app zone. Grown once here before ApplZone is placed,
+		 * so ApplZone lands above 4 MB and the anti-overlap invariant holds. */
 	if ((unsigned long)newEnd < (unsigned long)kBornSysZoneCeiling)
 		newEnd = kBornSysZoneCeiling;
 

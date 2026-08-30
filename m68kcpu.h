@@ -1488,6 +1488,35 @@ static inline uint m68ki_read_32_fc(m68ki_cpu_core *state, uint address, uint fc
 
 static inline void m68ki_write_8_fc(m68ki_cpu_core *state, uint address, uint fc, uint value)
 {
+	/* [BADBLK-W8] catch writes into the deterministic sub-min free block $015C08's header
+	 * region (back/tags/size/nextFree + the clobbered neighbor back @$015C24). Top of the
+	 * write path, BEFORE CHIP_FASTPATH (addr<$200000 bypasses the tail), so it sees fastpath
+	 * writes. Finds who forms the malformed 28-byte free block (a bad figment split). */
+	{ uint32_t _a = address & 0x1FFFFFF;
+	  if (_a >= 0x015C00u && _a <= 0x015C2Fu) { static int _bw8=0;
+	    if (_bw8++ < 40) printf("[BADBLK-W8]  $%06X <- $%02X PC=$%08X\n", _a, value&0xFF, ADDRESS_68K(REG_PPC)); } }
+	/* [PURGE-WR] byte write via a purge-flagged (bit30) handle master-ptr to
+	 * high-8MB RAM lands in ROM space ($40800000-$40880000) and VANISHES — the
+	 * likely cont14 "$13(a2) completion flag never set". See write_32 for the
+	 * full rationale. Byte path is where bset #7,$13(a2) would land. */
+	{ extern uint32_t ovl_sysrom_pos;
+	  if (ovl_sysrom_pos >= 0x40000000u && address >= 0x40800000u && address < 0x40880000u) {
+		static int pw8 = 0;
+		if (pw8++ < 40) printf("[PURGE-WR] W8  ->ROM $%08X (intended RAM $%08X?) val=$%02X PC=$%08X\n",
+			address, address & ~0x40000000u, value & 0xFF, ADDRESS_68K(REG_PPC)); } }
+	/* [DIRTY-IO-WR] BYTE write to a BARE 24-bit SE I/O address (no $40 iomap) hits
+	 * RAM not hardware — the write silently VANISHES. 5380 regs are byte-wired, so a
+	 * driver register poke through a bare $005FFxxx addr lands here (would explain
+	 * cont14: a completion/status register write that never reaches the chip). */
+	{ extern uint32_t ovl_sysrom_pos; uint32_t _pc8 = ADDRESS_68K(REG_PC);
+	  if (ovl_sysrom_pos >= 0x40000000 && !(_pc8 >= 0x40870000 && _pc8 < 0x40880000) && !(_pc8 >= 0x408026F0 && _pc8 < 0x40802780) &&
+	      ((address >= 0x00580000 && address < 0x00600000) ||    /* SCSI */
+	       (address >= 0x00900000 && address < 0x00C00000) ||    /* SCC  */
+	       (address >= 0x00D00000 && address < 0x00E00000) ||    /* IWM  */
+	       (address >= 0x00E80000 && address < 0x00F00000))) {   /* VIA  */
+	    static int dwio8 = 0;
+	    if (dwio8++ < 50) printf("[DIRTY-IO-WR] BARE byte I/O write $%08X <- $%02X PC=$%08X (hits RAM not HW!)\n",
+	                            address, value & 0xFF, _pc8); } }
 	m68ki_set_fc(fc); /* auto-disable (see m68kcpu.h) */
 	state->mmu_tmp_fc = fc;
 	state->mmu_tmp_rw = 0;
@@ -1556,6 +1585,16 @@ static inline void m68ki_write_8_fc(m68ki_cpu_core *state, uint address, uint fc
 // M68KI_WRITE_16_FC
 static inline void m68ki_write_16_fc(m68ki_cpu_core *state, uint address, uint fc, uint value)
 {
+	{ uint32_t _a = address & 0x1FFFFFF;   /* [BADBLK-W16] see write_8 */
+	  if (_a >= 0x015C00u && _a <= 0x015C2Fu) { static int _bw16=0;
+	    if (_bw16++ < 40) printf("[BADBLK-W16] $%06X <- $%04X PC=$%08X\n", _a, value&0xFFFF, ADDRESS_68K(REG_PPC)); } }
+	/* [PURGE-WR] word write via a purge-flagged handle to high-8MB RAM lands in
+	 * ROM space and vanishes. See write_32 for rationale. */
+	{ extern uint32_t ovl_sysrom_pos;
+	  if (ovl_sysrom_pos >= 0x40000000u && address >= 0x40800000u && address < 0x40880000u) {
+		static int pw16 = 0;
+		if (pw16++ < 40) printf("[PURGE-WR] W16 ->ROM $%08X (intended RAM $%08X?) val=$%04X PC=$%08X\n",
+			address, address & ~0x40000000u, value & 0xFFFF, ADDRESS_68K(REG_PPC)); } }
 	/* DSErrCode watchpoint (16-bit) */
 	if ((address & 0x00FFFFFF) == 0x0AF0 && value != 0) {
 		printf("[DSERR16-WR] $%04X ← $%04X  PC=$%08X  SP=$%08X\n",
@@ -1626,7 +1665,7 @@ static inline void m68ki_write_16_fc(m68ki_cpu_core *state, uint address, uint f
 	/* [DIRTY-IO-WR] born-32: a WRITE to a BARE 24-bit SE I/O address (no $40 iomap
 	 * prefix) hits RAM not hardware — e.g. the ROM's `bclr #7,$EFE1FE.L`. */
 	{ extern uint32_t ovl_sysrom_pos; uint32_t _pc = ADDRESS_68K(REG_PC);
-	  if (ovl_sysrom_pos >= 0x40000000 && _pc != 0x40870038 &&   /* skip boot32 RAM-fill */
+	  if (ovl_sysrom_pos >= 0x40000000 && !(_pc >= 0x40870000 && _pc < 0x40880000) && !(_pc >= 0x408026F0 && _pc < 0x40802780) &&   /* skip boot32 RAM-fill + ROM RAM-test */
 	      ((address >= 0x00580000 && address < 0x00600000) ||    /* SCSI */
 	       (address >= 0x00900000 && address < 0x00C00000) ||    /* SCC  */
 	       (address >= 0x00D00000 && address < 0x00E00000) ||    /* IWM  */
@@ -1742,6 +1781,16 @@ static inline void m68ki_write_16_fc(m68ki_cpu_core *state, uint address, uint f
 // M68KI_WRITE_32_FC
 static inline void m68ki_write_32_fc(m68ki_cpu_core *state, uint address, uint fc, uint value)
 {
+	/* [BADBLK-W32] the size field of the bad block is a LONG at $015C10 (block+8). A write of
+	 * a sub-$20 value there is THE smoking gun (the split writing a 28-byte free size). Dump
+	 * PC + the branch ring (call path) on that write. See write_8 for placement rationale. */
+	{ uint32_t _a = address & 0x1FFFFFF;
+	  if (_a >= 0x015C00u && _a <= 0x015C2Fu) { static int _bw32=0;
+	    if (_bw32++ < 40) {
+	      printf("[BADBLK-W32] $%06X <- $%08X PC=$%08X%s\n", _a, value, ADDRESS_68K(REG_PPC),
+	        (_a==0x015C10u && value<0x20u)?"  <== SUB-MIN SIZE!":"");
+	      if (_a==0x015C10u && value<0x20u) { extern void branch_ring_dump(const char*);
+	        branch_ring_dump("[BADBLK-W32] sub-min free size written"); } } } }
 	{
 		uint32_t _wa = ADDRESS_68K(address), _pp = ADDRESS_68K(REG_PPC);
 		/* Flag any ROM (non-figment) write into the SysZone stdHeap header — the
@@ -1752,6 +1801,20 @@ static inline void m68ki_write_32_fc(m68ki_cpu_core *state, uint address, uint f
 			if (ant < 30) { printf("[ROM-ZONE-WR] *$%08X = $%08X  by ROM PPC=$%08X\n",
 				_wa, value, _pp); ant++; }
 		}
+		/* [PURGE-WR] hugeSE flat: a classic 24-bit handle master-ptr with the PURGE
+		 * flag (bit30=$40000000) set, pointing at HIGH-8MB RAM ($00800000+), derefs
+		 * flat to $40800000+ = the ROM/I/O window instead of RAM. A real 24-bit SE
+		 * masks the flag off; hugeSE doesn't. A DATA WRITE landing in ROM space
+		 * ($40800000-$40880000) is never legit -> the write VANISHES (would explain
+		 * cont14: the driver's completion flag never gets set). Escapes [DIRTY-DEREF]
+		 * (which excludes $40xxxxxx as "legit ROM"). Strip bit30 to show intended RAM. */
+		{ extern uint32_t ovl_sysrom_pos;
+		  if (ovl_sysrom_pos >= 0x40000000u && _wa >= 0x40000000u && _wa < 0x41000000u
+		      && !(_wa >= 0x405FF000u && _wa < 0x40600000u) /* exclude SCSI iomap */) {
+			static int pw = 0;
+			if (pw++ < 60) printf("[PURGE-WR] W32 $%08X (strip40=RAM $%08X) val=$%08X PC=$%08X  %s\n",
+				_wa, _wa & ~0x40000000u, value, ADDRESS_68K(REG_PPC),
+				_wa >= 0x40800000u ? "**LANDS IN ROM/IO**" : "(low-8MB, stripped to RAM)"); } }
 	}
 	m68ki_set_fc(fc); /* auto-disable (see m68kcpu.h) */
 	state->mmu_tmp_fc = fc;
@@ -1773,7 +1836,7 @@ static inline void m68ki_write_32_fc(m68ki_cpu_core *state, uint address, uint f
 	/* [DIRTY-IO-WR] born-32: a WRITE to a BARE 24-bit SE I/O address (no $40 iomap
 	 * prefix) hits RAM not hardware — e.g. the ROM's `bclr #7,$EFE1FE.L`. */
 	{ extern uint32_t ovl_sysrom_pos; uint32_t _pc = ADDRESS_68K(REG_PC);
-	  if (ovl_sysrom_pos >= 0x40000000 && _pc != 0x40870038 &&   /* skip boot32 RAM-fill */
+	  if (ovl_sysrom_pos >= 0x40000000 && !(_pc >= 0x40870000 && _pc < 0x40880000) && !(_pc >= 0x408026F0 && _pc < 0x40802780) &&   /* skip boot32 RAM-fill + ROM RAM-test */
 	      ((address >= 0x00580000 && address < 0x00600000) ||    /* SCSI */
 	       (address >= 0x00900000 && address < 0x00C00000) ||    /* SCC  */
 	       (address >= 0x00D00000 && address < 0x00E00000) ||    /* IWM  */
@@ -1809,6 +1872,13 @@ static inline void m68ki_write_32_fc(m68ki_cpu_core *state, uint address, uint f
 			dbg_codewin_n++;
 		}
 	}
+
+	/* [RELOC-WATCH] surgical: catch the patch's ROM-ref relocation writing a 24-bit-truncated
+	 * $008xxxxx value (a $40400000 delta masked to $400000) into the loaded-patch code region.
+	 * The PC is the relocation loop → disassemble it to find the mask/and.l to neutralize. */
+	{ uint32_t _a = address & 0x1FFFFFF, _v = value;
+	  if (_a>=0x10000 && _a<0x30000 && (_v & 0xFFF80000u)==0x00800000u) {
+	    static int _rw=0; if (_rw++<24) printf("[RELOC-WATCH] $%06X <- $%08X pc=$%08X\n", _a, _v, ADDRESS_68K(REG_PC)); } }
 
 	/* Watch for writes to A-line vector ($028) */
 	if ((address & 0x00FFFFFF) == 0x0028) {
@@ -2147,11 +2217,20 @@ static inline void m68ki_jump(m68ki_cpu_core *state, uint new_pc)
 	/* [BRANCH-RING] record this absolute control transfer (JMP/JSR/RTS/RTE/RTR).
 	 * src = current instruction (REG_PPC), dst = target, ir = opcode. */
 	{
+		/* [RING-NOISE] Don't record transfers whose SOURCE is a known interrupt/poll
+		 * loop — the VIA ISR ($x2B00-2C80), the mouse-accel VBL task ($x18F00-19110),
+		 * and the SCSI completion poll ($x1A840-1A880). These saturate the 256-entry
+		 * ring and bury the real give-up decision. Config-agnostic (ROM offset). */
+		uint32_t _rs = ADDRESS_68K(REG_PPC), _ro = _rs & 0x7FFFF;
+		int _rrom = ((_rs & 0xFFF80000) == 0x40800000) || ((_rs & 0xFFF80000) == 0x00800000);
+		int _rnoise = _rrom && ((_ro>=0x2B00 && _ro<=0x2C80) || (_ro>=0x18F00 && _ro<=0x19110) || (_ro>=0x1A840 && _ro<=0x1A880));
+		if (!_rnoise) {
 		unsigned int bi = branch_ring_idx & (BRANCH_RING_SIZE - 1);
 		branch_ring_src[bi] = ADDRESS_68K(REG_PPC);
 		branch_ring_dst[bi] = new_pc;
 		branch_ring_ir[bi]  = REG_IR;
 		branch_ring_idx++;
+		}
 		/* [POST-TRACE] log control transfers whose SOURCE is in the power-on
 		 * diagnostic/POST region ($x0801B00-$x0802A00) to diff big-se vs huge-se
 		 * startup and find what huge-se's boot32 path ELIDES (per user: the SCSI
@@ -2206,9 +2285,24 @@ static inline void m68ki_jump(m68ki_cpu_core *state, uint new_pc)
 		if (branch_ring_armed && (new_pc & 0xFFF80000) == 0x00800000
 		    && branch_strip_budget > 0) {
 			branch_strip_budget--;
-			printf("[STRIP-JUMP] src=$%08X ir=$%04X -> dst=$%08X (want $40%06X)\n",
+			printf("[STRIP-JUMP] src=$%08X ir=$%04X -> dst=$%08X (want $40%06X) [FIXED]\n",
 			       ADDRESS_68K(REG_PPC), REG_IR, new_pc, new_pc & 0xFFFFFF);
 		}
+		/* [STRIP-FIX REMOVED 2026-08-30] — it was a dangerous band-aid: it rewrote any JMP/JSR/
+		 * RTS/RTE into $008xxxxx up to ROM $40800000 by GUESSING from the target address, but
+		 * $008xxxxx is live app-zone RAM, so it cannot tell a stripped-ROM jump from a legit RAM
+		 * jump and will corrupt the latter. The real source was _StripAddress ($A055) stripping
+		 * $40808xxx ROM pointers to $008xxxxx; that's now neutered to a no-op in patch-rom.py
+		 * (StripAddress @ $A7D0 -> NOP;RTS). This is now LOG-ONLY: it never redirects, but reports
+		 * any control transfer that STILL lands in the $008xxxxx window, so we can find any
+		 * remaining stripped-ROM source (e.g. §4 data constants) rather than paper over it. */
+		{ extern uint32_t ovl_sysrom_pos;
+		if (ovl_sysrom_pos >= 0x40000000u &&
+		    (new_pc & 0xFFF80000) == 0x00800000 && (new_pc & 0x0007FFFF) >= 0x1000) {
+			static int _sfl = 0;
+			if (_sfl++ < 30) printf("[STRIP-LEFTOVER] jump to $%08X from PC=$%08X ir=$%04X (NOT redirected)\n",
+			                        new_pc, ADDRESS_68K(REG_PPC), REG_IR);
+		} }
 		/* [ROMREF-JMP scaffold REMOVED 2026-07-07] — it was redirecting the
 		 * legitimate boot-block execution (ROM jsr's bbEntry at $400002; the
 		 * boot blocks load to $400000, bbID=$4C4B) to $800002 and Sad-Mac'ing.
@@ -2772,6 +2866,10 @@ static inline void m68ki_exception_bus_error(m68ki_cpu_core *state)
 	}
 	CPU_RUN_MODE = RUN_MODE_BERR_AERR_RESET;
 
+	{ extern int bb_active; if (bb_active) { static int n=0; if (n++ < 40)
+	    printf("[BB-EXCEPTION] BUS-ERROR PPC=$%08X PC=$%08X aerr=$%08X wr=%d IR=$%04X\n",
+	           ADDRESS_68K(REG_PPC), ADDRESS_68K(REG_PC), m68ki_aerr_address, m68ki_aerr_write_mode, REG_IR); } }
+
 	/* Use up some clock cycles and undo the instruction's cycles */
 	USE_CYCLES(CYC_EXCEPTION[EXCEPTION_BUS_ERROR] - CYC_INSTRUCTION[REG_IR]);
 
@@ -2808,6 +2906,78 @@ static inline void m68ki_exception_1010(m68ki_cpu_core *state)
 			printf("[ALINE-DBG] trap=$%04X PC=$%08X  #%d\n", REG_IR, REG_PPC, ++aline_log);
 	}
 
+	/* [STRIP055] StripAddress ($A055) input logger. StripAddress is `and.l Lo3Bytes,d0; rts`
+	 * (unconditional 24-bit strip on D0). The post-Welcome dirty jump comes from a pointer that
+	 * is ALREADY SE-base ($400000)-based before the strip. Catch the input D0/A0 + the memory it
+	 * came from (A0) when D0's low-24 is in the SE-ROM window ($400000-$47FFFF) — that's the
+	 * upstream structure holding a stock-based code address. */
+	if (REG_IR == 0xA055u) {
+		uint32_t _d0=REG_DA[0], _a0=REG_DA[8];
+		uint32_t _lo=_d0 & 0xFFFFFFu;
+		if (_lo >= 0x400000u && _lo <= 0x47FFFFu) {
+			static int _s5=0;
+			if (_s5++ < 40) printf("[STRIP055] callerPC=$%08X  D0(in)=$%08X  A0=$%08X  (A0)=$%08X  (A0-4)=$%08X\n",
+				REG_PPC, _d0, _a0, (_a0>=0x1000&&_a0<0xFF0000)?m68ki_read_32(state,_a0):0,
+				(_a0>=0x1004&&_a0<0xFF0000)?m68ki_read_32(state,_a0-4):0);
+		}
+	}
+
+	/* [NEWPTR-PROBE] ptch4's fatal _NewPtr(Sys,Clear) ($A71E) at ~$258xx: log requested size (D0),
+	 * trap word (D1), and where OS trap $1E actually vectors — figment ($40846xxx) or stock ROM? */
+	if (REG_IR == 0xA71E && (REG_PPC & 0xFFFFFF) >= 0x25000 && (REG_PPC & 0xFFFFFF) < 0x26000) {
+		static int np=0; if (np++ < 6)
+			printf("[NEWPTR-PROBE] $A71E callerPC=$%08X D0(size)=$%08X D1(trapword)=$%08X trap$1E->$%08X\n",
+				REG_PPC, REG_DA[0], REG_DA[1], m68ki_read_32(state, 0x0478));
+	}
+
+	/* [APPLZONE-TRAP] Does InitApplZone($A02C)/SetApplBase($A057)/MaxApplZone($A063)
+	 * fire, and does it dispatch to figment (fig_* @ $40846xxx) or the STOCK ROM's
+	 * un-redirected 24-bit code? SetApplBase ($A057) is NOT in figment_offsets.h. */
+	{ extern uint32_t ovl_sysrom_pos; uint16_t _ir = REG_IR;
+	  if (ovl_sysrom_pos >= 0x40000000u && (_ir & 0xF800u) == 0xA000u) {
+	    uint8_t _tn = _ir & 0xFF;
+	    if (_tn == 0x2C || _tn == 0x57 || _tn == 0x63) {
+	      const char* _nm = _tn==0x2C?"InitApplZone":(_tn==0x57?"SetApplBase":"MaxApplZone");
+	      uint32_t _hdlr = m68ki_read_32(state, 0x0400u + (uint32_t)_tn*4);
+	      static int _az = 0;
+	      if (_az++ < 20) printf("[APPLZONE-TRAP] %s ($%04X) -> $%08X (%s) callerPC=$%08X | SysZone=$%08X ApplZone=$%08X TheZone=$%08X ApplLimit=$%08X\n",
+	        _nm, _ir, _hdlr,
+	        (_hdlr>=0x40846000u&&_hdlr<0x40848000u)?"FIGMENT":(_hdlr>=0x40800000u&&_hdlr<0x40880000u?"stock-ROM":"?"),
+	        REG_PPC, m68ki_read_32(state,0x02A6), m68ki_read_32(state,0x02AA), m68ki_read_32(state,0x0118), m68ki_read_32(state,0x0130));
+	      if (_tn == 0x57) { extern int g_happymac_seen, trace_all_enabled; extern void trace_arm(void);
+	        static int _armed=0; if (0 && g_happymac_seen && !_armed) { _armed=1; trace_all_enabled=1; trace_arm();
+	          printf("[APPLZONE-TRAP] *** TRACE ARMED at post-HM SetApplBase (2nd-pass -> give-up) ***\n"); } }
+	    } } }
+
+	/* [MOUNTVOL] _MountVol ($A00F): the root is the HFS VOLUME never mounts (no VCB).
+	 * Detect the mount attempt (which drive) + arm the RAM trace at the first post-Happy-Mac
+	 * _MountVol so we can see WHERE the mount aborts (disarm at ?-floppy $F4A). */
+	/* [FMREAD] _Read ($A002) during the mount: log ioRefNum/ioReqCount/ioPosOffset to see if
+	 * hugeSE RE-reads the same position (failed read -> retry) or advances (catalog traversal). */
+	{ extern int g_happymac_seen; if (REG_IR == 0xA002u && g_happymac_seen) { static int _rd=0; if (_rd++ < 40) {
+	    uint32_t _pb=REG_DA[8]&0x1FFFFFF;
+	    printf("[FMREAD] _Read pb=$%06X ioRefNum=%d ioReqCount=$%X ioPosMode=%d ioPosOffset=$%X ioBuffer=$%08X\n",
+	           _pb, (int16_t)m68ki_read_16(state,_pb+0x18), m68ki_read_32(state,_pb+0x24),
+	           (int16_t)m68ki_read_16(state,_pb+0x2C), m68ki_read_32(state,_pb+0x2E), m68ki_read_32(state,_pb+0x20)); } } }
+	{ if (REG_IR == 0xA00Fu) {   /* fires for BOTH hugeSE ($408xxxxx) and bigSE ($008xxxxx) */
+	    static int _mv=0; uint32_t _a0=REG_DA[8]&0x1FFFFFF;
+	    if (_mv++ < 10) printf("[MOUNTVOL] _MountVol pb=$%06X ioDrive=%d callerPC=$%08X VCBQHead=$%06X\n",
+	                           _a0, (int16_t)m68ki_read_16(state,_a0+0x16), REG_PPC, m68ki_read_32(state,0x0358)&0x1FFFFFF);
+	    { extern int g_happymac_seen, trace_all_enabled; extern void trace_arm(void); static int _ma=0;
+	      if (g_happymac_seen && !_ma) { _ma=1; trace_all_enabled=1; trace_arm();
+	        printf("[MOUNTVOL] *** trace ARMED at _MountVol ***\n"); } } } }
+	/* [STRIPADDR] _StripAddress ($A055): the stock 24-bit Device Mgr IODone strips
+	 * the DCE ptr assuming lower-16MB. On born-32 flat, if it strips a ptr that HAS
+	 * bits 24-31 set (a $40xxxxxx iomap/ROM ptr, or an $80xxxxxx locked-handle DCE),
+	 * 24-bit masking CORRUPTS it -> wrong deref -> completion mis-posts (cont14). Log
+	 * only the DANGEROUS calls (input has high bits). */
+	{ extern uint32_t ovl_sysrom_pos;
+	  if (ovl_sysrom_pos >= 0x40000000u && REG_IR == 0xA055u) {
+	    uint32_t _a0 = REG_DA[8], _d0 = REG_DA[0];
+	    if ((_a0 & 0xFF000000u) || (_d0 & 0xFF000000u)) { static int _sa = 0;
+	      if (_sa++ < 40) printf("[STRIPADDR] _StripAddress A0=$%08X D0=$%08X (HIGH BITS! 24bit-mask A0->$%08X) callerPC=$%08X\n",
+	        _a0, _d0, _a0 & 0x00FFFFFFu, REG_PPC); } } }
+
 	/* PTCH dispatch trace: ROM+$4394 = JSR (A1) for System patches */
 	if ((REG_PPC & 0x00FFFFFF) == 0x804394 || (REG_PPC & 0x00FFFFFF) == 0x004394) {
 		printf("[PTCH-JSR] PC=$%08X A1=$%08X A0=$%08X  dispatching to patch code\n",
@@ -2819,6 +2989,16 @@ static inline void m68ki_exception_1010(m68ki_cpu_core *state)
 		printf("[SYSERROR] D0=%d (0x%04X)  callerPC=$%08X  SP=$%08X\n",
 			(int)(int16_t)(REG_DA[0] & 0xFFFF), REG_DA[0] & 0xFFFF,
 			REG_PPC, REG_DA[15]);
+		{ static int se=0; if ((REG_DA[0]&0xFFFF)==0x7FFF && se++<3) {
+			printf("[SYSERROR-DUMP] D:");
+			for (int i=0;i<8;i++) printf(" %08X",REG_DA[i]);
+			printf("  A:");
+			for (int i=8;i<16;i++) printf(" %08X",REG_DA[i]);
+			printf("\n");
+			{ uint32_t _sz=m68ki_read_32(state,0x02A6)&0x1FFFFFF, _tz=m68ki_read_32(state,0x0118)&0x1FFFFFF;
+			  printf("[SYSERR-HEAP] MemErr($220)=$%04X SysZone=$%06X TheZone=$%06X | SysZone hdr:", m68ki_read_16(state,0x0220), _sz, _tz);
+			  for (int _k=0;_k<0x20;_k+=4) printf(" %08X", m68ki_read_32(state,_sz+_k)); printf("\n"); }
+			} }
 	}
 	/* PC watchpoint: MOVEQ #12,D0 at the two error-12 locations */
 	{
@@ -2959,7 +3139,7 @@ static inline void m68ki_exception_1010(m68ki_cpu_core *state)
 			extern int figment_verbose;
 			/* Always surface PANIC messages; gate the rest behind verbose. */
 			if (figment_verbose || (buf[0]=='P'&&buf[1]=='A'&&buf[2]=='N'&&buf[3]=='I'&&buf[4]=='C'))
-				printf("[FIGMENT] %s $%08X\n", buf, val);
+				printf("[FIGMENT] A0=$%08X '%s' $%08X\n", str_addr, buf, val);
 			return;
 		}
 	}
@@ -3400,6 +3580,10 @@ static inline void m68ki_exception_address_error(m68ki_cpu_core *state)
 	}
 
 	CPU_RUN_MODE = RUN_MODE_BERR_AERR_RESET_WSF;
+
+	{ extern int bb_active; if (bb_active) { static int n=0; if (n++ < 40)
+	    printf("[BB-EXCEPTION] ADDR-ERROR PPC=$%08X PC=$%08X aerr=$%08X wr=%d IR=$%04X\n",
+	           ADDRESS_68K(REG_PPC), ADDRESS_68K(REG_PC), m68ki_aerr_address, m68ki_aerr_write_mode, REG_IR); } }
 
 	if (CPU_TYPE_IS_000(CPU_TYPE))
 	{
