@@ -1599,6 +1599,14 @@ static inline void m68ki_write_16_fc(m68ki_cpu_core *state, uint address, uint f
 	if ((address & 0x00FFFFFF) == 0x0AF0 && value != 0) {
 		printf("[DSERR16-WR] $%04X ← $%04X  PC=$%08X  SP=$%08X\n",
 			address & 0xFFFF, value & 0xFFFF, REG_PPC, REG_DA[15]);
+		if ((value & 0xFFFF) == 0x000C) {   /* dsCoreErr: WHICH trap was unimplemented? */
+			extern uint16_t g_trap_ring_w[8]; extern uint32_t g_trap_ring_pc[8]; extern int g_trap_ring_i;
+			static int _ce = 0;
+			if (_ce++ < 4) { printf("  [TRAP-RING] last A-line traps (newest last):");
+				for (int k = 7; k >= 0; k--) { int j = (g_trap_ring_i - 1 - k) & 7;
+					printf(" $%04X@%08X", g_trap_ring_w[j], g_trap_ring_pc[j]); }
+				printf("\n"); fflush(stdout); }
+		}
 		/* Dump the stack to find the BSR chain */
 		printf("  Stack: ");
 		for (int i = 0; i < 8; i++)
@@ -2906,6 +2914,11 @@ static inline void m68ki_exception_1010(m68ki_cpu_core *state)
 			printf("[ALINE-DBG] trap=$%04X PC=$%08X  #%d\n", REG_IR, REG_PPC, ++aline_log);
 	}
 
+	/* [TRAP-RING] tiny ring of recent A-line traps; dumped when DSErrCode<-$0C
+	 * (dsCoreErr, "unimplemented core routine") to identify WHICH trap is missing. */
+	{ extern uint16_t g_trap_ring_w[8]; extern uint32_t g_trap_ring_pc[8]; extern int g_trap_ring_i;
+	  g_trap_ring_w[g_trap_ring_i & 7] = REG_IR; g_trap_ring_pc[g_trap_ring_i & 7] = REG_PPC; g_trap_ring_i++; }
+
 	/* [STRIP055] StripAddress ($A055) input logger. StripAddress is `and.l Lo3Bytes,d0; rts`
 	 * (unconditional 24-bit strip on D0). The post-Welcome dirty jump comes from a pointer that
 	 * is ALREADY SE-base ($400000)-based before the strip. Catch the input D0/A0 + the memory it
@@ -3157,6 +3170,24 @@ static inline void m68ki_exception_1010(m68ki_cpu_core *state)
 		extern int trace_all_enabled; extern void trace_disarm(void);
 		if (trace_all_enabled) trace_disarm();
 		return;
+	}
+
+	/* [GESTALT-QD] born-32 mono SE must report CLASSIC QuickDraw. Under the method-5
+	 * (IIci) identity, gestalt answers "Color QD present" and the 32-bit System opens
+	 * color ports (_OpenCPort $AA00 @ loaded $9F04C -> unimplemented on this ROM ->
+	 * dsCoreErr). Paravirt any Gestalt-family trap ($A1AD/$A5AD flag variants) whose
+	 * selector (D0) is 'qd  ': return noErr with response 0 = gestaltOriginalQD.
+	 * All other selectors fall through to the real (ptch-installed) Gestalt. */
+	if ((REG_IR & 0xF9FFu) == 0xA1ADu && REG_DA[0] == 0x71642020u) {
+		extern uint32_t ovl_sysrom_pos;
+		if (ovl_sysrom_pos >= 0x40000000u) {
+			static int _gq = 0;
+			if (_gq++ < 12) printf("[GESTALT-QD] trap=$%04X 'qd  ' -> classic QD (0)  callerPC=$%08X\n",
+			                       REG_IR, ADDRESS_68K(REG_PPC));
+			REG_DA[0] = 0;   /* D0 = noErr */
+			REG_DA[8] = 0;   /* A0 = response: gestaltOriginalQD */
+			return;
+		}
 	}
 
 	/* _StripAddress ($A055) — identity in 32-bit mode.

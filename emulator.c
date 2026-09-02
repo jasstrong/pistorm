@@ -661,6 +661,8 @@ int figment_verbose = 0;  /* set from HUGESE_VERBOSE env; gates debug printfs on
 int trace_all_enabled = 0;   /* config gate (setvar trace_all): when set, trace_step is
                               * CALLED every instruction, but only RECORDS while armed. */
 int trace_armed = 0;         /* set/cleared by the $A0FD/$A0FC paravirt traps */
+/* [TRAP-RING] recent A-line trap words+PCs; dumped on DSErrCode<-$0C (dsCoreErr) */
+uint16_t g_trap_ring_w[8]; uint32_t g_trap_ring_pc[8]; int g_trap_ring_i = 0;
 int trace_in_insn = 0;       /* 1 only during instruction execution — so trace_mem records
                               * the INSTRUCTION's reads/writes, NOT the per-instruction
                               * diagnostic probes (which read fixed addrs every insn). */
@@ -1241,10 +1243,25 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			  { static int go32=0;
 			    if (!go32 && rom_off == 0x07E8) { go32=1;
 			      uint8_t ov=m68ki_read_8(state,0x0B73); m68ki_write_8(state,0x0B73, ov & 0xFC);
-			      printf("[GO32] $0B73 $%02X -> $%02X (clear Systemis24bit) at InitRsrcMgr\n", ov, ov & 0xFC); }
+			      printf("[GO32] $0B73 $%02X -> $%02X (clear Systemis24bit) at InitRsrcMgr\n", ov, ov & 0xFC);
+			      /* [NO-CQD] Color-QuickDraw-absent marker. The 32-bit (IIci-method) System guards its
+			       * CQD init with `cmpi.l #-1,($8B0).w; beq skip` (loaded code $22470), but $8B0 is
+			       * never initialized on born-32 — it holds RAM-test residue ($55555555) → the System
+			       * thinks CQD exists → calls Color-QD trap $AA18 → unimplemented on the mono SE ROM
+			       * → dsCoreErr(12) → SysError draw storm (the "splattered splash" crash). Tell the
+			       * truth: this machine has no Color QD. */
+			      m68ki_write_32(state, 0x8B0, 0xFFFFFFFFu);
+			      printf("[NO-CQD] $8B0 <- $FFFFFFFF (Color QuickDraw absent)\n"); }
 			    /* clamp it clear: the loaded System MM init may re-derive 24-bit */
 			    if (go32) { static uint32_t pc=0; if ((pc++ & 0x3F)==0) { uint8_t v=m68ki_read_8(state,0x0B73);
-			      if (v & 3) { m68ki_write_8(state,0x0B73, v & 0xFC); static int rl=0; if (rl++<12) printf("[GO32-RE] $0B73 re-set to $%02X by something, re-cleared\n", v); } } } }
+			      if (v & 3) { m68ki_write_8(state,0x0B73, v & 0xFC); static int rl=0; if (rl++<12) printf("[GO32-RE] $0B73 re-set to $%02X by something, re-cleared\n", v); }
+			      /* [NO-CQD] keep $8B0 = -1 (Color QD absent). The one-shot InitRsrcMgr write gets
+			       * clobbered by the second-pass RAM test ($55/$AA fill); repair whenever it holds
+			       * test-pattern residue so the System's `cmpi.l #-1,($8B0)` guard skips the CQD
+			       * init instead of calling unimplemented $AA18 -> dsCoreErr(12). */
+			      { uint32_t b=m68ki_read_32(state,0x8B0);
+			        if (b==0x55555555u || b==0xAAAAAAAAu) { m68ki_write_32(state,0x8B0,0xFFFFFFFFu);
+			          static int nc=0; if (nc++<6) printf("[NO-CQD-RE] $8B0 residue $%08X -> $FFFFFFFF\n", b); } } } } }
 			  /* ADB deferred-queue integrity at $3A32 (after $3A16 reads the 14-byte
 			   * ADBCmdQEntry): is a4 (queue ptr) in-bounds, or is ABusVars/the queue
 			   * corrupt? Filter to the garbage transaction (fQComp top byte set). */
@@ -1316,8 +1333,11 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 					                    * load ran with the trace dormant (trace_all_enabled=0, zero overhead). */
 					      extern void branch_ring_dump(const char*); extern void trace_arm(void);
 					      branch_ring_dump("[TRAP] boot-block tail: why boot1 RTS'd to $826 instead of jmp boot2");
-					      trace_all_enabled = 1; trace_arm();
-					      printf("[TRAP] instruction trace ARMED at BB-EXIT — capturing ROM $826+ give-up to ?-floppy\n");
+					      /* trace-arm DISABLED 2026-08-30: it fills the 44.7M RAM buffer and auto-exits
+					       * BEFORE the post-Welcome crash, cutting off the [SP-SEAM] probe. Re-enable only
+					       * for the ?-floppy give-up investigation. */
+					      /* trace_all_enabled = 1; trace_arm(); */
+					      printf("[TRAP] (trace-arm disabled) BB-EXIT reached\n");
 					    } } }
 				  { extern unsigned long g_pmmu_calls, g_pmmu_hits, g_pmmu_walks, g_pmmu_tt;
 				    static unsigned long next=20000000UL;
@@ -1494,7 +1514,27 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			            uint32_t gh=hv&0x1FFFFFF, gp=m68ki_read_32(state,gh)&0x1FFFFFF;
 			            printf("[GTBL-DUMP] id=%d handle=$%08X master=$%06X:\n",(int16_t)g_last_getres_id,hv,gp);
 			            for (int i=0;i<256;i+=16){ printf("  +%03X:",i);
-			              for(int j=0;j<16;j++) printf(" %02X",m68ki_read_8(state,gp+i+j)); printf("\n"); } }
+			              for(int j=0;j<16;j++) printf(" %02X",m68ki_read_8(state,gp+i+j)); printf("\n"); }
+            /* [GTBL-MIN] jas's minimal-gtbl experiment: the stock 'gtbl' 5 (IIci) lists machine
+             * patches (PTCH 1660 etc.) whose self-relocation applies IIci-ROM offsets to our SE
+             * ROM -> jsr into ROM data ($40828080) -> the recurring-illegal display storm
+             * (cont23-confirmed; the whole reference set is for a different ROM, unpatchable).
+             * hugeSE's machine init is already done by boot32/figment/emulator, so hand the
+             * loader an EMPTY patch list: header = sig + count(+$06); set count $001A -> 0. */
+            if ((int16_t)g_last_getres_id == 5 && m68ki_read_32(state,gp+2) == 0xAE5B5E75u) {
+              /* [GTBL-MIN v2] count->0 taught us: no machine patch = no _Gestalt ($A1AD
+               * unimplemented, dsCoreErr before the splash) — the machine patch installs it.
+               * So keep the list but swap the ONE poisoned entry: PTCH 1660 (IIci-ROM offsets,
+               * the $40828080 storm) -> PTCH 630 (the SE machine patch: correct-for-our-ROM refs,
+               * relocated by [PATCH-RELOC], installs ptch 5/4/27 incl Gestalt). 32-bit method-5
+               * System + SE machine services = the catch-22 split down the middle. */
+              uint16_t cnt = m68ki_read_16(state,gp+6);
+              for (uint32_t o = 8; o + 8 <= 8u + (uint32_t)cnt*8u; o += 8) {
+                if (m68ki_read_32(state,gp+o+2) == 0x50544348u &&      /* 'PTCH' */
+                    m68ki_read_16(state,gp+o+6) == 0x067Cu) {          /* id 1660 */
+                  m68ki_write_16(state,gp+o+6, 0x0276u);               /* -> id 630 */
+                  printf("[GTBL-MIN] gtbl 5 entry @+$%02X: PTCH 1660 -> PTCH 630 (SE machine patch)\n", o);
+                  break; } } } }
 			          /* [PATCH-RELOC] massage SE machine patches for our relocated ROM. They reference the
 			           * ROM with ABSOLUTE long addresses in the $008xxxxx window (a ROM-at-$800000 basis) but
 			           * our ROM lives at $40800000. For every absolute-long instruction operand
@@ -2938,6 +2978,20 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			m68ki_instruction_jump_table[REG_IR](state);
 			trace_in_insn = 0;
 			USE_CYCLES(CYC_INSTRUCTION[REG_IR]);
+
+			/* [SP-SEAM] catch the first instruction after which SP carries a dirty (non-zero)
+			 * high byte — the MODE32-seam dirty stack pointer that RTE/RTS-es to garbage and
+			 * drives the post-Welcome recurring-exception crash. Clean SP is always $00xxxxxx. */
+			{ uint32_t _sp = REG_DA[15]; static int _seen_clean = 0;
+			  if (ovl_sysrom_pos >= 0x40000000u) {
+			    /* legit stack is RAM up to the (32MB-forced) MemTop, i.e. high byte <= $01;
+			     * a high byte >= $02 is a garbage/dirty SP (the crash SP is $FD/$FExxxxxx). */
+			    if (_sp < 0x02000000u) { _seen_clean = 1; }   /* real stack established */
+			    else if (_seen_clean) {   /* SP went garbage-dirty AFTER a real stack = the seam bug */
+			      static int _spd = 0;
+			      if (_spd++ < 8) { printf("[SP-SEAM] SP re-dirtied=$%08X  PC=$%08X ir=$%04X\n",
+			                               _sp, ADDRESS_68K(REG_PPC), REG_IR); fflush(stdout);
+			        extern void branch_ring_dump(const char*); if (_spd==1) branch_ring_dump("[SP-SEAM] SP re-dirtied after clean"); } } } }
 
 			/* Trace m68k_exception, if necessary */
 			m68ki_exception_if_trace(state); /* auto-disable (see m68kcpu.h) */

@@ -1094,6 +1094,18 @@ int m68k_execute(m68ki_cpu_core *state, int num_cycles)
 			m68ki_instruction_jump_table[REG_IR](state);
 			USE_CYCLES(CYC_INSTRUCTION[REG_IR]);
 
+			/* [SP-SEAM] catch the instruction that first gives SP a dirty (non-zero) high byte.
+			 * Clean SP is always $00xxxxxx (RAM stack); a non-zero high byte is the 24-bit-dirty
+			 * pointer that later RTE/RTS-es to garbage -> the post-Welcome recurring-exception
+			 * crash. This is the MODE32 "seam": a stack switch/LINK/global load from a value a
+			 * real MODE32 would scrub at the 24->32 transition. Log the culprit PC + instruction. */
+			{ uint32_t _sp = REG_DA[15]; extern uint32_t ovl_sysrom_pos;
+			  if (ovl_sysrom_pos >= 0x40000000u && (_sp & 0xFF000000u) != 0) {
+			    static int _spd = 0;
+			    if (_spd++ < 8) { printf("[SP-SEAM] dirty SP=$%08X  PC=$%08X ir=$%04X\n",
+			                             _sp, ADDRESS_68K(REG_PPC), REG_IR); fflush(stdout);
+			      extern void branch_ring_dump(const char*); if (_spd==1) branch_ring_dump("[SP-SEAM] first dirty SP"); } } }
+
 			/* Trace m68k_exception, if necessary */
 			m68ki_exception_if_trace(state); /* auto-disable (see m68kcpu.h) */
 		} while(GET_CYCLES() > 0);
