@@ -1789,6 +1789,17 @@ static inline void m68ki_write_16_fc(m68ki_cpu_core *state, uint address, uint f
 // M68KI_WRITE_32_FC
 static inline void m68ki_write_32_fc(m68ki_cpu_core *state, uint address, uint fc, uint value)
 {
+	/* [SEBASE-W32] catch the PRODUCER of real-SE-base ROM pointers. The crash values
+	 * ($00408100/$004031E5/$00404806 = $400000+offset) are NOT static ROM constants -- they
+	 * are computed at runtime from a $400000 base instead of ROMBase ($40800000). Log every
+	 * write of a value in the SE-ROM window, with the writing PC, to find that computation. */
+	{ uint32_t _v = value; extern uint32_t ovl_sysrom_pos;
+	  if (ovl_sysrom_pos >= 0x40000000u && (_v & 0xFFF80000u) == 0x00400000u && (_v & 0x7FFFFu) >= 0x1000u) {
+	    static int _sb = 0;
+	    if (_sb++ < 30) { printf("[SEBASE-W32] $%08X -> mem $%08X  PC=$%08X (want $%08X)\n",
+	                             _v, ADDRESS_68K(address), ADDRESS_68K(REG_PPC), 0x40800000u | (_v & 0x7FFFFu));
+	      fflush(stdout); } } }
+
 	/* [BADBLK-W32] the size field of the bad block is a LONG at $015C10 (block+8). A write of
 	 * a sub-$20 value there is THE smoking gun (the split writing a 28-byte free size). Dump
 	 * PC + the branch ring (call path) on that write. See write_8 for placement rationale. */
@@ -2306,10 +2317,12 @@ static inline void m68ki_jump(m68ki_cpu_core *state, uint new_pc)
 		 * remaining stripped-ROM source (e.g. §4 data constants) rather than paper over it. */
 		{ extern uint32_t ovl_sysrom_pos;
 		if (ovl_sysrom_pos >= 0x40000000u &&
-		    (new_pc & 0xFFF80000) == 0x00800000 && (new_pc & 0x0007FFFF) >= 0x1000) {
+		    (((new_pc & 0xFFF80000) == 0x00800000) || ((new_pc & 0xFFF80000) == 0x00400000)) &&
+		    (new_pc & 0x0007FFFF) >= 0x1000) {
 			static int _sfl = 0;
-			if (_sfl++ < 30) printf("[STRIP-LEFTOVER] jump to $%08X from PC=$%08X ir=$%04X (NOT redirected)\n",
-			                        new_pc, ADDRESS_68K(REG_PPC), REG_IR);
+			if (_sfl++ < 30) printf("[STRIP-LEFTOVER] jump to $%08X from PC=$%08X ir=$%04X (want $%08X)\n",
+			                        new_pc, ADDRESS_68K(REG_PPC), REG_IR,
+			                        0x40800000u | (new_pc & 0x0007FFFFu));
 		} }
 		/* [ROMREF-JMP scaffold REMOVED 2026-07-07] — it was redirecting the
 		 * legitimate boot-block execution (ROM jsr's bbEntry at $400002; the

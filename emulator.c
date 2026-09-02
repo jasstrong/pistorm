@@ -1250,8 +1250,12 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			       * thinks CQD exists → calls Color-QD trap $AA18 → unimplemented on the mono SE ROM
 			       * → dsCoreErr(12) → SysError draw storm (the "splattered splash" crash). Tell the
 			       * truth: this machine has no Color QD. */
-			      m68ki_write_32(state, 0x8B0, 0xFFFFFFFFu);
-			      printf("[NO-CQD] $8B0 <- $FFFFFFFF (Color QuickDraw absent)\n"); }
+			      /* [NO-CQD DISABLED 2026-09-02] Only needed on the IIci (method $05) path.
+			       * On the SE path (method $02, classic QuickDraw) the System never consults a
+			       * Color-QD marker, and $8B0 is LIVE memory there (observed cycling $55555555/
+			       * $AAAAAAAA), so stamping $FFFFFFFF over it corrupts live data. */
+			      /* m68ki_write_32(state, 0x8B0, 0xFFFFFFFFu);
+			      printf("[NO-CQD] $8B0 <- $FFFFFFFF (Color QuickDraw absent)\n"); */ }
 			    /* clamp it clear: the loaded System MM init may re-derive 24-bit */
 			    if (go32) { static uint32_t pc=0; if ((pc++ & 0x3F)==0) { uint8_t v=m68ki_read_8(state,0x0B73);
 			      if (v & 3) { m68ki_write_8(state,0x0B73, v & 0xFC); static int rl=0; if (rl++<12) printf("[GO32-RE] $0B73 re-set to $%02X by something, re-cleared\n", v); }
@@ -1259,9 +1263,7 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			       * clobbered by the second-pass RAM test ($55/$AA fill); repair whenever it holds
 			       * test-pattern residue so the System's `cmpi.l #-1,($8B0)` guard skips the CQD
 			       * init instead of calling unimplemented $AA18 -> dsCoreErr(12). */
-			      { uint32_t b=m68ki_read_32(state,0x8B0);
-			        if (b==0x55555555u || b==0xAAAAAAAAu) { m68ki_write_32(state,0x8B0,0xFFFFFFFFu);
-			          static int nc=0; if (nc++<6) printf("[NO-CQD-RE] $8B0 residue $%08X -> $FFFFFFFF\n", b); } } } } }
+			      /* [NO-CQD-RE DISABLED 2026-09-02] see above -- was overwriting live memory. */ } } }
 			  /* ADB deferred-queue integrity at $3A32 (after $3A16 reads the 14-byte
 			   * ADBCmdQEntry): is a4 (queue ptr) in-bounds, or is ABusVars/the queue
 			   * corrupt? Filter to the garbage transaction (fQComp top byte set). */
@@ -1637,9 +1639,17 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			          uint8_t m5=m68ki_read_8(state,p+0x0F), m9=m68ki_read_8(state,p+0x1F);
 			          printf("[GUSD-RAM] found via RM exit: handle=$%08X data=$%06X m5-method=$%02X m9-method=$%02X",
 			                 hv, p, m5, m9);
-			          if (m5!=0x05) { m68ki_write_8(state,p+0x0F,0x05); }
-			          if (m9!=0x05) { m68ki_write_8(state,p+0x1F,0x05); }
-			          printf(" -> now $05/$05 (32-bit IIci method — matches config/comment; SE $02 = 24-bit-dirty hang after Welcome)\n"); }
+			          /* [GUSD-RAM] method $02 = SE (B&W, classic QuickDraw). SuperMario's
+			           * AllB&WQDPatch.a ("loaded on all B&W machines", hasCQD=false, no _OpenCPort)
+			           * proves System 7.5 runs fully on B&W SE-class machines WITHOUT Color QD --
+			           * so we do NOT need CQD; we need the SE path. Method $05 (IIci) was chosen to
+			           * get 32-bit-clean operation, but it assumes CQD (-> _OpenCPort dsCoreErr) and
+			           * IIci-ROM patch offsets. The SE path's old blocker was 24-bit dirtiness, whose
+			           * roots are now fixed: StripAddress no-op, figment kMinFreeSplitSize, GO32
+			           * ($0B73 24-bit flags cleared), PATCH-RELOC both bases, 4MB sys zone. */
+			          if (m5!=0x02) { m68ki_write_8(state,p+0x0F,0x02); }
+			          if (m9!=0x02) { m68ki_write_8(state,p+0x1F,0x02); }
+			          printf(" -> now $02/$02 (SE B&W method: classic QuickDraw, no CQD needed)\n"); }
 			        { static int once=0; if(!once){ once=1;
 			            printf("[GUSD-RAM] toolbox tbl: $A80C(rGetResource)->$%08X $A9A0(GetResource)->$%08X\n",
 			                   m68ki_read_32(state,0xE00+0x0C*4), m68ki_read_32(state,0xE00+0x1A0*4)); } } }
