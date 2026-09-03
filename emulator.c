@@ -1467,7 +1467,9 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			        /* [PTCH5-PROBE] why does GetResource('ptch',5) come back NIL? Dump ResLoad/CurMap and
 			         * walk the resource-map chain (TopMapHndl->mNext) to see if 'ptch' 5 is present anywhere.
 			         * present-but-nil => search misbehaving (ResLoad/CurMap); absent => genuinely not there. */
-			        if (rtype==0x70746368u && (int16_t)m68ki_read_16(state,sp+4)==5) {
+			        { int16_t _pid=(int16_t)m68ki_read_16(state,sp+4);
+			        if (rtype==0x70746368u && (_pid==5 || _pid==51 || _pid==53)) {
+			          printf("[PTCH5-PROBE] ===== probing 'ptch' %d =====\n", _pid);
 			          uint8_t resLoad=m68ki_read_8(state,0x0A5E);
 			          uint16_t curMap=m68ki_read_16(state,0x0A5A);
 			          uint32_t topMH=m68ki_read_32(state,0x0A50)&0x1FFFFFF, sysMH=m68ki_read_32(state,0x0A54)&0x1FFFFFF;
@@ -1481,13 +1483,13 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			            for (int t=0;t<nt && t<200;t++,te+=8) {
 			              if (m68ki_read_32(state,te)==0x70746368u){ hasP=1; cnt=(int16_t)m68ki_read_16(state,te+4)+1;
 			                uint32_t rp=tl+m68ki_read_16(state,te+6);
-			                for (int r=0;r<cnt && r<400;r++,rp+=12){ if ((int16_t)m68ki_read_16(state,rp)==5){ p5=1;
-			                  printf("[PTCH5-PROBE]   FOUND ptch 5 in map $%06X: attrs=$%02X dataOff=$%06X handle=$%08X\n",
-			                    mh,m68ki_read_8(state,rp+4),m68ki_read_32(state,rp+4)&0xFFFFFF,m68ki_read_32(state,rp+8)); } } } }
-			            printf("[PTCH5-PROBE]  map#%d fileRef=$%04X handle=$%06X ptchType=%d ptchCount=%d ptch5=%d\n",g,fref,mh,hasP,cnt,p5);
+			                for (int r=0;r<cnt && r<400;r++,rp+=12){ if ((int16_t)m68ki_read_16(state,rp)==_pid){ p5=1;
+			                  printf("[PTCH5-PROBE]   FOUND ptch %d in map $%06X: attrs=$%02X dataOff=$%06X handle=$%08X\n",
+			                    _pid,mh,m68ki_read_8(state,rp+4),m68ki_read_32(state,rp+4)&0xFFFFFF,m68ki_read_32(state,rp+8)); } } } }
+			            printf("[PTCH5-PROBE]  map#%d fileRef=$%04X handle=$%06X ptchType=%d ptchCount=%d found_ptch%d=%d\n",g,fref,mh,hasP,cnt,_pid,p5);
 			            mh=m68ki_read_32(state,mp+16)&0x1FFFFFF;
 			          }
-			        }
+			        } }
 			        /* [RESLOAD-FIX] Our SuperMario RM returns NIL (not a non-nil EMPTY handle) for
 			         * GetResource when ResLoad=false and the resource isn't yet in memory. PTCH 630's
 			         * RamSysInit does SetResLoad(false)+GetResource('ptch',N) as an existence check, so it
