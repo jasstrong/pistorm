@@ -43,10 +43,9 @@ boot32_memsize_rom:
 	sub.l	#0x20000,%d2		/* d2 = SP - 128KB (preserve stack) */
 	cmp.l	#BOOT32_L1,%d2
 	bcs.s	0f
-	/* Cap at BOOT32_L1 (MemTop-128KB): the 64KB below the WTC video buffer is
-	 * reserved for the born-32 PMMU page tables (boot32_pmmu_setup builds them
-	 * at BOOT32_L1).  The RAM test caps at the same boundary.  Filling above it
-	 * would corrupt the descriptors (the POST re-sizes after the tables exist). */
+	/* Cap at BOOT32_L1 (MemTop-128KB), the 64KB below the WTC video buffer that
+	 * used to hold the PMMU tables.  The tables are ROM-resident now (boot32_l1);
+	 * the cap is kept so the RAM layout is unchanged. */
 	move.l	#BOOT32_L1,%d2
 0:	move.l	#0x4000,%a0
 	move.l	#0x6DB6DB6D,%d1		/* authentic Mac RAM-test fill pattern */
@@ -75,8 +74,8 @@ boot32_ramtest_rom:
  * The RAM test sweeps essentially ALL of RAM across 4 calls; the LAST is
  * A0=$00200000,A1=$01FFA700. The $26F0 stub (patch-rom.py) detects that call,
  * saves the diagnostic return in A3, and points A6 here — so the test's
- * `jmp (a6)` lands here AFTER the final sweep. We build the born-32 page tables
- * in the now-stable RAM (nothing sweeps it again), enable translation + set the
+ * `jmp (a6)` lands here AFTER the final sweep. We point the PMMU at the
+ * ROM-resident page tables (boot32_l1), enable translation + set the
  * MMU low-mem globals (so the System knows it's a 32-bit machine), then restore
  * A6 from A3 and return to the POST with the MMU on. A3 (not the stack) carries
  * the return because the RAM test overwrites the stack region; A3 is callee-saved
@@ -84,7 +83,7 @@ boot32_ramtest_rom:
 	.globl	boot32_pmmu_setup_rom
 boot32_pmmu_setup_rom:
 	movem.l	%d0-%d7/%a0-%a5,-(%sp)
-	jsr	boot32_pmmu_setup	/* build tables + MMU globals + PMOVE CRP/SRP/TC (enable) */
+	jsr	boot32_pmmu_setup	/* MMU globals + PMOVE CRP/SRP/TC (enable) */
 	movem.l	(%sp)+,%d0-%d7/%a0-%a5
 	.short	0xA0FD			/* paravirt: ARM the RAM-buffered trace HERE — right after the
 					 * RAM test, so the trace captures the post-RAM-test boot -> SCSI
@@ -92,3 +91,39 @@ boot32_pmmu_setup_rom:
 					 * it (NOP) unless `setvar trace_all 1`. */
 	move.l	%a3,%a6			/* the real diagnostic return the stub saved in A3 */
 	jmp	(%a6)
+
+
+/* ---- born-32 PMMU tables, ROM-resident ------------------------------------
+ * Static data derived only from BOOT32_MEMTOP, so they live here in ROM where no
+ * OS allocation can reach them.  (In RAM at MemTop-128KB they were inside BufPtr
+ * territory: AppleShare's .AFPTranslator lowered BufPtr across them and
+ * _BlockMoved its 'EXFS' code over L1 -> "PMMU table search beyond maximum depth".)
+ * Every descriptor has U pre-set (page descriptors also M), so the MMU never
+ * writes back into ROM.  CRP/SRP and MMUTbl point at boot32_l1.
+ *   L1 (256 x 16MB): [0..(MEMTOP>>24)-1] RAM identity, [$40] -> L2,
+ *                    else base-$0 "dirty alias" (strips the top byte)
+ *   L2 (16 x 1MB, the $40000000 window): [0-7] strip $40 -> RAM, [5] SCSI I/O (CI),
+ *                    [8] ROM + SCSI ($40800000, no CI), [9-F] I/O ($409-$40F, CI) */
+	.balign	16
+	.globl	boot32_l1
+boot32_l1:
+	.set	b32slot, 0
+	.rept	256
+	.if	b32slot == 0x40
+	.long	boot32_l2 + 0x0A		/* DT=2 (short table) + U -> L2 */
+	.elseif	b32slot < (BOOT32_MEMTOP >> 24)
+	.long	(b32slot << 24) + 0x19		/* RAM identity: DT=1, U, M */
+	.else
+	.long	0x00000019			/* dirty alias -> physical $0 */
+	.endif
+	.set	b32slot, b32slot + 1
+	.endr
+
+	.balign	16
+	.globl	boot32_l2
+boot32_l2:
+	.long	0x00000019, 0x00100019, 0x00200019, 0x00300019	/* $400-$403: strip $40 -> RAM */
+	.long	0x00400019, 0x40500059, 0x00600019, 0x00700019	/* $404, $405 SCSI I/O (CI), $406-$407 */
+	.long	0x40800019					/* $408: ROM + SCSI, no CI */
+	.long	0x40900059, 0x40A00059, 0x40B00059, 0x40C00059	/* $409-$40C: I/O, CI */
+	.long	0x40D00059, 0x40E00059, 0x40F00059		/* $40D-$40F: I/O, CI */

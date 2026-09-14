@@ -18,7 +18,8 @@
 #define BOOT32_MEMTOP 0x01000000
 /* Derived layout (all relative to the top of RAM):
  *   video (WTC) buffer : MEMTOP - 64KB  (mirrors to SE-bus $3F0000)
- *   PMMU L1/L2 tables  : MEMTOP - 128KB (the 64KB just below the video buffer)
+ *   RAM fill cap       : MEMTOP - 128KB (formerly the PMMU tables; those are
+ *                        ROM-resident now: boot32_l1/boot32_l2 in boot32_glue.S)
  *   ScrnBase           : MEMTOP - $5900 (Mac screen base, inside the video buf)
  *   RAM-test A1 cap     : MEMTOP - $100  (protect the caller's stack-saved regs) */
 #define BOOT32_VIDEO  (BOOT32_MEMTOP - 0x10000)
@@ -36,10 +37,9 @@ unsigned long boot32_memsize(void);
  * memory; report success (noErr) without touching it. */
 unsigned long boot32_ramtest(void);
 
-/* Build the born-32 (IS=0) PMMU page tables in tested RAM and enable
- * translation.  Called after the ROM RAM test ($408026F0) so the destructive
- * sweep can't clobber the tables (the old emulator-side setup at the $48 seam
- * put them inside the swept range). */
+/* Point the PMMU at the ROM-resident born-32 (IS=0) page tables (boot32_l1 in
+ * boot32_glue.S) and enable translation.  Called after the ROM RAM test
+ * ($408026F0). */
 void boot32_pmmu_setup(void);
 #endif /* __ASSEMBLER__ */
 
