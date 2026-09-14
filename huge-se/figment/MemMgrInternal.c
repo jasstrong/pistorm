@@ -674,7 +674,16 @@ static handleBlock* JumpRelocateBlock(handleBlock* blockHeader, blockSize_t reqB
 		#ifdef small_freeBlock_headers
 			if ((blockHeader->sizeDelta >= kAlignmentFactor + kMagicSize + kBackPtrSize))
 		#else
-			if ((blockHeader->sizeDelta > kAlignmentFactor + kMagicSize + kBackPtrSize))
+			/* [BORN32-FIX] The sizeDelta test alone assumes 20-byte free headers (or 16-byte
+			 * alignment).  This build has 32-byte free headers and 4-byte alignment, so a
+			 * handle at the kMinFreeBlockSize floor with a small payload lost 4 bytes on every
+			 * jump relocation (32 -> 28 -> 24 -> 20).  Once freed, such a block is too small for
+			 * its own free header: KillBlock writes prevFree at +$1C into the NEXT block's tags,
+			 * leaving a live block marked free but unlinked.  SetHandleSize later grew into it
+			 * and "unlinked" it through its data, writing into the VIA Lvl1DT vectors ($01A8)
+			 * at the Finder launch.  Never trim a block below kMinFreeBlockSize. */
+			if ((blockHeader->sizeDelta > kAlignmentFactor + kMagicSize + kBackPtrSize) &&
+				(reqBlockSize >= kMinFreeBlockSize + kAlignmentFactor))
 		#endif
 			{
 			/* reduce internal fragmentation, of the relocated block. */
@@ -1765,7 +1774,9 @@ static freeBlock* JumpRelocateRange(stdBlock* rangeStart, stdBlock* rangeEnd, lo
 			#ifdef small_freeBlock_headers
 				if (workBlock->sizeDelta >= kAlignmentFactor + kMagicSize + kBackPtrSize)
 			#else
-				if (workBlock->sizeDelta > kAlignmentFactor + kMagicSize + kBackPtrSize)
+				/* [BORN32-FIX] never trim below kMinFreeBlockSize (see JumpRelocateBlock) */
+				if ((workBlock->sizeDelta > kAlignmentFactor + kMagicSize + kBackPtrSize) &&
+					(newBlockSize >= kMinFreeBlockSize + kAlignmentFactor))
 			#endif
 				{
 				/* reduce internal fragmentation, of the relocated block. */
