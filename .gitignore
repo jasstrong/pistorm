@@ -13,3 +13,6 @@
 /m68kops.c
 /m68kops.h
 /emulator
+
+# Claude Code agent worktrees and local settings
+.claude/
