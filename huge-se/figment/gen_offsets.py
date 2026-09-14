@@ -48,9 +48,12 @@ trap_map = {
     "fig_HClrRBit":      0x68,  # _HClrRBit = $A068
     "fig_HGetState":     0x69,  # _HGetState = $A069
     "fig_HSetState":     0x6A,  # _HSetState = $A06A
+    "fig_NewEmptyHandle": 0x66,  # _NewEmptyHandle = $A166 (OS trap $66)
 }
 # NOTE: fig_MoveHLow ($A09D) = base $1D? No, $9D. Need to check.
-# NOTE: fig_NewEmptyHandle ($A166) is a TOOLBOX trap, not OS trap.
+# NewEmptyHandle ($A166) is an OS trap: bit 11 is clear ($0100 is the return-A0 flag),
+# so it is OS trap $66 at $0400+$66*4. It was once left out here as a supposed Toolbox
+# trap, which sent every _NewEmptyHandle to the stock SE ROM routine on a figment heap.
 
 entries = []
 for line in out.strip().split('\n'):
