@@ -90,29 +90,38 @@
 .equ RMgrPerm,      0x0BA4
 .equ fondCache,     0       /* font cache pointer — stub */
 
-/* Extended resource record offsets */
-.equ signature,                         0
-.equ headerVersion,                     4
-.equ actualSize,                        6
-.equ decompressID,                      10
-.equ extendedAttributes,                12
-.equ ExtResRecord_signature,            0
-.equ ExtResRecord_extendedAttributes,   12
-.equ ExtResRecord_actualSize,           6
-.equ ExtResRecord_ResHeader_actualSize, 6
-.equ ExtResRecord_ResHeaderSize,        16
-.equ CurHeaderVersion,                  1
-.equ greggyHeaderVersion,               2
-.equ resCompressed,                     0  /* bit in extendedAttributes */
+/* Extended (compressed) resource header -- offsets relative to the header start.
+ * Verified against Apple's compiled DecompressorPatch (System 7.5.3, installed on the SE):
+ * sig.L headerLength.W headerVersion.B extendedAttributes.B actualSize.L, then
+ * DonnBits (v8): varTableRatio.B overRun.B decompressID.W cTableID.W  (18-byte header)
+ * GreggyBits (v9): defprocID.W decompressSlop.W
+ * The previous values here were placeholders (all 0 / guessed), so CheckLoad never
+ * recognised a compressed resource and loaded the raw packed bytes. */
+.equ signature,             0
+.equ headerLength,          4
+.equ headerVersion,         6
+.equ extendedAttributes,    7
+.equ actualSize,            8
+.equ extendedData,          12     /* data offset: extended, not compressed */
+.equ varTableRatio,         12     /* DonnBits */
+.equ overRun,               13     /* DonnBits */
+.equ decompressID,          14     /* DonnBits */
+.equ cTableID,              16     /* DonnBits */
+.equ defprocID,             12     /* GreggyBits */
+.equ decompressSlop,        14     /* GreggyBits */
+.equ compressedData,        18     /* data offset: compressed */
+.equ CurHeaderVersion,      8      /* DonnBits */
+.equ greggyHeaderVersion,   9      /* GreggyBits */
+.equ resCompressed,         0      /* bit in extendedAttributes */
+
+/* DecompressionLocals RECORD {a6Link},DECR: ResourceTemplate buffer (ResSize.L + header),
+ * DonnBits flag, pad, cached decompressor handle.  The shared localSize (-66) covers it. */
+.equ ResTemplateSize,     22
+.equ DoDonnDecompress,    -23
+.equ DefProcHandle,       -28
 
 /* Decompression equates */
 .equ DeCompressDefType,   0x64636D70  /* 'dcmp' */
-.equ decompressSlop,      0
-.equ varTableRatio,       0
-.equ defprocID,           0
-.equ cTableID,            0
-.equ DefProcHandle,       0
-.equ overRun,             0
 
 /* Misc constants */
 .equ OneOne,         0x0A02     /* low-mem global containing $00010001, was literal */
@@ -120,7 +129,7 @@
 .equ Resource, 5
 
 /* External function stubs — these won't be called in our minimal RM */
-.equ RobustnessData, 0
+.equ RobustnessData, 0xA89F6572  /* _Unimplemented + 'er': compressed-resource signature */
 .equ bkLim,          0     /* old MM zone header offset */
 .equ purgeProc,      0x28  /* old MM zone header offset for purge proc */
 .equ localSize,      -66   /* ioBlock (52) + override locals (14); was -52 which overlapped them */
@@ -148,11 +157,8 @@
 .equ jNewMap,       JNewMap
 .equ jSuperLoad,    JSuperLoad
 .equ jCmpFrm,      JCmpFrm
-.equ jCacheFlush,   0x07F4
+.equ jCacheFlush,   0x06F4     /* Apple's jCacheFlush (was 0x07F4, an RM vector slot) */
 
-/* ExtendedResource struct field access (used as Record.field) */
-.equ compressedData, 16
-.equ extendedData,   16
 
 /* IO */
 .equ vRefNum,       22
@@ -164,13 +170,3 @@
 .equ HSCache,         0x0B80
 .equ ROMMapInsert,    RomMapInsert
 
-/* ExtResRecord field access — dots converted to underscores */
-/* These are used as ExtResRecord.field — already converted by mpw2gas */
-/* But the linker sees them as external symbols. Define as offsets. */
-.equ ExtResRecord_signature, 0
-.equ ExtResRecord_ResHeaderSize, 16
-.equ ExtResRecord_extendedAttributes, 12
-.equ ExtResRecord_actualSize, 6
-.equ ExtResRecord_ResHeader_actualSize, 6
-.equ ExtendedResource_extendedData, 16
-.equ ExtendedResource_compressedData, 16

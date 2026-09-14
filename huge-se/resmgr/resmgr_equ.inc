@@ -266,7 +266,7 @@
 .equ ioDirID,        48            /* ioDirID in HFS PB */
 
 /* Resource header buffer (on stack) */
-.equ ResHeaderBuffer, -64          /* approximate */
+.equ ResHeaderBuffer, -22          /* DecompressionLocals: 22-byte ResourceTemplate below a6Link */
 .equ ResSize,         0
 .equ resCompressed,   0
 
@@ -283,8 +283,8 @@
 /* VarTable record (decompression) */
 .equ VarTableRec_VarRecSize, 8
 /* Resource header on-stack buffer */
-.equ ResHeader,      0
-.equ ResHeaderSize,  16
+.equ ResHeader,      4          /* header follows the 4-byte resource length (ResSize) */
+.equ ResHeaderSize,  18         /* compressed-resource header length */
 
 /* More misc equates */
 .equ flags,          5         /* DCE flags byte offset */

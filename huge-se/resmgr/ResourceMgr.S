@@ -5158,7 +5158,7 @@ DeCompressor:
 
 // read in the resource data header.  This gives us decompressed size.
 
-    moveq #16,%d0 //amount we wish to read.
+    moveq #ResTemplateSize,%d0 //amount we wish to read.
     move.l RLocn(%a2),%d6 //get the relative data location.
     and.l Lo3Bytes,%d6 //mask off the resource attributes.
     move.l %d6,%d1 //this is where we want to start reading from.
@@ -5166,7 +5166,7 @@ DeCompressor:
 
 // do a robustness check to see if the handle really seems to be compacted.
 
-    cmp.l #RobustnessData,0(%a0) //is it really an extended resource?
+    cmp.l #RobustnessData,ResHeader+signature(%a0) //is it really an extended resource?
     beq.w .L_DeCompressor_TestHeaderVersion
 
     movem.l (%sp)+,%d3-%d7/%a4-%a5 //restore the regs, but don't pop them yet.
@@ -5178,10 +5178,10 @@ DeCompressor:
     move.w #CantDecompress,%d2 //assume bad extended resource.
     lea DoDonnDecompress(%a6), %a1 //get flag location <17>
     sf (%a1) //set the flag, assuming that's what we want
-    cmp.b #CurHeaderVersion,headerVersion(%a0) //is this DonnBits?
+    cmp.b #CurHeaderVersion,ResHeader+headerVersion(%a0) //is this DonnBits?
     beq .L_DeCompressor_headerVersionOK //yep, okay
     st (%a1) //nope, clear the flag
-    cmp.b #greggyHeaderVersion, headerVersion(%a0) //is this GreggyBits?
+    cmp.b #greggyHeaderVersion,ResHeader+headerVersion(%a0) //is this GreggyBits?
     bne ErrorExit //no, bail
 .L_DeCompressor_headerVersionOK:
  //move along
@@ -5192,10 +5192,10 @@ DeCompressor:
 
 // assume it's just a non-compressed extended resource, compute data size and offset.
 
-    moveq #16,%d2 //offset to start of data for a normal extended attribute resource
+    moveq #extendedData,%d2 //offset to start of data for a normal extended attribute resource
     move.l ResSize(%a0),%d5 //get the size, including header.
     sub.l %d2,%d5 //actual amount of data to read.
-    btst #resCompressed,extendedAttributes(%a0)
+    btst #resCompressed,ResHeader+extendedAttributes(%a0)
     beq.w HaveSizeAndOffset //not compressed, then we have the size and offset.
 
 // check which def proc to unpack it with.  We use a simple robust caching scheme to avoid _GetResource calls.
@@ -5203,11 +5203,11 @@ DeCompressor:
     move.w #badExtResource,%d2 //assume an error if it was the wrong version!
     btst #0, DoDonnDecompress(%a6) // are we doing DonnBits <17>
     bne.w .L_DeCompressor_notDonn // no, get ID from revised general header format
-    move.w decompressID(%a0),%d5 //get the Donn ID this resource needs
+    move.w ResHeader+decompressID(%a0),%d5 //get the Donn ID this resource needs
     bra.w .L_DeCompressor_gotID // ...and keep going
 .L_DeCompressor_notDonn:
 
-    move.w defprocID(%a0), %d5 // get defProc
+    move.w ResHeader+defprocID(%a0),%d5 // get defProc
 .L_DeCompressor_gotID:
 
 
@@ -5271,21 +5271,21 @@ DeCompressor:
     lea ResHeaderBuffer(%a6),%a0 //point into our frame. <17>
     btst #0, DoDonnDecompress(%a6) // are we DonnBits? <17>
     bne.w .L_DeCompressor_cTableDontCare // no, then cTables are not used
-    tst.w cTableID(%a0) //is the built in table to be used?
+    tst.w ResHeader+cTableID(%a0) //is the built in table to be used?
 
     bne ErrorExit // for now, we don't load decompression tables.
 .L_DeCompressor_cTableDontCare:
 
-    moveq #16,%d2 //offset to start reading from.
-    move.l actualSize(%a0),%d5 //get the unpacked size.
+    moveq #compressedData,%d2 //offset to start reading from.
+    move.l ResHeader+actualSize(%a0),%d5 //get the unpacked size.
     moveq #0,%d0 //overRun indicates the amount of extra room we need to
     btst #0, DoDonnDecompress(%a6) // are we DonnBits? <17>
     bne.w .L_DeCompressor_getWordSizedSlop // no, then slop size is a word
-    move.b overRun(%a0),%d0 // avoid the input and output pointers crossing during decompression.
+    move.b ResHeader+overRun(%a0),%d0 // avoid the input and output pointers crossing during decompression.
     bra.w .L_DeCompressor_addOverRun //
 .L_DeCompressor_getWordSizedSlop:
  //
-    move.w decompressSlop(%a0), %d0 // get word sized slop size
+    move.w ResHeader+decompressSlop(%a0),%d0 // get word sized slop size
 .L_DeCompressor_addOverRun:
  //
     add.l %d0,%d5 // block size must include overRun.
@@ -5352,7 +5352,7 @@ HaveSizeAndOffset:
 // Read the data into the end part of the handle.
 
     move.l %d6,%d1 //where the size and resource header start.
-    // addq.l #0,%d1  (no-op, ResHeader==ResSize)
+    addq.l #ResHeader,%d1 // skip the resource length long in front of the header.
     add.l %d2,%d1 // we want to read from beyond the header.
     bsr ReadResData //read the data into the block.
     beq.w .L_HaveSizeAndOffset_NoReadError // do an error check.
@@ -5364,14 +5364,14 @@ HaveSizeAndOffset:
 
 // if it is not a compressed resource, then we are done.
 
-    btst #resCompressed,ResHeaderBuffer+12(%a6) //compressed resource? <17>
+    btst #resCompressed,ResHeaderBuffer+ResHeader+extendedAttributes(%a6) //compressed resource? <17>
     beq ExitCheckLoad
 
 // create the room for the variable table.  It is a percentage of the unpacked size.
     btst #0, DoDonnDecompress(%a6) // DonnBits? <17>
     bne.w dontCallDonn // no, call defProc via new and improved interface
     moveq #0,%d0 //get the ratio of var table to unpacked size.
-    move.b ResHeaderBuffer+varTableRatio(%a6),%d0 //<17>
+    move.b ResHeaderBuffer+ResHeader+varTableRatio(%a6),%d0 //<17>
     beq.w .L_HaveSizeAndOffset_HaveVarSize
     addq.l #1,%d0 //round up.
     move.l %d5,%d1 //unpacked size - is it a long?
@@ -5445,7 +5445,7 @@ FPCallGreggyDone:
 
 cutBackCLHandle:
  // cut back the handle to get rid of the slop.
-    move.l ResHeaderBuffer+6(%a6),%d0 //final size. <17>
+    move.l ResHeaderBuffer+ResHeader+actualSize(%a6),%d0 //final size. <17>
     move.l %a5,%a0
     _sethandlesize //shrink the handle to it's correct size.
 
@@ -5694,21 +5694,21 @@ SizeRsrcDecomp:
 // make sure this is really a compressed resource by reading in the header data, and testing for our signature.
     link %a6, #localSize // allow for reentrancy
     movem.l %d1/%a0,-(%sp) // save some scratch regs
-    moveq #16,%d0 // amount we wish to read.
+    moveq #ResTemplateSize,%d0 // amount we wish to read.
     move.l RLocn(%a2),%d1 // get the relative data location.
     and.l Lo3Bytes,%d1 // mask off the resource attributes.
     bsr ReadResBuffer // read in the resource data.
 
 // do a robustness check to see if the handle really seems to be compacted.
 
-    cmp.l #RobustnessData,signature(%a0) //is it really an extended resource?
+    cmp.l #RobustnessData,ResHeader+signature(%a0) //is it really an extended resource?
     movem.l (%sp)+,%d1/%a0
     unlk %a6
     bne.w ReadRsrcLength //didn't match, then just do old sizersrc. <sm21>kc
 
 // adjust the position offset to point within the header to the actual length.
 
-    moveq #6,%d0 //get delta to the new position.
+    moveq #ResHeader+actualSize,%d0 //get delta to the new position (the actualSize field).
     add.l %d0,%d2 //bump the offset by our header and a long. <SM19>
 
     bra.w ReadRsrcLength //				<sm21>kc
@@ -8574,7 +8574,6 @@ ResourceDispatchStub:
 PreLoad:
 PreLoad2:
 SmgrInitialize:
-DoDonnDecompress:
 DiskCachePurgeProcedure:
 UpdateCompact:
 ZNextRes:
