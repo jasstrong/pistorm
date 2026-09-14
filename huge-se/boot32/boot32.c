@@ -81,6 +81,46 @@ void boot32_pmmu_setup(void)
 	*(volatile unsigned long *)0x0CB4UL = BOOT32_L1;    /* MMUTbl base */
 	*(volatile unsigned long *)0x0CB8UL = 256UL * 4 + 16UL * 4; /* MMUTbl size */
 
+	/* Fig_InitMemMgr (SuperMario OS/MemoryMgr/FigmentSources/MemMgrBoot.a) is NOT
+	 * ported into born-32 figment — MemMgrBoot.a isn't compiled into figment.bin —
+	 * so figment's MMFlags config byte is never established and the System comes up
+	 * mis-configured.  Replicate its ForROM MMFlags setup here:
+	 *   MMStartMode(0)|MMMixed(1)|MMSysheap(2)|MMROZheap(3)|mmFigEnable(5) = $2F
+	 *   (32-bit addressing + 32-bit system/ROZ heaps + Figment enabled;
+	 *    mmHighSysHeap(4) cleared).  The $0B73 Systemis24bit/Sysheapis24bit bits
+	 *   that Fig_InitMemMgr also clears are already 0 (set above). */
+	*(volatile unsigned char *)0x1EFCUL = 0x2F;         /* MMFlags */
+	/* ...and the rest of Fig_InitMemMgr that figment's C actually reads.
+	 * FakeHandleRange ($1E10) is LOAD-BEARING: figment compares heap/block ptrs
+	 * against it constantly (LMGetFakeHandleRange, e.g. `if (curHeap >
+	 * FakeHandleRange)`) to detect heaps above RealMemTop; left 0 it makes every
+	 * such test true -> figment mishandles every heap.  Set FakeHandleRange =
+	 * RealMemTop = MemTop.  Zero the grow-zone roots (GZRootHnd/Ptr/MoveHnd) as
+	 * Fig_InitMemMgr does.  (MoveBytes/ClearBytes are direct C funcs in figment,
+	 * not lomem vectors, so no vMoveBytes/vClearBytes needed for born-32.) */
+	*(volatile unsigned long *)0x1EF4UL = BOOT32_MEMTOP;   /* RealMemTop */
+	*(volatile unsigned long *)0x1E10UL = BOOT32_MEMTOP;   /* FakeHandleRange */
+	*(volatile unsigned long *)0x0328UL = 0;               /* GZRootHnd */
+	*(volatile unsigned long *)0x032CUL = 0;               /* GZRootPtr */
+	*(volatile unsigned long *)0x0330UL = 0;               /* GZMoveHnd */
+	/* vMoveBytes/vClearBytes: jump vectors old-MM callers reach via JSR([$1E00])/
+	 * JSR([$1E04]).  Point them at figment's exported routines (the born-32 "hack":
+	 * figment provides these as real 32-bit C funcs).  NB figment-build-specific
+	 * addresses (memmove/ClearBytes in figment_stubs.c, figment linked @$40840000) —
+	 * revisit if figment's layout changes. */
+	*(volatile unsigned long *)0x1E00UL = 0x40846D52UL;  /* vMoveBytes -> figment memmove */
+	*(volatile unsigned long *)0x1E04UL = 0x40846D2CUL;  /* vClearBytes -> figment ClearBytes */
+	*(volatile unsigned long *)0x1E0CUL = 0;             /* vTrashQTMemList */
+	/* nil handle/window safety pointers: $0/$4 = ROMBase+$10000 (a safe deref
+	 * target so a nil-handle deref reads harmless ROM).  asm barrier defeats the
+	 * compiler's null-deref optimization on the literal-0 store. */
+	{
+		volatile unsigned long *nilp = (volatile unsigned long *)0;
+		__asm__ __volatile__("" : "+a"(nilp));
+		nilp[0] = 0x40810000UL;   /* $0 nil handle */
+		nilp[1] = 0x40810000UL;   /* $4 nil window ptr */
+	}
+
 	/* Root pointers + translation control.  Writing TC with bit 31 set turns
 	 * on translation; the emulator's PMOVE handler validates + enables. */
 	{
