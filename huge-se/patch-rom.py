@@ -460,6 +460,26 @@ def patch_rom(infile, outfile):
     patches += 1
     print(f"=== StripAddress ($A055 @ $A7D0) neutered to a 32-bit no-op ===")
 
+    # === .DRVR open: keep the full 32-bit driver pointer (born-32) ===
+    # The ROM's _Open for ROM-resident drivers (stock $403066-$403078) does
+    #   MOVE.L (A0),D3 ; AND.L Lo3Bytes,D3 ; MOVE.L ROMBase,-(SP) ; CLR.B (SP) ;
+    #   CMP.L (SP)+,D3 ; BCS ramdrvr ; MOVE.L D3,(A1)
+    # i.e. it strips the DRVR master pointer to 24 bits and compares it with ROMBase
+    # minus its high byte. On born-32 the .Sony DRVR lives in the ROM resources at
+    # $40855406, which strips to $00855406 -- plain RAM -- so the DCE gets
+    # dCtlDriver=$00855406, its flags and entry offsets are read from RAM, and the
+    # Device Manager's JSR at $402F24 lands in never-written memory. (Found by running
+    # this ROM in Snow; PiStorm's [DRV-FIX] in emulator.c papers over the same fault
+    # at runtime by OR-ing $40000000 into A2 at $2F1E.) NOP the strip and the CLR.B so
+    # the compare uses the real 32-bit pointer and ROMBase; figment master pointers
+    # carry no flag bytes, so RAM-based drivers stay below ROMBase.
+    assert rom[0x306A:0x306E] == b'\xc6\xb8\x03\x1a', ".DRVR open strip site mismatch"
+    assert rom[0x3072:0x3074] == b'\x42\x17', ".DRVR open ROMBase CLR.B site mismatch"
+    rom[0x306A:0x306E] = bytes([0x4E, 0x71, 0x4E, 0x71])  # NOP NOP (was AND.L Lo3Bytes,D3)
+    rom[0x3072:0x3074] = bytes([0x4E, 0x71])              # NOP     (was CLR.B (SP))
+    patches += 1
+    print(f"=== .DRVR open ($306A/$3072): 32-bit driver pointer kept (no Lo3Bytes strip) ===")
+
     # Clear address 0 so nil-terminated linked list walks work correctly.
     # The ROM's File Manager search at $932E does MOVEA.L A3,A4; MOVEA.L (A4),A4
     # with A3=0 (nil list head). *(0) is the reset SSP vector (non-zero),
