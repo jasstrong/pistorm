@@ -106,12 +106,16 @@
 /* This routine walks the heap tree to find the heap that contains the address. Note:
 	this routine must be revised to support discontiguous heaps. If no heap found
 	it returns nil. */
+#ifdef patchedIn
+stdHeap* b32_FindHeap(const void* address);	/* figment_glue.S */
+#endif
 stdHeap* FindHeap(const void* address)
 {
 #ifdef patchedIn
-	#pragma unused(newHeap)	
-	#pragma unused(address)	
-	return GetCurrentHeap();
+	/* born-32 runs figment patchedIn: there is no heap tree, and FindHeap was just
+	 * GetCurrentHeap() (TheZone).  b32_FindHeap applies the classic MM's MMRHPrologue
+	 * zone choice instead (SysZone vs ApplZone by address). */
+	return b32_FindHeap(address);
 #else
 	stdHeap*	testHeap = LMGetSysZone();
 	stdHeap*	parentHeap = nil;

@@ -606,3 +606,30 @@ fig_InitApplZone:
     moveq   #0,%d0
     move.w  %d0,(0x220).w          /* MemErr = noErr (InitAllPacks may trash it) */
     rts
+
+/* -----------------------------------------------------------------------
+ * b32_FindHeap — FindHeap for the patchedIn build (no heap tree).
+ *
+ * Mirrors the classic MM's MMRHPrologue (MemoryMgrInternal.a, "patch from Mac+"):
+ * when TheZone is SysZone or ApplZone, use ApplZone if the address lies above
+ * ApplZone, else SysZone; otherwise TheZone.  Plain patchedIn FindHeap returned
+ * TheZone, so RecoverHandle(p) on a system-heap block while TheZone == ApplZone
+ * gave ApplZone + relHandle (Assistant Toolbox's "LaterLaser INIT" then copied
+ * 0 bytes and jumped into an empty block -> error type 10).  Kept at the end of
+ * the last object so no other figment routine moves.
+ *
+ * In:  4(SP) = address     Out: D0 = heap
+ */
+    .globl b32_FindHeap
+b32_FindHeap:
+    move.l  (0x118).w,%d0           /* TheZone */
+    cmp.l   (0x2A6).w,%d0           /* SysZone? */
+    beq.s   1f
+    cmp.l   (0x2AA).w,%d0           /* ApplZone? */
+    bne.s   2f
+1:  move.l  (0x2A6).w,%d0           /* presume SysZone */
+    move.l  4(%sp),%d1              /* address */
+    cmp.l   (0x2AA).w,%d1
+    bls.s   2f                      /* address <= ApplZone -> SysZone */
+    move.l  (0x2AA).w,%d0           /* above ApplZone -> ApplZone */
+2:  rts
