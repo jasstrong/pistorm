@@ -27,7 +27,7 @@
 .equ SysResName,    0x0AD8
 .equ RomMapInsert,  0x0B9E
 .equ TmpResLoad,    0x0B9F
-.equ ROMMapHndl,    0x0B5E     /* was 0x0B06 — WRONG! */
+.equ ROMMapHndl,    0x0B06     /* Apple SysEqu.a ROMMapHndl = $B06. The old $0B5E overlapped BNMQHd ($0B60, Notification Mgr queue header): the System writes $0001 there and clobbered the ROM map handle to $00000001. System patches (PTCH 0, gpch 750, lpch 16, ROvr 0) also read $0B06. */
 .equ CurApRefNum,   0x0900
 
 /* RMGR HandleScan cache at $B80 */

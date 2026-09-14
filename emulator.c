@@ -2166,7 +2166,7 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 					      uint32_t truezone = m68ki_read_32(state, 0x1F44);  /* RM-saved ROZ zone ptr */
 					      uint32_t mpb = m68ki_read_32(state, 0x1F40);       /* RM-saved MPB base */
 					      printf("[RM-MPW] slot=$%08X relh=$%04X HandleZone=$%08X | trueROZ($1F44)=$%08X MPB($1F40)=$%08X ROMMapHndl=$%08X  -> %s\n",
-					             REG_DA[8], relh, hz, truezone, mpb, m68ki_read_32(state, 0x0B5E),
+					             REG_DA[8], relh, hz, truezone, mpb, m68ki_read_32(state, 0x0B06),
 					             (hz==truezone) ? "HandleZone-OK(rootB:figment)" : "HandleZone-WRONG(rootA:_HandleZone)");
 					      rc++;
 					    }
