@@ -64,6 +64,15 @@ for line in out.strip().split('\n'):
         trap_num = trap_map[name]
         entries.append((trap_num, addr, name))
 
+# figext.elf (same Makefile; linked at ROM+$74000 because figment's slot is full) provides
+# born-32's _HeapDispatch/_FigmentDispatch, OS trap $A4 = $A0A4.
+import os
+if os.path.exists("figext.elf"):
+    for line in subprocess.check_output([nm, "figext.elf"], text=True).strip().split('\n'):
+        parts = line.split()
+        if len(parts) >= 3 and parts[1] == 'T' and parts[2] == "b32_HeapDispatch":
+            entries.append((0xA4, int(parts[0], 16), "b32_HeapDispatch (figext)"))
+
 entries.sort()
 
 print("/* Auto-generated — do not edit */")

@@ -1,5 +1,5 @@
 /* Auto-generated — do not edit */
-#define FIGMENT_TRAP_COUNT 39
+#define FIGMENT_TRAP_COUNT 40
 static const struct { uint8_t trap_num; uint32_t offset; } figment_trap_table[] = {
     { 0x19, 0x40846DA8 }, /* fig_InitZone */
     { 0x1A, 0x40846DE2 }, /* fig_GetZone */
@@ -40,5 +40,6 @@ static const struct { uint8_t trap_num; uint32_t offset; } figment_trap_table[] 
     { 0x68, 0x40846FB8 }, /* fig_HClrRBit */
     { 0x69, 0x40846FC4 }, /* fig_HGetState */
     { 0x6A, 0x40846FD0 }, /* fig_HSetState */
+    { 0xA4, 0x40874000 }, /* b32_HeapDispatch (figext) */
     { 0, 0 }  /* sentinel */
 };

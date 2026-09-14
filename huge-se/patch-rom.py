@@ -868,6 +868,20 @@ def patch_rom(infile, outfile):
         else:
             print(f"\n=== WARNING: Figment doesn't fit ===")
 
+    # Embed figext (figment/figext.bin): born-32's _HeapDispatch ($A0A4) + Apple's
+    # ProcessMgrHeap.c, linked at $40874000 against figment.elf because figment's own slot
+    # is full.  Its trap entry comes from figment_offsets.h.  The slot is the unused upper
+    # mirror of the 256KB base ROM; refuse to overwrite anything already patched there.
+    figext_path = os.path.join(os.path.dirname(__file__), 'figment', 'figext.bin')
+    FIGEXT_ROM_OFF = 0x74000
+    if os.path.exists(figext_path):
+        figext = open(figext_path, 'rb').read()
+        _mirror = FIGEXT_ROM_OFF - 0x40000
+        assert out[FIGEXT_ROM_OFF:FIGEXT_ROM_OFF + len(figext)] == out[_mirror:_mirror + len(figext)], \
+            "figext slot at ROM+$74000 is already in use"
+        out[FIGEXT_ROM_OFF:FIGEXT_ROM_OFF + len(figext)] = figext
+        print(f"=== figext (_HeapDispatch) embedded at ROM+${FIGEXT_ROM_OFF:05X} ({len(figext)} bytes) ===")
+
     # Embed Resource Manager binary in mirror half
     RESMGR_ROM_OFF = 0x48000  # linked at $40848000
     if resmgr and RESMGR_ROM_OFF + len(resmgr) <= len(out):
