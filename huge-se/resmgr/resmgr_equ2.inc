@@ -68,7 +68,9 @@
 .equ IOFileName,    ioNamePtr
 .equ IORefNum,      ioRefNum
 .equ IOVRefNum,     ioVRefNum
-.equ IOOwnBuf,      ioBuffer
+.equ IOOwnBuf,      ioMisc      /* Apple SysEqu ioOwnBuf EQU $1C (Open's private-buffer ptr) -- NOT ioBuffer ($20): with $20 the
+                                   * RM's 'clr.l IOOwnBuf(a0)' left offset 28 as stack garbage and HFS Open ($40805BB6) cleared 10
+                                   * bytes at that garbage address + kept it as the FCB's buffer ptr */
 .equ IOLEOF,        28      /* logical EOF offset in PB = ioMisc (SE ROM File Mgr _GetEOF returns EOF here, NOT ioPosOffset 46) */
 .equ ioQElSize,     ioHQElSize
 .equ dirID,         48

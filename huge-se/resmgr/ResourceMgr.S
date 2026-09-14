@@ -1189,7 +1189,7 @@ InitResources:
     move.l %a4,SysMapHndl // Save handle as sys map						<05sep85> BBM
     move.w %d6,CurMap // set up curmap 								<09jul85> BBM
     move.w %d6,SysMap // set up sysmap 								<10jul85> BBM
-    bsr PreLoad // Preload required resources... 				<31jan85> BBM
+    bsr Preload // Preload required resources... 				<31jan85> BBM
 
 
     bsr ReDoMap // restore the ROM map (Returns A1 pointer)
@@ -2552,7 +2552,7 @@ OPResFileCommon:
     beq.w .L_OPResFileCommon_9 // No, it was already there, don't relink.
     move.l TopMapHndl, MNext(%a1) // If new, link. Store old top as next map
     move.l %a4,TopMapHndl // Set new map as top map						<05sep85> BBM
-    bsr PreLoad2 // Preload required resources... 				<22Jan85> BBM
+    bsr Preload2 // Preload required resources... 				<22Jan85> BBM
     bsr CheckAndFlushFontCache // If this new file has fonts we should flush the font cache‚Ä¶
 .L_OPResFileCommon_9:
 
@@ -2899,7 +2899,7 @@ UpdateResFileCommon:
     bmi UpdateResExit // if failed return error
 
     bclr #MapCompact, MAttr(%a3) // Do I need to compact? 						<12jun85> BBM
-    bne.w UpdateCompact // If so, skip to compact stuff
+    bne.w UpDateCompact // If so, skip to compact stuff
 
     moveq #ResChanged,%d1 // which bit to check in FirstRes/NextRes		<09apr85> BBM
     bsr FirstRes // first resource in file order that changed 	<13may85> BBM
@@ -6138,7 +6138,7 @@ SpaceAt:
 
 // RSRC is before the map . ..
 
-    bsr ZNextRes // Get following resource--D0 is location.
+    bsr ZnextRes // Get following resource--D0 is location.
     bmi.w .L_SpaceAt_1 // If no next resource go get size before map
     cmpa.l %d0,%a1 // If next resource before map ...
     bpl.w satNotLast // ... CC=PL means it is before map
@@ -6150,7 +6150,7 @@ SpaceAt:
 // we come here if RSRC is past map . . .
 
 .L_SpaceAt_2:
-    bsr ZNextRes // Get following resource--D0 is location.
+    bsr ZnextRes // Get following resource--D0 is location.
     bpl.w satNotLast // CC=PL means next resource exists
     bsr.w MaxRFEOF // get EOF in D0 and exit through satLast
     sub.l ResDataOffset(%a0),%d0 // make D0 an offset into the data segment		 <28oct85> BBM
@@ -8570,11 +8570,11 @@ ResourceDispatchStub:
     clr.l (%sp)                 /* result = nil */
     jmp (%a0)                   /* return */
 
-/* Stub functions for unneeded external references */
-PreLoad:
-PreLoad2:
+/* No-op stubs for routines that live outside the Resource Manager: SmgrInitialize
+ * (Script Manager, ScriptMgrInit.a) and DiskCachePurgeProcedure (TrueType disk cache).
+ * PreLoad/PreLoad2/UpdateCompact/ZNextRes used to be stubbed here too, but they are
+ * Preload/Preload2/UpDateCompact/ZnextRes in this file -- MPW Asm is case-insensitive,
+ * gas is not, so the references now use the real routines' spelling. */
 SmgrInitialize:
 DiskCachePurgeProcedure:
-UpdateCompact:
-ZNextRes:
     rts
