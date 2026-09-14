@@ -281,7 +281,7 @@
 /* Already defined above */
 
 /* VarTable record (decompression) */
-.equ VarTableRec_VarRecSize, 8
+.equ VarTableRec_VarRecSize, 4   /* NextVarIndex.W + VarsList.W (Apple Internal/Asm/Decompression.a) */
 /* Resource header on-stack buffer */
 .equ ResHeader,      4          /* header follows the 4-byte resource length (ResSize) */
 .equ ResHeaderSize,  18         /* compressed-resource header length */

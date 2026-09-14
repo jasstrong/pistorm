@@ -5384,7 +5384,7 @@ HaveSizeAndOffset:
     lsr.l #8,%d0
 .L_HaveSizeAndOffset_HaveVarSize:
 
-    addq.l #8,%d0 //add enough room for at least one record.
+    addq.l #VarTableRec_VarRecSize,%d0 //add enough room for at least one record.
     move.l %d0,%d1 //save var table size.
     _newhandle //get the table.  Used to be a _NewPtr, but that moves the Realloc'ed handle
     bne ErrorExitBlowoffHandle //blow off the handle and return a nil handle
