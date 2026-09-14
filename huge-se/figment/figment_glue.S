@@ -598,5 +598,11 @@ fig_InitApplZone:
     /* Set ApplZone = TheZone (InitZone sets TheZone to the new zone) */
     move.l  (0x118).w,(0x2AA).w
 
+    /* Reinstall the packages, as the stock SE ROM's InitApplZone does ($40A410) and as
+     * Apple's Figment post-init did (MemMgrBoot.a Fig_VIAZPOSTINIT, not built here).
+     * Without it the package table (AppPacks, $0AB8) keeps the ROM's $FFFFFFFF low-memory
+     * fill, so the first _PackN call dereferences a -1 handle and jumps into RAM. */
+    .short  0xA9E6                 /* _InitAllPacks */
     moveq   #0,%d0
+    move.w  %d0,(0x220).w          /* MemErr = noErr (InitAllPacks may trash it) */
     rts
