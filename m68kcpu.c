@@ -88,10 +88,31 @@ void branch_ring_dump(const char *why) {
 		unsigned int j = (branch_ring_idx + i) & (BRANCH_RING_SIZE - 1);
 		if (branch_ring_src[j] || branch_ring_dst[j]) {
 			int stripped = (branch_ring_dst[j] & 0xFFF80000) == 0x00800000;
-			printf("  [%3d] $%08X --ir$%04X--> $%08X%s\n", i,
+			printf("  [%3d] $%08X --ir$%04X--> $%08X  SP=$%08X SR=$%04X%s\n", i,
 			       branch_ring_src[j], branch_ring_ir[j], branch_ring_dst[j],
+			       branch_ring_sp[j], branch_ring_sr[j],
 			       stripped ? "   <-- STRIPPED" : "");
 		}
+	}
+}
+/* SP and SR (supervisor bit + interrupt mask) at each recorded transfer, so a ring dump
+ * shows where the stack pointer jumped and whether it happened at interrupt level. */
+uint32_t branch_ring_sp[BRANCH_RING_SIZE];
+uint16_t branch_ring_sr[BRANCH_RING_SIZE];
+
+/* [WWATCH] ring of the last CPU writes into [WWATCH_LO, WWATCH_HI) (see m68kcpu.h). */
+uint32_t wwatch_addr[WWATCH_SIZE], wwatch_val[WWATCH_SIZE], wwatch_pc[WWATCH_SIZE], wwatch_sp[WWATCH_SIZE];
+uint16_t wwatch_sr[WWATCH_SIZE];
+uint8_t wwatch_sz[WWATCH_SIZE];
+unsigned int wwatch_idx = 0;
+void wwatch_dump(void) {
+	unsigned int n = wwatch_idx < WWATCH_SIZE ? wwatch_idx : WWATCH_SIZE;
+	printf("[WWATCH] last %u of %u CPU writes into [$%06X,$%06X) (oldest first):\n",
+	       n, wwatch_idx, WWATCH_LO, WWATCH_HI);
+	for (unsigned int i = 0; i < n; i++) {
+		unsigned int j = (wwatch_idx - n + i) & (WWATCH_SIZE - 1);
+		printf("  [%3u] $%08X <- $%0*X (%u)  PC=$%08X SP=$%08X SR=$%04X\n", i, wwatch_addr[j],
+		       wwatch_sz[j] * 2, wwatch_val[j], wwatch_sz[j], wwatch_pc[j], wwatch_sp[j], wwatch_sr[j]);
 	}
 }
 uint m68ki_tracing = 0;

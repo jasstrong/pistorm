@@ -1486,8 +1486,26 @@ static inline uint m68ki_read_32_fc(m68ki_cpu_core *state, uint address, uint fc
 	uint32_t _rd = (addr) & 0x00FFFFFF; \
 	if (ovl_sysrom_pos == 0x800000 && _rd >= 0x8000 && _rd < 0x10000) r0_dirty = 1; } while (0)
 
+/* [WWATCH] ring of the last CPU writes into a small window, dumped at the first ILLEGAL.
+ * Default window: the trap-dispatcher frame on the Finder's stack whose return slot
+ * ($FB936E) holds $0000000C at the born-32 Finder-launch crash (identical in two rig runs),
+ * to catch who overwrites it. Masked to 24 bits so dirty-alias writes are caught too. */
+#define WWATCH_LO   0x00FB9340u
+#define WWATCH_HI   0x00FB9380u
+#define WWATCH_SIZE 128
+extern uint32_t wwatch_addr[WWATCH_SIZE], wwatch_val[WWATCH_SIZE], wwatch_pc[WWATCH_SIZE], wwatch_sp[WWATCH_SIZE];
+extern uint16_t wwatch_sr[WWATCH_SIZE];
+extern uint8_t wwatch_sz[WWATCH_SIZE];
+extern unsigned int wwatch_idx;
+extern void wwatch_dump(void);
+#define WWATCH_REC(a, v, s) do { uint32_t _wa = (a) & 0x00FFFFFFu; \
+	if (_wa >= WWATCH_LO && _wa < WWATCH_HI) { unsigned int _wi = wwatch_idx++ & (WWATCH_SIZE - 1); \
+	  wwatch_addr[_wi] = (a); wwatch_val[_wi] = (v); wwatch_pc[_wi] = REG_PPC; wwatch_sp[_wi] = REG_SP; \
+	  wwatch_sr[_wi] = (uint16_t)((FLAG_S ? 0x2000 : 0) | FLAG_INT_MASK); wwatch_sz[_wi] = (s); } } while (0)
+
 static inline void m68ki_write_8_fc(m68ki_cpu_core *state, uint address, uint fc, uint value)
 {
+	WWATCH_REC(address, value, 1);
 	/* [BADBLK-W8] catch writes into the deterministic sub-min free block $015C08's header
 	 * region (back/tags/size/nextFree + the clobbered neighbor back @$015C24). Top of the
 	 * write path, BEFORE CHIP_FASTPATH (addr<$200000 bypasses the tail), so it sees fastpath
@@ -1585,6 +1603,7 @@ static inline void m68ki_write_8_fc(m68ki_cpu_core *state, uint address, uint fc
 // M68KI_WRITE_16_FC
 static inline void m68ki_write_16_fc(m68ki_cpu_core *state, uint address, uint fc, uint value)
 {
+	WWATCH_REC(address, value, 2);
 	{ uint32_t _a = address & 0x1FFFFFF;   /* [BADBLK-W16] see write_8 */
 	  if (_a >= 0x015C00u && _a <= 0x015C2Fu) { static int _bw16=0;
 	    if (_bw16++ < 40) printf("[BADBLK-W16] $%06X <- $%04X PC=$%08X\n", _a, value&0xFFFF, ADDRESS_68K(REG_PPC)); } }
@@ -1789,6 +1808,7 @@ static inline void m68ki_write_16_fc(m68ki_cpu_core *state, uint address, uint f
 // M68KI_WRITE_32_FC
 static inline void m68ki_write_32_fc(m68ki_cpu_core *state, uint address, uint fc, uint value)
 {
+	WWATCH_REC(address, value, 4);
 	/* [SEBASE-W32] catch the PRODUCER of real-SE-base ROM pointers. The crash values
 	 * ($00408100/$004031E5/$00404806 = $400000+offset) are NOT static ROM constants -- they
 	 * are computed at runtime from a $400000 base instead of ROMBase ($40800000). Log every
@@ -2225,6 +2245,8 @@ static inline void m68ki_fake_pull_32(m68ki_cpu_core *state)
 extern uint32_t branch_ring_src[BRANCH_RING_SIZE];
 extern uint32_t branch_ring_dst[BRANCH_RING_SIZE];
 extern uint16_t branch_ring_ir[BRANCH_RING_SIZE];
+extern uint32_t branch_ring_sp[BRANCH_RING_SIZE];   /* A7 when the transfer executed */
+extern uint16_t branch_ring_sr[BRANCH_RING_SIZE];   /* SR (interrupt mask) at the transfer */
 extern unsigned int branch_ring_idx;
 extern int branch_ring_armed;        /* 1 = print [STRIP-JUMP] on stripped targets */
 extern int branch_strip_budget;      /* remaining live [STRIP-JUMP] prints (caps spam) */
@@ -2248,6 +2270,8 @@ static inline void m68ki_jump(m68ki_cpu_core *state, uint new_pc)
 		branch_ring_src[bi] = ADDRESS_68K(REG_PPC);
 		branch_ring_dst[bi] = new_pc;
 		branch_ring_ir[bi]  = REG_IR;
+		branch_ring_sp[bi]  = REG_SP;
+		branch_ring_sr[bi]  = (uint16_t)((FLAG_S ? 0x2000 : 0) | FLAG_INT_MASK);
 		branch_ring_idx++;
 		}
 		/* [POST-TRACE] log control transfers whose SOURCE is in the power-on
@@ -3382,7 +3406,7 @@ static inline void m68ki_exception_illegal(m68ki_cpu_core *state)
 	 * instruction — the last absolute transfer is the dirty jump into RAM
 	 * garbage (the post-Welcome crash), and its src PC names the culprit. */
 	{ static int ill_chain_once = 0; if (!ill_chain_once) { ill_chain_once = 1;
-		branch_ring_dump("at first ILLEGAL (post-Welcome dirty jump)"); } }
+		branch_ring_dump("at first ILLEGAL (post-Welcome dirty jump)"); wwatch_dump(); { extern void rmring_dump(void); rmring_dump(); } } }
 	{
 		uint32_t fpc = ADDRESS_68K(REG_PPC);
 		printf("  Code @%08X: ", fpc);

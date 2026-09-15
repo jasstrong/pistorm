@@ -647,6 +647,27 @@ int gestalt_trap_intercept(void) {
 
 int mode32_active = 0;
 int mode32_enabled = 0;  /* set by config: setvar mode32 1 */
+
+/* [RMRING] ring of Resource Manager entries/exits, recorded by the probe at vRMgrStdEntry
+ * ($4932A) and StdExitOut ($49554) and dumped at the first ILLEGAL. Pairs an RM call's
+ * entry and exit SP to find the call that returns 4 bytes high (the born-32 Finder-launch
+ * stack creep), and shows whether any RM call runs nested at interrupt level. */
+#define RMRING_SIZE 256
+static char rmring_kind[RMRING_SIZE];
+static uint32_t rmring_sp[RMRING_SIZE], rmring_a[RMRING_SIZE], rmring_b[RMRING_SIZE];
+static uint32_t rmring_c[RMRING_SIZE], rmring_d0[RMRING_SIZE];
+static uint16_t rmring_sr[RMRING_SIZE];
+static unsigned int rmring_idx = 0;
+void rmring_dump(void) {
+  unsigned int n = rmring_idx < RMRING_SIZE ? rmring_idx : RMRING_SIZE;
+  printf("[RMRING] last %u of %u RM entries (E: [SP]=return into routine, caller, 1st param) and "
+         "exits (X: [SP]=return to caller, D0=ResErr), oldest first:\n", n, rmring_idx);
+  for (unsigned int i = 0; i < n; i++) {
+    unsigned int j = (rmring_idx - n + i) & (RMRING_SIZE - 1);
+    printf("  [%3u] %c SP=$%08X  $%08X $%08X $%08X  SR=$%04X D0=$%08X\n", i, rmring_kind[j],
+           rmring_sp[j], rmring_a[j], rmring_b[j], rmring_c[j], rmring_sr[j], rmring_d0[j]);
+  }
+}
 volatile int mode32_trigger = 0;  /* set by SIGUSR1 */
 int figment_enabled = 0;  /* set when Figment is embedded in ROM */
 int huge_se_emu_pmmu = 0; /* 1 = old emulator-owned PMMU setup at $48 (debug fallback);
@@ -2234,13 +2255,35 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			             ret, (ret>=0x40840000&&ret<=0x408445D7)?"(figment re-entrant!)":(ret>=0x40800000&&ret<0x40840000)?"(ROM)":"(other)",
 			             REG_DA[8], REG_DA[14]); gc++; }
 			  }
-			  /* fig_InitZone entry ($46D2C): a0 = InitZoneParamBlock. Log every zone
-			   * figment creates, so we see whether the $2000 SysZone goes through it. */
+			  /* [FIG-CLEAR] figment ClearBytes(ptr, len) entry ($46D2C; C args on the stack).
+			   * Logs the clears that touch the high Process Manager area ($F70000-$FD0000:
+			   * the Finder partition, its stack below CurStackBase and its A5 world), to catch
+			   * a clear of a live stack. (This was [FIG-INITZONE]; figment moved and
+			   * fig_InitZone is now $46DA8, so it was logging every ClearBytes with junk.) */
 			  if (rom_off == 0x46D2C) {
-			    uint32_t pb = REG_DA[8];   /* a0 */
-			    printf("[FIG-INITZONE] paramBlk=$%08X start=$%08X limit=$%08X moreMast=$%04X PC=$%08X\n",
-			           pb, m68ki_read_32(state, pb), m68ki_read_32(state, pb + 4),
-			           m68ki_read_16(state, pb + 8), REG_PC);
+			    static int fc = 0;
+			    uint32_t sp = REG_DA[15];
+			    uint32_t ptr = m68ki_read_32(state, sp + 4), len = m68ki_read_32(state, sp + 8);
+			    if (ptr < 0xFD0000 && ptr + len > 0xF70000 && fc < 300) {
+			      fc++;
+			      printf("[FIG-CLEAR] ptr=$%08X len=$%X end=$%08X caller=$%08X SP=$%08X CurStackBase=$%08X\n",
+			             ptr, len, ptr + len, m68ki_read_32(state, sp), sp, m68ki_read_32(state, 0x908));
+			    }
+			  }
+			  /* [RMRING] record every Resource Manager entry (vRMgrStdEntry $4932A: [SP] = return
+			   * into the routine, [SP+4] = the routine's caller, [SP+8] = first parameter long)
+			   * and exit (StdExitOut $49554, the final rts: [SP] = return to the caller, D0 =
+			   * ResErr), with SP and SR. Dumped at the first ILLEGAL by rmring_dump(). */
+			  if (rom_off == 0x4932A || rom_off == 0x49554) {
+			    uint32_t sp = REG_DA[15];
+			    unsigned int k = rmring_idx++ & (RMRING_SIZE - 1);
+			    rmring_kind[k] = (rom_off == 0x4932A) ? 'E' : 'X';
+			    rmring_sp[k] = sp;
+			    rmring_a[k] = m68ki_read_32(state, sp);
+			    rmring_b[k] = m68ki_read_32(state, sp + 4);
+			    rmring_c[k] = m68ki_read_32(state, sp + 8);
+			    rmring_sr[k] = (uint16_t)((FLAG_S ? 0x2000 : 0) | FLAG_INT_MASK);
+			    rmring_d0[k] = REG_DA[0];
 			  }
 		  /* [RAMTEST] RAM-test real entry ($26F6, after the $26F0->$6F000 stub). Log tested
 		   * range (a0=start,a1=end) + call count: ONE giant slow pass or the dispatcher
