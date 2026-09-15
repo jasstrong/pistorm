@@ -3013,9 +3013,9 @@ static inline void m68ki_exception_1010(m68ki_cpu_core *state)
 	    static int _mv=0; uint32_t _a0=REG_DA[8]&0x1FFFFFF;
 	    if (_mv++ < 10) printf("[MOUNTVOL] _MountVol pb=$%06X ioDrive=%d callerPC=$%08X VCBQHead=$%06X\n",
 	                           _a0, (int16_t)m68ki_read_16(state,_a0+0x16), REG_PPC, m68ki_read_32(state,0x0358)&0x1FFFFFF);
-	    { extern int g_happymac_seen, trace_all_enabled; extern void trace_arm(void); static int _ma=0;
-	      if (g_happymac_seen && !_ma) { _ma=1; trace_all_enabled=1; trace_arm();
-	        printf("[MOUNTVOL] *** trace ARMED at _MountVol ***\n"); } } } }
+	    /* (No longer arms the 512MB RAM trace here: it recorded every instruction from the
+	     * first post-Happy-Mac _MountVol on every hugeSE boot, slowing it and dumping 512MB
+	     * at exit. Arm it with setvar trace_all when needed.) */ } }
 	/* [STRIPADDR] _StripAddress ($A055): the stock 24-bit Device Mgr IODone strips
 	 * the DCE ptr assuming lower-16MB. On born-32 flat, if it strips a ptr that HAS
 	 * bits 24-31 set (a $40xxxxxx iomap/ROM ptr, or an $80xxxxxx locked-handle DCE),
