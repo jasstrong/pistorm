@@ -152,6 +152,7 @@ typedef uint32 uint64;
 
 /* MMU constants */
 #define MMU_ATC_ENTRIES 22    // 68851 has 64, 030 has 22
+#define MMU_STLB_SIZE 256     // soft TLB in front of the ATC (see m68kmmu.h)
 
 /* instruction cache constants */
 #define M68K_IC_SIZE 128
@@ -1016,6 +1017,8 @@ typedef struct m68ki_cpu_core
 	uint mmu_atc_tag[MMU_ATC_ENTRIES], mmu_atc_data[MMU_ATC_ENTRIES];
 	uint mmu_atc_rr;
 	uint mmu_atc_mru;   /* most-recently-used entry: start ATC scan here (O(1) hot path) */
+	/* soft TLB: [0] = writes, [1] = reads; tag = logical page | fc<<1 | 1 (0 = empty) */
+	uint mmu_stlb_tag[2][MMU_STLB_SIZE], mmu_stlb_phys[2][MMU_STLB_SIZE];
 	uint mmu_tt0, mmu_tt1;
 	uint mmu_itt0, mmu_itt1, mmu_dtt0, mmu_dtt1;
 	uint mmu_acr0, mmu_acr1, mmu_acr2, mmu_acr3;

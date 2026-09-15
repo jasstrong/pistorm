@@ -132,6 +132,38 @@ void pmmu_set_buserror(m68ki_cpu_core *state, uint32 addr_in)
 }
 
 
+/* Soft TLB (fields in m68kcpu.h).  The real 68030 ATC compares all 22 entries in
+ * one cycle; emulating it costs two TT checks plus a scan on every access, which
+ * profiled at ~35% of hugeSE's CPU thread.  This direct-mapped cache sits in front
+ * of it (pmmu_translate_addr) and answers a repeat translation in a few
+ * instructions.  It only ever holds what the ATC would answer without a bus
+ * error (for writes, only once the page's M bit is set), and every ATC flush
+ * (PFLUSH, PMOVE to TC/SRP/CRP, reset) and every TT write empties it. */
+static inline unsigned int pmmu_stlb_index(uint32 addr_in, unsigned int fc, unsigned int ps)
+{
+	return ((addr_in >> ps) ^ (fc << 5)) & (MMU_STLB_SIZE - 1);
+}
+
+static inline void pmmu_stlb_flush(m68ki_cpu_core *state)
+{
+	for (int i = 0; i < MMU_STLB_SIZE; i++)
+	{
+		state->mmu_stlb_tag[0][i] = 0;
+		state->mmu_stlb_tag[1][i] = 0;
+	}
+}
+
+static inline void pmmu_stlb_fill(m68ki_cpu_core *state, uint32 addr_in, uint32 addr_out, int fc, uint16 rw)
+{
+	unsigned int ps = (state->mmu_tc >> 20) & 0xf;
+	uint32 page_mask = ~(uint32)0 << ps;
+	unsigned int i = pmmu_stlb_index(addr_in, fc & 7, ps);
+	int r = rw ? 1 : 0;
+
+	state->mmu_stlb_tag[r][i] = (addr_in & page_mask) | ((fc & 7) << 1) | 1;
+	state->mmu_stlb_phys[r][i] = addr_out & page_mask;
+}
+
 // pmmu_atc_add: adds this address to the ATC
 void pmmu_atc_add(m68ki_cpu_core *state, uint32 logical, uint32 physical, int fc, int rw)
 {
@@ -207,6 +239,7 @@ void pmmu_atc_flush(m68ki_cpu_core *state)
 	for(int i=0;i<MMU_ATC_ENTRIES;i++)
 		state->mmu_atc_tag[i]=0;
 	state->mmu_atc_rr = 0;
+	pmmu_stlb_flush(state);
 }
 
 int fc_from_modes(m68ki_cpu_core *state, uint16 modes);
@@ -218,6 +251,8 @@ void pmmu_atc_flush_fc_ea(m68ki_cpu_core *state, uint16 modes)
 	unsigned int ps = (state->mmu_tc >> 20) & 0xf;
 	unsigned int mode = (modes >> 10) & 7;
 	uint32 ea;
+
+	pmmu_stlb_flush(state);
 
 	switch (mode)
 	{
@@ -608,6 +643,10 @@ uint32 pmmu_translate_addr_with_fc(m68ki_cpu_core *state, uint32 addr_in, uint8 
 					addr_in, addr_out, state->mmu_tmp_rw, state->mmu_tmp_fc, state->mmu_tmp_sz));
 			pmmu_set_buserror(state, addr_in);
 		}
+		else if (!m_side_effects_disabled)
+		{
+			pmmu_stlb_fill(state, addr_in, addr_out, fc, rw);
+		}
 		return addr_out;
 	}
 
@@ -667,6 +706,12 @@ uint32 pmmu_translate_addr_with_fc(m68ki_cpu_core *state, uint32 addr_in, uint8 
 	if (!m_side_effects_disabled)
 	{
 		pmmu_atc_add(state, addr_in, addr_out, fc, rw && type != 1);
+		if (!pload &&
+			!(state->mmu_tmp_sr & (M68K_MMU_SR_BUS_ERROR|M68K_MMU_SR_INVALID|M68K_MMU_SR_SUPERVISOR_ONLY)) &&
+			!(!rw && (state->mmu_tmp_sr & M68K_MMU_SR_WRITE_PROTECT)))
+		{
+			pmmu_stlb_fill(state, addr_in, addr_out, fc, rw);
+		}
 	}
 	MMULOG(("PMMU: [%08x] => [%08x] (SR %04x)\n", addr_in, addr_out, state->mmu_tmp_sr));
 	return addr_out;
@@ -928,6 +973,18 @@ uint32 pmmu_translate_addr(m68ki_cpu_core *state, uint32 addr_in, uint16 rw)
 	}
 	else
 	{
+		/* soft TLB hit: a clean translation the ATC already made (see pmmu_stlb_fill) */
+		unsigned int fc = state->mmu_tmp_fc & 7;
+		unsigned int ps = (state->mmu_tc >> 20) & 0xf;
+		uint32 page_mask = ~(uint32)0 << ps;
+		unsigned int i = pmmu_stlb_index(addr_in, fc, ps);
+		int r = rw ? 1 : 0;
+
+		if (state->mmu_stlb_tag[r][i] == ((addr_in & page_mask) | (fc << 1) | 1))
+		{
+			return state->mmu_stlb_phys[r][i] | (addr_in & ~page_mask);
+		}
+
 		addr_out = pmmu_translate_addr_with_fc(state, addr_in, state->mmu_tmp_fc, rw, 7, 0, 0);
 		MMULOG(("ADDRIN %08X, ADDROUT %08X\n", addr_in, addr_out));
 	}
@@ -1096,6 +1153,7 @@ void m68851_pmove_put(m68ki_cpu_core *state, uint32 ea, uint16 modes)
 			MMULOG(("WRITE TT1 = 0x%08x\n", state->mmu_tt1));
 			state->mmu_tt1 = temp;
 		}
+		pmmu_stlb_flush(state);
 		break;
 
 		// FIXME: unreachable

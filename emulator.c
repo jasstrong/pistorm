@@ -2902,6 +2902,7 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 						for (int j = 0; j < MMU_ATC_ENTRIES; j++)
 							m68ki_cpu.mmu_atc_tag[j] = 0;
 						m68ki_cpu.mmu_atc_rr = 0;
+						memset(m68ki_cpu.mmu_stlb_tag, 0, sizeof(m68ki_cpu.mmu_stlb_tag));
 						m68ki_cpu.fc_read_translation_cache.lower = 0;
 						m68ki_cpu.fc_read_translation_cache.upper = 0;
 						m68ki_cpu.fc_write_translation_cache.lower = 0;
