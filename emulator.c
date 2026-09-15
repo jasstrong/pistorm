@@ -4288,6 +4288,21 @@ unsigned int m68k_read_memory_32(unsigned int address) {
   /* Settle delay before the custom I/O handler — see m68k_read_memory_8. */
   { int _sd = slowio_get_delay(bus_addr); if (_sd) slowio_delay(_sd); }
 
+  /* Once the reset overlay is off, serve RAM/ROM from the fast-path buffers BEFORE the
+   * platform check.  The PMMU table walk reads descriptors through this slow path, and on
+   * born-32 hugeSE the iomap window ($40000000-$41000000) also covers the ROM at
+   * $40800000: checked first, custom_read sent reads of the ROM-resident page tables
+   * ($40870080) to the SE bus at $870080, so the walk built translations from bus garbage.
+   * custom_read_mac68k assumes RAM and ROM never reach it; this makes that true here too. */
+  if (!ovl) {
+    for (int i = 0; i < m68ki_cpu.read_ranges; i++) {
+      if (address >= m68ki_cpu.read_addr[i] && address < m68ki_cpu.read_upper[i]) {
+        unsigned char *p = m68ki_cpu.read_data[i] + (address - m68ki_cpu.read_addr[i]);
+        return (p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
+      }
+    }
+  }
+
   if (platform_read_check(OP_TYPE_LONGWORD, address, &platform_res)) {
     return platform_res;
   }
