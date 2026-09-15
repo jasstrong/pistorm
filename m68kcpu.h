@@ -3281,60 +3281,14 @@ static inline void m68ki_exception_1010(m68ki_cpu_core *state)
 		}
 	}
 
-	/* SuperMario RM Toolbox trap fix: The SE ROM's A-line dispatcher discards
-	 * the return PC for non-auto-pop Toolbox traps (MOVE.L (SP)+,(SP) at $2D08).
-	 * SuperMario RM's StdEntry/StdExit expects the return PC on the stack.
-	 * Fix: intercept RM Toolbox traps here, push return PC, JMP to handler. */
-	{
-		extern int figment_enabled;
-		uint16_t trap = REG_IR;
-		if (figment_enabled && (trap & 0x0800)) {
-			/* Toolbox trap (bit 11 set). Check if it's an RM trap. */
-			uint16_t trap_idx = trap & 0x01FF;
-			uint32_t handler = m68ki_read_32(state, 0x0E00 + trap_idx * 4);
-			{ if (trap == 0xA9F0) {  /* _LoadSeg(segID:W @SP+0) — figment_enabled already true here */
-				uint32_t sp = REG_DA[15];
-				printf("[LOADSEG] seg=%d  handler=$%08X  retPC=$%08X  A5=$%08X\n",
-					(int16_t)m68ki_read_16(state, sp + 0), handler, REG_PC, REG_DA[13]);
-			  } }
-			extern int figment_verbose;
-			static int tb_log = 0;
-			if (figment_verbose && tb_log < 3) {
-				printf("[TB-TRAP] $%04X idx=$%03X handler=$%08X figment=%d\n",
-					trap, trap_idx, handler, figment_enabled);
-				tb_log++;
-			}
-			/* RM handlers are in the mirror half at $40848000+ */
-			if (handler >= 0x40848000 && handler < 0x40860000) {
-				static int rm_trap_log = 0;
-				if (figment_verbose && rm_trap_log++ < 50) {
-					printf("[RM-TRAP] $%04X → $%08X  retPC=$%08X",
-						trap, handler, REG_PC);
-					/* For GetResource ($A9A0), show type+ID from stack */
-					if (trap == 0xA9A0) {
-						uint32_t sp = REG_DA[15];
-						uint32_t type = m68ki_read_32(state, sp + 2);
-						uint16_t id = m68ki_read_16(state, sp + 0);
-						printf("  type='%c%c%c%c' id=%d",
-							(type>>24)&0xFF, (type>>16)&0xFF,
-							(type>>8)&0xFF, type&0xFF, (int16_t)id);
-					}
-					printf("\n");
-				}
-				/* Auto-pop bit ($0400): the caller JSR'd through glue (or dup'd its
-				 * return address, e.g. the 'ROvr' self-release tail) and the handler's
-				 * final RTS must return to the address ALREADY on top of the stack.
-				 * Only non-auto-pop traps get the post-trap PC pushed — matches the
-				 * ROM dispatcher's $2CFE cmpi #$AC00 / $2D08 move.l (sp)+,(sp) pair. */
-				if (!(trap & 0x0400)) {
-					uint32_t return_pc = REG_PC;
-					m68ki_push_32(state, return_pc);
-				}
-				m68ki_jump(state, handler);
-				return;
-			}
-		}
-	}
+	/* (Removed: the "SuperMario RM Toolbox trap fix" intercept. It indexed the $0E00 toolbox
+	 * table with trap & $1FF, so System 7.5's extended traps $AA00-$ABFF aliased onto
+	 * $A800-$A9FF: the Process Manager's idle-loop trap $ABF7 ran _SetResFileAttrs, which
+	 * popped 4 bytes the caller never pushed, until the stack walked into the vector table
+	 * (jump to $0, $A142 at $0A) -- the born-32 hugeSE crash tens of seconds after the
+	 * Finder went idle. It was also unneeded: the SE ROM dispatcher ($2CE0) keeps the return
+	 * PC for non-auto-pop traps, and so does System 7.5's; Snow boots the same ROM to the
+	 * Finder without it.) */
 
 	uint sr;
 
