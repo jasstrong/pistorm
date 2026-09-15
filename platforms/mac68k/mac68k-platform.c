@@ -158,6 +158,12 @@ void setvar_mac68k(struct emulator_config *cfg, char *var, char *val) {
         printf("[MAC68K] Runtime 'gusd' 32-bit-method patch enabled (hugeSE, in-RAM after load)\n");
     }
 
+    if (CHKVAR("probes")) {
+        extern int probes_enabled;
+        probes_enabled = 1;
+        printf("[MAC68K] Print-only boot probes enabled (per-instruction diagnostics; slow)\n");
+    }
+
     if (CHKVAR("figment")) {
         extern int figment_enabled;
         extern int figment_verbose;
