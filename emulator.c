@@ -2789,14 +2789,16 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			 * is at sysrom_pos+$48. A6 holds MemTop from sizing. */
 			{
 				extern uint32_t ovl_sysrom_pos;
-				static int memtop_done = 0;
+				static int memtop_boots = 0;
 				uint32_t memtop_pc = ovl_sysrom_pos + 0x48;
-				/* Huge SE: big-se ROM executes at virtual $800048 even
-				 * though sysrom_pos is $40800000.  Check both. */
-				uint32_t memtop_pc_virt = (ovl_sysrom_pos >= 0x40000000) ?
-				    (0x800000 + 0x48) : 0;
-				if (!memtop_done && ovl_sysrom_pos >= 0x800000 &&
-				    (REG_PC == memtop_pc || REG_PC == memtop_pc_virt)) {
+				/* Fires on EVERY boot, not once per emulator run: a restart goes back
+				 * through the ROM's memory sizing, and without the force it comes up
+				 * with the ROM's own 8MB MemTop, which puts ScrnBase outside the WTC
+				 * video mirror (a stale, corrupted screen) and halves the machine.
+				 * Only the ROM's own $48 matches: the old virtual-$800048 alias (from
+				 * the IS=8 days) is plain RAM on born-32 hugeSE, where the boot blocks
+				 * run, so a match there could now fire mid-boot. */
+				if (ovl_sysrom_pos >= 0x800000 && REG_PC == memtop_pc) {
 					uint32_t old = REG_DA[14];
 					int32_t ram_idx = get_named_mapped_item(cfg, "sysram");
 					uint32_t ram_size = (ram_idx >= 0) ? cfg->map_size[ram_idx] : 0x800000;
@@ -2821,8 +2823,8 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 						memtop = ram_size;
 					}
 					REG_DA[14] = memtop;
-					printf("[%s] MemTop forced: A6=$%08X → $%08X\n",
-					       is_huge_se ? "HUGE-SE" : "BIG-SE", old, memtop);
+					printf("[%s] MemTop forced (boot #%d): A6=$%08X → $%08X\n",
+					       is_huge_se ? "HUGE-SE" : "BIG-SE", ++memtop_boots, old, memtop);
 
 					/* Born-32 boot stack: move SP off the top of RAM (where the RAM
 					 * sizing routine left it) down to the top of plain RAM just below
@@ -2935,8 +2937,6 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 						       m68ki_cpu.mmu_tc, m68ki_cpu.mmu_crp_limit,
 						       m68ki_cpu.mmu_crp_aptr);
 					}
-
-					memtop_done = 1;
 				}
 			}
 
