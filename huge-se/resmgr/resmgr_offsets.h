@@ -9,38 +9,38 @@ static const struct { uint16_t trap_num; uint32_t offset; } resmgr_trap_table[] 
     { 0x081C, 0x4084900A }, /* Count1Types */
     { 0x081F, 0x408490D6 }, /* Get1Resource */
     { 0x0820, 0x408491AA }, /* Get1NamedResource */
-    { 0x0821, 0x4084A3B8 }, /* MaxSizeRsrc */
-    { 0x0992, 0x40849DE2 }, /* DetachResource */
-    { 0x0993, 0x40849ED8 }, /* SetResPurge */
-    { 0x0994, 0x40849F0E }, /* CurResFile */
+    { 0x0821, 0x4084A762 }, /* MaxSizeRsrc */
+    { 0x0992, 0x4084A18C }, /* DetachResource */
+    { 0x0993, 0x4084A282 }, /* SetResPurge */
+    { 0x0994, 0x4084A2B8 }, /* CurResFile */
     { 0x0995, 0x40848142 }, /* InitResources */
     { 0x0996, 0x40848730 }, /* RsrcZoneInit */
     { 0x0997, 0x4084891C }, /* OpenResFile */
     { 0x0998, 0x408489C6 }, /* UseResFile */
     { 0x0999, 0x40848AD0 }, /* UpdateResFile */
     { 0x099A, 0x40848E7C }, /* CloseResFile */
-    { 0x099B, 0x40849F02 }, /* SetResLoad */
+    { 0x099B, 0x4084A2AC }, /* SetResLoad */
     { 0x099C, 0x40848F4C }, /* CountResources */
     { 0x099D, 0x40848F7A }, /* GetIndResource */
     { 0x099E, 0x4084900E }, /* CountTypes */
     { 0x099F, 0x40849062 }, /* GetIndType */
     { 0x09A0, 0x408490DE }, /* GetResource */
     { 0x09A1, 0x408491AE }, /* GetNamedResource */
-    { 0x09A2, 0x40849D46 }, /* LoadResource */
-    { 0x09A3, 0x40849DAC }, /* ReleaseResource */
-    { 0x09A4, 0x40849E9E }, /* HomeResFile */
-    { 0x09A5, 0x4084A392 }, /* SizeResource */
-    { 0x09A6, 0x40849F40 }, /* GetResAttrs */
-    { 0x09A7, 0x40849F58 }, /* SetResAttrs */
-    { 0x09A8, 0x40849F96 }, /* GetResInfo */
-    { 0x09A9, 0x40849FEA }, /* SetResInfo */
-    { 0x09AA, 0x40849E0A }, /* ChangedResource */
-    { 0x09AB, 0x4084A044 }, /* AddResource */
-    { 0x09AC, 0x40849F22 }, /* AddReference */
-    { 0x09AD, 0x4084A15E }, /* RmveResource */
-    { 0x09AE, 0x40849F34 }, /* RmveReference */
-    { 0x09AF, 0x40849F18 }, /* ResError */
-    { 0x09B0, 0x40849E56 }, /* WriteResource */
+    { 0x09A2, 0x4084A0F0 }, /* LoadResource */
+    { 0x09A3, 0x4084A156 }, /* ReleaseResource */
+    { 0x09A4, 0x4084A248 }, /* HomeResFile */
+    { 0x09A5, 0x4084A73C }, /* SizeResource */
+    { 0x09A6, 0x4084A2EA }, /* GetResAttrs */
+    { 0x09A7, 0x4084A302 }, /* SetResAttrs */
+    { 0x09A8, 0x4084A340 }, /* GetResInfo */
+    { 0x09A9, 0x4084A394 }, /* SetResInfo */
+    { 0x09AA, 0x4084A1B4 }, /* ChangedResource */
+    { 0x09AB, 0x4084A3EE }, /* AddResource */
+    { 0x09AC, 0x4084A2CC }, /* AddReference */
+    { 0x09AD, 0x4084A508 }, /* RmveResource */
+    { 0x09AE, 0x4084A2DE }, /* RmveReference */
+    { 0x09AF, 0x4084A2C2 }, /* ResError */
+    { 0x09B0, 0x4084A200 }, /* WriteResource */
     { 0x09B1, 0x408488A0 }, /* CreateResFile */
     { 0x09C1, 0x4084908E }, /* UniqueID */
     { 0x09C4, 0x40848978 }, /* OpenRFPerm */

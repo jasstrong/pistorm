@@ -5474,6 +5474,12 @@ ExitCLPastHSetState:
     add.l (%a4),%a2 // pointer to map entry.
     add.l (%a4),%a3 // some callers have a block pointer here.
     move.l %a5,%a0 //return the handle.
+    move.l %a0,%d0 // born-32: relocate SE literals in patch code,
+    beq.s .L_ExitCL_noreloc // unless this is an error exit
+    tst.w ResErr
+    bne.s .L_ExitCL_noreloc
+    bsr b32_RelocSEPatch
+.L_ExitCL_noreloc:
 
 // MACHINE MC68040 // (should we cache flush on all cpus?)										<18>
 // (if we do then make sure to save D1 since trashed by '030 flush routine)	<18>
@@ -5594,7 +5600,10 @@ LoadRes:
     bsr RdRsrc // read the resource.
     bsr.w SetPL // set purgable, lock bits in MP
     move.w ResErr, %d0 // was there a read error? (D0 for errLoad)
-    beq.w EndLoad // If not, everything is ok.  A2 correct.
+    bne.s .L_LoadRes_err // if so, report it
+    bsr b32_RelocSEPatch // born-32: relocate SE literals in patch code
+    bra.w EndLoad // everything is ok.  A2 correct.
+.L_LoadRes_err:
     sub.l (%a4), %a2 // Make A2 an offset again for ErrLoad
 
 ErrLoad:
@@ -5655,6 +5664,479 @@ SetPL:
     or.b %d1,%d0 // Set up new LPR bits	<C169>
     _hsetstate // MemMgr bits <- D0		<C169>
     rts // finally return.
+
+//_______________________________________________________________________________
+//
+// Routine:     b32_RelocSEPatch (born-32)
+//
+// Arguments:   A0 (input.L)   handle of a resource just read from a file
+//              A2 (input.L)   pointer to its reference entry in the map
+//              A4 (input.L)   handle to that map
+//              All registers are preserved.  Does not move memory.
+//
+// Called By:   LoadRes, ExitCLPastHSetState (the decompressor)
+//
+// Function:    Apple's SE patches assume the SE memory map: ROM at $400000 and the chips
+//              at their 24-bit addresses.  born-32 runs the ROM at $40800000 and the chips
+//              at the SE address + $40000000.  Literal addresses that no loader relocates
+//              are rewritten here, as the resource is read: 7.5.3's SysBeep patch calls the
+//              ROM beep with MOVEA.L #$004029B4,A0, and PTCH 630 pushes ROM addresses and
+//              RTSes into them and checks its callers with CMPI.L #rom.  b32_Classify has
+//              the rules.
+//
+//              'PTCH'/'ptch' are plain code: every match is rewritten.
+//
+//              'lpch' is only half-linked.  LinkedPatchLoader finishes the link, and until
+//              then every ROM reference holds [link to next][ROM-table entry] and every
+//              reference between modules holds [F|link to next][opcode|jump-table entry];
+//              the loader rewrites those 4 bytes.  A link can look like a 24-bit address
+//              (link $0047 + entry $01D0 = $004701D0), so this walks both kinds of chain
+//              (b32_LpchWalk) and leaves alone every match that overlaps a site.  The
+//              header size depends on the resource (universal: 4 bytes, one ROM: 2, the
+//              rest: 0), so all three are tried and the one layout whose tables end inside
+//              the resource and whose chains stay inside the code is used.  If none or
+//              more than one fits, the resource is left untouched.
+//_______________________________________________________________________________
+
+b32_RelocSEPatch:
+    movem.l %d0-%d7/%a0-%a5,-(%sp)
+    move.l (%a0),%d0 // master pointer
+    beq.w .L_b32r_exit // nothing loaded
+    move.l %d0,%a1 // A1 = resource data
+    _GetHandleSize // D0 = size (A0 = handle)
+    tst.l %d0
+    ble.w .L_b32r_exit
+    move.l %d0,%d4 // D4 = size
+
+// Which type?  Find the type-list entry whose reference list holds A2.
+    move.l (%a4),%a3 // map
+    moveq #0,%d0
+    move.w mTypes(%a3),%d0 // offset to the type list
+    add.l %d0,%a3 // A3 = type list
+    move.w (%a3),%d1 // number of types - 1
+    lea 2(%a3),%a0 // A0 = first type entry: type, count-1, list offset
+.L_b32r_type:
+    moveq #0,%d2
+    move.w 6(%a0),%d2 // reference list offset, from the type list
+    add.l %a3,%d2 // D2 = first reference entry
+    moveq #0,%d3
+    move.w 4(%a0),%d3 // number of resources - 1
+    addq.l #1,%d3
+    move.l %d3,%d0
+    add.l %d3,%d3
+    add.l %d0,%d3 // x3
+    lsl.l #2,%d3 // x12 (12-byte reference entries)
+    add.l %d2,%d3 // D3 = end of the list
+    cmpa.l %d2,%a2
+    blo.s .L_b32r_nexttype
+    cmpa.l %d3,%a2
+    blo.s .L_b32r_gottype
+.L_b32r_nexttype:
+    addq.l #8,%a0
+    dbra %d1,.L_b32r_type
+    bra.w .L_b32r_exit // not in this map (shouldn't happen)
+.L_b32r_gottype:
+    move.l (%a0),%d0
+    cmp.l #0x50544348,%d0 // 'PTCH'
+    beq.s .L_b32r_plain
+    cmp.l #0x70746368,%d0 // 'ptch'
+    beq.s .L_b32r_plain
+    cmp.l #0x6C706368,%d0 // 'lpch'
+    beq.w .L_b32r_lpch
+    bra.w .L_b32r_exit
+
+// 'PTCH'/'ptch': rewrite every match.
+.L_b32r_plain:
+    lea -4(%a1,%d4.l),%a3 // A3 = last long that fits
+    lea 2(%a1),%a0 // A0 = candidate operand; its opword is at -2(A0)
+.L_b32r_ploop:
+    cmpa.l %a3,%a0
+    bhi.w .L_b32r_exit
+    bsr.w b32_Classify
+    tst.l %d0
+    beq.s .L_b32r_pnext
+    move.l %d0,(%a0) // rewrite the operand
+    addq.l #4,%a0 // and resume after it
+    bra.s .L_b32r_ploop
+.L_b32r_pnext:
+    addq.l #2,%a0
+    bra.s .L_b32r_ploop
+
+.L_b32r_exit:
+    movem.l (%sp)+,%d0-%d7/%a0-%a5
+    rts
+
+// 'lpch': find the layout, collect the matches in the code, drop the ones the loader owns.
+    .equ b32l_C, -4 // code
+    .equ b32l_S, -8 // code size
+    .equ b32l_E, -12 // ROM-reference exception table
+    .equ b32l_J, -16 // packed jump table
+    .equ b32l_valid, -20 // how many header sizes fit
+    .equ b32l_max, 64 // candidate slots
+    .equ b32l_cands, -20-4*b32l_max
+.L_b32r_lpch:
+    link %a6,#b32l_cands
+    move.w (%a2),%d0 // resource ID = its ROM set
+    moveq #0,%d7 // D7 = 3 x ROMs in the set = packed ROM-table entry size
+.L_b32l_pop:
+    lsr.w #1,%d0
+    bcc.s .L_b32l_pop1
+    addq.l #3,%d7
+.L_b32l_pop1:
+    tst.w %d0
+    bne.s .L_b32l_pop
+    clr.l b32l_valid(%a6)
+    moveq #0,%d6 // no candidates yet: the walk only validates
+    moveq #4,%d3 // header sizes 4, 2, 0
+.L_b32l_try:
+    bsr.w b32_LpchCheck // A3 = code, D5 = size, A4/A5 = tables; Z = tables end in time
+    bne.s .L_b32l_nexth
+    bsr.w b32_LpchWalk // Z = every chain stays inside the code
+    bne.s .L_b32l_nexth
+    addq.l #1,b32l_valid(%a6)
+    move.l %a3,b32l_C(%a6)
+    move.l %d5,b32l_S(%a6)
+    move.l %a4,b32l_E(%a6)
+    move.l %a5,b32l_J(%a6)
+.L_b32l_nexth:
+    subq.l #2,%d3
+    bge.s .L_b32l_try
+    cmp.l #1,b32l_valid(%a6)
+    bne.w .L_b32l_done // no layout fits, or more than one does
+    move.l b32l_C(%a6),%a3
+    move.l b32l_S(%a6),%d5
+    beq.w .L_b32l_done // no code
+    lea b32l_cands(%a6),%a2 // A2 = candidate slots
+    lea 2(%a3),%a0 // A0 = candidate operand
+    lea -4(%a3,%d5.l),%a1 // A1 = last long in the code
+.L_b32l_scan:
+    cmpa.l %a1,%a0
+    bhi.s .L_b32l_scanned
+    bsr.w b32_Classify
+    tst.l %d0
+    beq.s .L_b32l_snext
+    cmp.w #b32l_max,%d6
+    bhs.w .L_b32l_done // too many matches: leave the resource alone
+    move.l %a0,(%a2,%d6.w*4)
+    addq.w #1,%d6
+    addq.l #4,%a0
+    bra.s .L_b32l_scan
+.L_b32l_snext:
+    addq.l #2,%a0
+    bra.s .L_b32l_scan
+.L_b32l_scanned:
+    tst.w %d6
+    beq.w .L_b32l_done
+    move.l b32l_E(%a6),%a4
+    move.l b32l_J(%a6),%a5
+    bsr.w b32_LpchWalk // clears the candidates that overlap a loader-owned site
+    bne.w .L_b32l_done
+    subq.w #1,%d6
+.L_b32l_rel:
+    move.l (%a2,%d6.w*4),%d0
+    beq.s .L_b32l_rnext // the loader's
+    move.l %d0,%a0
+    bsr.w b32_Classify
+    move.l %d0,(%a0)
+.L_b32l_rnext:
+    dbra %d6,.L_b32l_rel
+.L_b32l_done:
+    unlk %a6
+    bra.w .L_b32r_exit
+
+//_______________________________________________________________________________
+// b32_Classify (born-32): A0 -> a candidate operand long, its opword at -2(A0).
+// Returns in D0 the value to store if the pair is a 24-bit SE ROM or I/O reference,
+// else 0.  Preserves everything else.
+//   ROM $400000-$43FFFF (+$40400000): abs.L operands (EA mode $39), CMPI.L #, and
+//     MOVE.L/MOVEA.L # to anything but a data register ($400000 is also a 4MB size)
+//   SE I/O (+$40000000): SCSI $580000-$5FFFFF, SCC $9FFFF0-$9FFFFF and $BFFFF0-$BFFFFF,
+//     IWM $DFE000-$DFFFFF, VIA $EFE000-$EFFFFF: abs.L operands and MOVEA.L #
+// The ROM range stops at 256KB: the SE ROM's mirrors are never code targets, and
+// $440000-$47FFFF lets constants through (CMPI.L #$00474D52 in 'lpch' 30/31).
+// Relocated values are outside both ranges, so a second pass changes nothing.
+//_______________________________________________________________________________
+b32_Classify:
+    movem.l %d1-%d2,-(%sp)
+    move.l (%a0),%d0 // candidate operand
+    move.w -2(%a0),%d1 // candidate opword
+    move.l %d0,%d2
+    sub.l #0x400000,%d2
+    cmp.l #0x40000,%d2
+    bhs.s .L_b32k_io // not in the 256KB SE ROM
+    moveq #0x3F,%d2 // ROM: abs.L operand?
+    and.w %d1,%d2
+    cmp.w #0x39,%d2
+    beq.s .L_b32k_rom
+    move.w %d1,%d2 // CMPI.L #,<ea>?
+    and.w #0xFFC0,%d2
+    cmp.w #0x0C80,%d2
+    beq.s .L_b32k_rom
+    move.w %d1,%d2 // MOVE.L/MOVEA.L #,<ea>...
+    and.w #0xF03F,%d2
+    cmp.w #0x203C,%d2
+    bne.s .L_b32k_no
+    move.w %d1,%d2 // ...but not to a data register
+    and.w #0x01C0,%d2
+    beq.s .L_b32k_no
+.L_b32k_rom:
+    add.l #0x40400000,%d0
+    bra.s .L_b32k_out
+.L_b32k_io:
+    move.l %d0,%d2 // SCSI $580000-$5FFFFF
+    sub.l #0x580000,%d2
+    cmp.l #0x80000,%d2
+    blo.s .L_b32k_ioform
+    move.l %d0,%d2 // SCC read $9FFFF0-$9FFFFF
+    sub.l #0x9FFFF0,%d2
+    cmp.l #0x10,%d2
+    blo.s .L_b32k_ioform
+    move.l %d0,%d2 // SCC write $BFFFF0-$BFFFFF
+    sub.l #0xBFFFF0,%d2
+    cmp.l #0x10,%d2
+    blo.s .L_b32k_ioform
+    move.l %d0,%d2 // IWM $DFE000-$DFFFFF
+    sub.l #0xDFE000,%d2
+    cmp.l #0x2000,%d2
+    blo.s .L_b32k_ioform
+    move.l %d0,%d2 // VIA $EFE000-$EFFFFF
+    sub.l #0xEFE000,%d2
+    cmp.l #0x2000,%d2
+    bhs.s .L_b32k_no
+.L_b32k_ioform:
+    moveq #0x3F,%d2 // I/O: abs.L operand?
+    and.w %d1,%d2
+    cmp.w #0x39,%d2
+    beq.s .L_b32k_iorel
+    move.w %d1,%d2 // MOVEA.L #,An?
+    and.w #0xF1FF,%d2
+    cmp.w #0x207C,%d2
+    bne.s .L_b32k_no
+.L_b32k_iorel:
+    add.l #0x40000000,%d0
+    bra.s .L_b32k_out
+.L_b32k_no:
+    moveq #0,%d0
+.L_b32k_out:
+    movem.l (%sp)+,%d1-%d2
+    rts
+
+//_______________________________________________________________________________
+// b32_LpchCheck (born-32): do this 'lpch''s tables end inside it, given a D3-byte header?
+//   In:  A1 = resource data, D4 = its size, D3 = header size,
+//        D7 = packed ROM-table entry size (3 x ROMs in the set)
+//   Out: A3 = code, D5 = code size, A4 = ROM-reference exception table,
+//        A5 = packed jump table; Z set if they all end inside the resource.
+//   Trashes D0-D2/A0.  Layout (LinkedPatchLoader.a): header, code size.L, code,
+//   first ROM-table entry.W (-1: none), packed ROM table (bit 7 of the last 3-byte
+//   offset of an entry ends it), exception table (3-byte offsets, 0 ends it),
+//   packed jump table (252,0 ends it).
+//_______________________________________________________________________________
+b32_LpchCheck:
+    move.l %a1,%d2
+    add.l %d4,%d2 // D2 = end of the resource
+    lea 4(%a1,%d3.l),%a3 // A3 = code
+    cmpa.l %d2,%a3
+    bhi.s .L_b32c_bad
+    move.l -4(%a3),%d5 // D5 = code size
+    btst #0,%d5
+    bne.s .L_b32c_bad
+    cmp.l %d4,%d5
+    bhi.s .L_b32c_bad
+    lea 2(%a3,%d5.l),%a0 // past the code and the first ROM-table entry number
+    cmpa.l %d2,%a0
+    bhi.s .L_b32c_bad
+    tst.w -2(%a0)
+    bmi.s .L_b32c_rtdone // -1: no packed ROM table
+    tst.l %d7
+    beq.s .L_b32c_bad
+.L_b32c_rt:
+    adda.l %d7,%a0 // one entry: a 3-byte offset per ROM in the set
+    cmpa.l %d2,%a0
+    bhi.s .L_b32c_bad
+    btst #7,-3(%a0) // bit 7 of the entry's last offset ends the table
+    beq.s .L_b32c_rt
+.L_b32c_rtdone:
+    move.l %a0,%a4 // A4 = exception table
+.L_b32c_ex:
+    addq.l #3,%a0
+    cmpa.l %d2,%a0
+    bhi.s .L_b32c_bad
+    move.b -3(%a0),%d0
+    or.b -2(%a0),%d0
+    or.b -1(%a0),%d0
+    bne.s .L_b32c_ex // 0 ends the table
+    move.l %a0,%a5 // A5 = packed jump table
+.L_b32c_jt:
+    cmpa.l %d2,%a0
+    bhs.s .L_b32c_bad
+    move.b (%a0)+,%d0
+    cmp.b #0xFF,%d0 // 255: a word size follows
+    bne.s .L_b32c_jt1
+    addq.l #2,%a0
+    bra.s .L_b32c_jt
+.L_b32c_jt1:
+    cmp.b #0xFC,%d0 // 252: skip jump-table entries; 252,0 ends the table
+    bne.s .L_b32c_jt
+    cmpa.l %d2,%a0
+    bhs.s .L_b32c_bad
+    move.b (%a0)+,%d0
+    beq.s .L_b32c_ok
+    cmp.b #0xFF,%d0 // 252,255: a word count follows
+    bne.s .L_b32c_jt
+    addq.l #2,%a0
+    bra.s .L_b32c_jt
+.L_b32c_ok:
+    moveq #0,%d0
+    rts
+.L_b32c_bad:
+    moveq #1,%d0
+    rts
+
+//_______________________________________________________________________________
+// b32_LpchWalk (born-32): walk the reference chains of a half-linked 'lpch'.
+//   In:  A3 = code, D5 = code size, A4 = exception table, A5 = packed jump table,
+//        A2 = candidate operand addresses, D6.W = how many (0: only validate)
+//   Out: Z set if every reference site lies inside the code.  Clears each candidate
+//        whose opword or operand overlaps a site.  Preserves everything but D0.
+//   ROM references: 3-byte offsets from the table chain through the code; each site is
+//   [link.W][ROM-table entry.W], the next is site+4+2*link (0: the next table offset,
+//   from site+4).  Module references: 253 in the packed jump table puts the current
+//   module's list head at the current position; each site is [F|link.W][opcode|entry.W]
+//   and the next is site+2*link (0 ends the list).
+//_______________________________________________________________________________
+b32_LpchWalk:
+    movem.l %d1-%d4/%a0-%a1,-(%sp)
+    move.l %a3,%d4
+    add.l %d5,%d4
+    subq.l #4,%d4 // D4 = last address a 4-byte site can start at
+    move.l %a4,%a0 // the ROM-reference chains
+    move.l %a3,%d3 // D3 = position in the code
+.L_b32w_rtab:
+    moveq #0,%d0
+    move.b (%a0)+,%d0
+    swap %d0
+    move.b (%a0)+,%d0
+    lsl.w #8,%d0
+    move.b (%a0)+,%d0
+    tst.l %d0
+    beq.s .L_b32w_mods // 0 ends the table
+    add.l %d0,%d3
+.L_b32w_rsite:
+    cmp.l %a3,%d3
+    blo.w .L_b32w_bad
+    cmp.l %d4,%d3
+    bhi.w .L_b32w_bad
+    bsr.w .L_b32w_mark
+    move.l %d3,%a1
+    moveq #0,%d0
+    move.w (%a1),%d0 // link to the next ROM reference, in words
+    addq.l #4,%d3
+    tst.w %d0
+    beq.s .L_b32w_rtab // 0: the next offset comes from the table
+    add.l %d0,%d3
+    add.l %d0,%d3
+    bra.s .L_b32w_rsite
+.L_b32w_mods:
+    move.l %a5,%a0 // the packed jump table
+    move.l %a3,%d3 // D3 = position in the code
+    moveq #-1,%d2 // D2 = start of the current module (none yet)
+    moveq #1,%d1 // D1 = a new module is pending
+.L_b32w_jt:
+    moveq #0,%d0
+    move.b (%a0)+,%d0
+    cmp.b #0xFF,%d0
+    bne.s .L_b32w_jt1
+    move.b (%a0)+,%d0 // 255: a word size follows
+    lsl.w #8,%d0
+    move.b (%a0)+,%d0
+    bra.s .L_b32w_size
+.L_b32w_jt1:
+    cmp.b #0xFE,%d0
+    beq.s .L_b32w_entry // 254: an entry point, not a new module
+    cmp.b #0xFD,%d0
+    beq.s .L_b32w_head // 253: the current module's reference list starts here
+    cmp.b #0xFC,%d0
+    beq.s .L_b32w_skip // 252: skip jump-table entries
+    add.w %d0,%d0 // 0-251: size in words
+.L_b32w_size:
+    tst.b %d1
+    beq.s .L_b32w_size1
+    move.l %d3,%d2 // the pending module starts here
+.L_b32w_size1:
+    add.l %d0,%d3
+    moveq #1,%d1
+    move.l %d4,%d0
+    addq.l #4,%d0 // end of the code
+    cmp.l %d0,%d3
+    bhi.w .L_b32w_bad
+    bra.s .L_b32w_jt
+.L_b32w_entry:
+    moveq #0,%d1
+    bra.s .L_b32w_jt
+.L_b32w_skip:
+    move.b (%a0)+,%d0
+    beq.w .L_b32w_ok // 252,0: end of the table
+    cmp.b #0xFF,%d0
+    bne.s .L_b32w_jt
+    addq.l #2,%a0 // 252,255: a word count follows
+    bra.s .L_b32w_jt
+.L_b32w_head:
+    moveq #0,%d1 // (no pending module after a 253)
+    tst.l %d2
+    bmi.w .L_b32w_bad // no module yet
+    move.l %d3,%d0
+    sub.l %d2,%d0 // head = position - module start
+    btst #0,%d0
+    bne.s .L_b32w_jt // odd: the module has no references
+    move.l %d3,-(%sp) // keep the jump-table position
+.L_b32w_msite:
+    cmp.l %a3,%d3
+    blo.s .L_b32w_badpop
+    cmp.l %d4,%d3
+    bhi.s .L_b32w_badpop
+    bsr.s .L_b32w_mark
+    move.l %d3,%a1
+    moveq #0,%d0
+    move.w (%a1),%d0
+    and.w #0x7FFF,%d0 // link to the next reference, in words (bit 15: force-resident)
+    beq.s .L_b32w_mdone
+    add.l %d0,%d3
+    add.l %d0,%d3
+    bra.s .L_b32w_msite
+.L_b32w_mdone:
+    move.l (%sp)+,%d3
+    bra.w .L_b32w_jt
+.L_b32w_badpop:
+    addq.l #4,%sp
+.L_b32w_bad:
+    movem.l (%sp)+,%d1-%d4/%a0-%a1
+    moveq #1,%d0 // NZ: a site is outside the code
+    rts
+.L_b32w_ok:
+    movem.l (%sp)+,%d1-%d4/%a0-%a1
+    moveq #0,%d0 // Z
+    rts
+// clear every candidate whose opword or operand overlaps the site [D3, D3+4)
+.L_b32w_mark:
+    move.w %d6,%d0
+    beq.s .L_b32w_mark9
+    move.l %d1,-(%sp)
+    move.l %a2,%a1
+    subq.w #1,%d0
+.L_b32w_mark1:
+    move.l %d3,%d1
+    sub.l (%a1),%d1 // site - candidate
+    addq.l #5,%d1
+    cmp.l #9,%d1 // -5 <= site - candidate <= 3: they overlap
+    bhs.s .L_b32w_mark2
+    clr.l (%a1)
+.L_b32w_mark2:
+    addq.l #4,%a1
+    dbra %d0,.L_b32w_mark1
+    move.l (%sp)+,%d1
+.L_b32w_mark9:
+    rts
 
 //_______________________________________________________________________________
 //
