@@ -1621,7 +1621,7 @@ static inline void m68ki_write_16_fc(m68ki_cpu_core *state, uint address, uint f
 	{
 		extern uint32_t ovl_sysrom_pos;
 		uint32_t a = ADDRESS_68K(address);
-		if (ovl_sysrom_pos >= 0x800000 && a >= 4 && a < 0x400000) {
+		if (ovl_sysrom_pos == 0x800000 && a >= 4 && a < 0x400000) { /* bigSE only: on born-32 hugeSE (ROM at $40800000) $400000-$7FFFFF is RAM */
 			/* Check: is there a known opcode at a-4 with $0040-$0043 at a-2? */
 			uint16_t hi_word = m68ki_read_16(state, a - 2);
 			if (hi_word >= 0x0040 && hi_word <= 0x0043) {
@@ -3246,7 +3246,7 @@ static inline void m68ki_exception_1010(m68ki_cpu_core *state)
 	 * The snth $1005 resource may be (re)loaded with $4xxxxx ROM refs. */
 	if (REG_IR >= 0xA800 && REG_IR <= 0xA807) {
 		extern uint32_t ovl_sysrom_pos;
-		if (ovl_sysrom_pos >= 0x800000) {
+		if (ovl_sysrom_pos == 0x800000) { /* bigSE only: on born-32 hugeSE (ROM at $40800000) $400000-$7FFFFF is RAM */
 			uint32_t caller = ADDRESS_68K(REG_PPC);
 			if (caller >= 0x010000 && caller < ovl_sysrom_pos) {
 				uint32_t scan_lo = caller & 0xFFFF0000;
@@ -3498,7 +3498,8 @@ static inline void m68ki_exception_illegal(m68ki_cpu_core *state)
 
 		/* Big SE: auto-fixup poison hits — patch $4xxxxx → $8xxxxx and continue */
 		printf("  [POISON-CHECK] fpc=$%06X IR=$%04X\n", fpc, REG_IR);
-		if (fpc >= 0x400000 && fpc < 0x800000 && REG_IR == 0x4AFC) {
+		extern uint32_t ovl_sysrom_pos;
+		if (ovl_sysrom_pos == 0x800000 && fpc >= 0x400000 && fpc < 0x800000 && REG_IR == 0x4AFC) { /* bigSE only: on born-32 hugeSE (ROM at $40800000) $400000-$7FFFFF is RAM */
 			uint32_t new_pc = fpc + 0x400000;
 			/* Find the caller that JSR/JMP'd here */
 			uint32_t caller_pc = 0;

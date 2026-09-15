@@ -2883,7 +2883,7 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			 * the region-entry hook catches Sound Manager etc. */
 			{
 				extern uint32_t ovl_sysrom_pos;
-				if (ovl_sysrom_pos >= 0x800000) {
+				if (ovl_sysrom_pos == 0x800000) { /* bigSE only: on born-32 hugeSE (ROM at $40800000) $400000-$7FFFFF is RAM */
 					uint32_t pc24 = ADDRESS_68K(REG_PC);
 					int do_scan = 0;
 					uint32_t scan_lo = 0, scan_hi = 0;
