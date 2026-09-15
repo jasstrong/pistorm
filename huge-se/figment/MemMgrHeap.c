@@ -324,14 +324,20 @@ stdHeap* CreateNewHeap(GrowZoneProcPtr pgrowZone, long numMasters, Ptr limit, Pt
 	heapPtr->lastFree = firstRealBlock;
 	heapPtr->favoredFree = firstRealBlock;
 	heapPtr->lowestRemovableBlock = firstRealBlock;
-	heapPtr->validationFlags = checkHeap | checkHeapIn;  /* run _CheckHeap on MM entry+exit.
-	                                  [hugeSE 2026-06-27] RE-CONFIRMED load-bearing: setting =0
-	                                  AGAIN broke the boot (display corruption, jas saw it) — same
-	                                  regression as 06-19, NOT the gpclk thing. _CheckHeap's walk
-	                                  is doing something the boot depends on (or it halts on a real
-	                                  corruption that otherwise scribbles the heap). DO NOT disable.
-	                                  Its O(n^2) ramp (36%+ late boot) must be fixed by making it
-	                                  CHEAPER / less frequent, not by turning it off. */
+#ifdef FIGMENT_HEAPCHECK
+	heapPtr->validationFlags = checkHeap | checkHeapIn;  /* run _CheckHeap on MM entry+exit */
+#else
+	heapPtr->validationFlags = 0;
+#endif
+	/* Heap validation is opt-in (make HEAPCHECK=1). _CheckHeap walks the whole heap on every
+	   Memory Manager entry and exit; with a 16MB born-32 heap that made hugeSE several times
+	   slower (Snow: Finder at ~340s with it, ~160s without; the real SE: ~3-4 min vs 87s).
+	   History: turning it off broke the boot on 2026-06-19 and 06-27 (display corruption), so it
+	   was left on. That predated the ExpandMem=$2200 collision fix (8018b25, 06-29), which also
+	   found _CheckHeap has no side effects; figment's heap bugs have been fixed since, and the
+	   PiStorm RM trap intercept behind the Finder-idle crash was removed (43afb9b). Re-tested
+	   off on the real SE 2026-09-14: boots to a stable Finder and mounts an AppleShare volume
+	   over EtherTalk. */
 	heapPtr->gzProc = pgrowZone;
 	heapPtr->heapType = heapDouJour;
 	

@@ -11,6 +11,12 @@ CFLAGS = -m68030 -O2 -fno-builtin -DpatchedIn \
          -include figment_shim.h \
          -I. -I"$(R68INC)" -I"$(SMINT)"
 
+# Heap validation (_CheckHeap on every Memory Manager entry/exit) is off by default.
+# make HEAPCHECK=1 turns it back on.
+ifdef HEAPCHECK
+CFLAGS += -DFIGMENT_HEAPCHECK
+endif
+
 OBJS = MemMgr.o MemMgrInternal.o MemMgrHeap.o MemMgrUtils.o MemMgrDebug.o figment_stubs.o figment_glue.o
 
 all: figment.bin figext.bin
