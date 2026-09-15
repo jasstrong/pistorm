@@ -1,4 +1,5 @@
 /* figext_glue.S -- born-32 figment extension: _HeapDispatch / _FigmentDispatch ($A0A4).
+/* (OSErr-returning a_* glue sign-extends D0 -- see figment_glue.S.) */
  *
  * born-32's system heap is a figment heap (zone heapType = 2), so the System 7.5 Process
  * Manager takes its figment path and calls _HeapDispatch selectors $10-$1F
@@ -197,6 +198,7 @@ a_NewHandleHi:					/* A0 = size, D1 = trap word -> A0 = handle */
 	move.l	%d1,-(%sp)
 	pea	8(%sp)
 	jsr	c_NewHandleHi
+    ext.l   %d0                     /* OSErr is 16 bits in GCC's ABI; callers need a 32-bit D0 */
 	lea	12(%sp),%sp
 	move.l	(%sp)+,%a0
 	rts
@@ -210,17 +212,20 @@ a_RegisterDisposeProc:				/* A0 = proc, A1 = zone */
 	move.l	%a1,-(%sp)
 	move.l	%a0,-(%sp)
 	jsr	c_RegisterDisposeProc
+    ext.l   %d0                     /* OSErr is 16 bits in GCC's ABI; callers need a 32-bit D0 */
 	addq.l	#8,%sp
 	rts
 a_DisposeZone:					/* A0 = zone */
 	move.l	%a0,-(%sp)
 	jsr	c_DisposeZone
+    ext.l   %d0                     /* OSErr is 16 bits in GCC's ABI; callers need a 32-bit D0 */
 	addq.l	#4,%sp
 	rts
 a_SetZoneCompatibilityFlags:			/* A0 = zone, A1 = flags */
 	move.l	%a1,-(%sp)
 	move.l	%a0,-(%sp)
 	jsr	c_SetZoneCompatibilityFlags
+    ext.l   %d0                     /* OSErr is 16 bits in GCC's ABI; callers need a 32-bit D0 */
 	addq.l	#8,%sp
 	rts
 a_GetZoneCompatibilityFlags:			/* A0 = zone */

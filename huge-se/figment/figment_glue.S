@@ -1,4 +1,10 @@
 /* figment_glue.S — converted from MPW MemMgrGlue.a */
+/* D0 result codes: GCC returns a 16-bit OSErr in D0.W only and leaves the high word
+ * undefined, but Mac code relies on the Memory Manager returning a full 32-bit D0 (the
+ * classic MM ends with MOVEQ).  System 7.5 does `move.w rowBytes,d0; _NewHandle` right
+ * after an MM call, so a stale high word ($00F4...) turned a 10-byte request into ~16MB
+ * and memFullErr (After Dark toasters and Speedometer's gauge drew nothing).  Every glue
+ * whose C routine returns OSErr therefore sign-extends D0 before returning. */
     .text
     .even
 
@@ -34,6 +40,7 @@ fig_InitZone:
 fig_SetApplLimit:
     move.l  %a0,-(%sp)              /* put parameter on stack */
     jsr     c_SetApplLimit
+    ext.l   %d0                     /* OSErr is 16 bits in GCC's ABI; callers need a 32-bit D0 */
     addq.l  #4,%sp
     rts
 
@@ -46,6 +53,7 @@ fig_SetApplLimit:
     .globl fig_MaxApplZone
 fig_MaxApplZone:
     jsr     c_MaxApplZone
+    ext.l   %d0                     /* OSErr is 16 bits in GCC's ABI; callers need a 32-bit D0 */
     rts
 
 /* -----------------------------------------------------------------------
@@ -57,6 +65,7 @@ fig_MaxApplZone:
     .globl fig_MoreMasters
 fig_MoreMasters:
     jsr     c_MoreMasters
+    ext.l   %d0                     /* OSErr is 16 bits in GCC's ABI; callers need a 32-bit D0 */
     rts
 
 /* -----------------------------------------------------------------------
@@ -82,6 +91,7 @@ fig_GetZone:
 fig_SetZone:
     move.l  %a0,-(%sp)              /* put new zone ptr on the stack */
     jsr     c_SetZone
+    ext.l   %d0                     /* OSErr is 16 bits in GCC's ABI; callers need a 32-bit D0 */
     addq.l  #4,%sp
     rts
 
@@ -98,6 +108,7 @@ fig_NewHandle:
     move.l  %d1,-(%sp)              /* put trap word on the stack */
     pea     8(%sp)                  /* push pointer to handle on stack */
     jsr     c_NewHandle
+    ext.l   %d0                     /* OSErr is 16 bits in GCC's ABI; callers need a 32-bit D0 */
     lea     12(%sp),%sp             /* cleanup 12 bytes from the stack */
     move.l  (%sp)+,%a0              /* put handle in A0 */
     rts
@@ -114,6 +125,7 @@ fig_NewEmptyHandle:
     move.l  %d1,-(%sp)              /* put trap word on the stack */
     pea     4(%sp)                  /* push pointer to handle on stack */
     jsr     c_NewEmptyHandle
+    ext.l   %d0                     /* OSErr is 16 bits in GCC's ABI; callers need a 32-bit D0 */
     addq.l  #8,%sp                  /* cleanup 8 bytes from the stack */
     move.l  (%sp)+,%a0              /* put handle in A0 */
     rts
@@ -128,6 +140,7 @@ fig_NewEmptyHandle:
 fig_DisposeHandle:
     move.l  %a0,-(%sp)              /* put handle on stack */
     jsr     c_DisposeHandle
+    ext.l   %d0                     /* OSErr is 16 bits in GCC's ABI; callers need a 32-bit D0 */
     addq.l  #4,%sp
     rts
 
@@ -155,6 +168,7 @@ fig_SetHandleSize:
     move.l  %d0,-(%sp)              /* put size on stack */
     move.l  %a0,-(%sp)              /* put handle on stack */
     jsr     c_SetHandleSize
+    ext.l   %d0                     /* OSErr is 16 bits in GCC's ABI; callers need a 32-bit D0 */
     addq.l  #8,%sp
     rts
 
@@ -170,6 +184,7 @@ fig_HandleZone:
     move.l  %a0,-(%sp)              /* put handle on the stack */
     pea     4(%sp)                  /* push pointer to the zone on stack */
     jsr     c_HandleZone
+    ext.l   %d0                     /* OSErr is 16 bits in GCC's ABI; callers need a 32-bit D0 */
     addq.l  #8,%sp                  /* cleanup 8 bytes from the stack */
     move.l  (%sp)+,%a0              /* put zone in A0 */
     rts
@@ -202,6 +217,7 @@ fig_ReallocHandle:
     move.l  %d0,-(%sp)              /* put size on stack */
     move.l  %a0,-(%sp)              /* put handle on stack */
     jsr     c_ReallocHandle
+    ext.l   %d0                     /* OSErr is 16 bits in GCC's ABI; callers need a 32-bit D0 */
     addq.l  #8,%sp
     rts
 
@@ -218,6 +234,7 @@ fig_NewPtr:
     move.l  %d1,-(%sp)              /* put trap word on the stack */
     pea     8(%sp)                  /* push pointer to thePtr on stack */
     jsr     c_NewPtr
+    ext.l   %d0                     /* OSErr is 16 bits in GCC's ABI; callers need a 32-bit D0 */
     lea     12(%sp),%sp             /* cleanup 12 bytes from the stack */
     move.l  (%sp)+,%a0              /* put thePtr in A0 */
     rts
@@ -232,6 +249,7 @@ fig_NewPtr:
 fig_DisposePtr:
     move.l  %a0,-(%sp)              /* put ptr on stack */
     jsr     c_DisposePtr
+    ext.l   %d0                     /* OSErr is 16 bits in GCC's ABI; callers need a 32-bit D0 */
     addq.l  #4,%sp
     rts
 
@@ -259,6 +277,7 @@ fig_SetPtrSize:
     move.l  %d0,-(%sp)              /* put size on stack */
     move.l  %a0,-(%sp)              /* put pointer on stack */
     jsr     c_SetPtrSize
+    ext.l   %d0                     /* OSErr is 16 bits in GCC's ABI; callers need a 32-bit D0 */
     addq.l  #8,%sp
     rts
 
@@ -274,6 +293,7 @@ fig_PtrZone:
     move.l  %a0,-(%sp)              /* put ptr on the stack */
     pea     4(%sp)                  /* push pointer to the zone on stack */
     jsr     c_PtrZone
+    ext.l   %d0                     /* OSErr is 16 bits in GCC's ABI; callers need a 32-bit D0 */
     addq.l  #8,%sp                  /* cleanup 8 bytes from the stack */
     move.l  (%sp)+,%a0              /* put zone in A0, cleanup stack */
     rts
@@ -332,6 +352,7 @@ fig_ReserveMem:
     move.l  %d0,-(%sp)              /* put sizeNeeded on stack */
     move.l  %d1,-(%sp)              /* put trap word on the stack */
     jsr     c_ReserveMem
+    ext.l   %d0                     /* OSErr is 16 bits in GCC's ABI; callers need a 32-bit D0 */
     addq.l  #8,%sp
     rts
 
@@ -346,6 +367,7 @@ fig_PurgeMem:
     move.l  %d0,-(%sp)              /* put sizeNeeded on stack */
     move.l  %d1,-(%sp)              /* put trap word on the stack */
     jsr     c_PurgeMem
+    ext.l   %d0                     /* OSErr is 16 bits in GCC's ABI; callers need a 32-bit D0 */
     addq.l  #8,%sp
     rts
 
@@ -359,6 +381,7 @@ fig_PurgeMem:
 fig_EmptyHandle:
     move.l  %a0,-(%sp)              /* put handle on stack */
     jsr     c_EmptyHandle
+    ext.l   %d0                     /* OSErr is 16 bits in GCC's ABI; callers need a 32-bit D0 */
     addq.l  #4,%sp
     rts
 
@@ -372,6 +395,7 @@ fig_EmptyHandle:
 fig_HLock:
     move.l  %a0,-(%sp)              /* put handle on stack */
     jsr     c_HLock
+    ext.l   %d0                     /* OSErr is 16 bits in GCC's ABI; callers need a 32-bit D0 */
     addq.l  #4,%sp
     rts
 
@@ -385,6 +409,7 @@ fig_HLock:
 fig_HUnlock:
     move.l  %a0,-(%sp)              /* put handle on stack */
     jsr     c_HUnlock
+    ext.l   %d0                     /* OSErr is 16 bits in GCC's ABI; callers need a 32-bit D0 */
     addq.l  #4,%sp
     rts
 
@@ -398,6 +423,7 @@ fig_HUnlock:
 fig_HPurge:
     move.l  %a0,-(%sp)              /* put handle on stack */
     jsr     c_HPurge
+    ext.l   %d0                     /* OSErr is 16 bits in GCC's ABI; callers need a 32-bit D0 */
     addq.l  #4,%sp
     rts
 
@@ -411,6 +437,7 @@ fig_HPurge:
 fig_HNoPurge:
     move.l  %a0,-(%sp)              /* put handle on stack */
     jsr     c_HNoPurge
+    ext.l   %d0                     /* OSErr is 16 bits in GCC's ABI; callers need a 32-bit D0 */
     addq.l  #4,%sp
     rts
 
@@ -424,6 +451,7 @@ fig_HNoPurge:
 fig_SetGrowZone:
     move.l  %a0,-(%sp)              /* put grow zone proc on stack */
     jsr     c_SetGrowZone
+    ext.l   %d0                     /* OSErr is 16 bits in GCC's ABI; callers need a 32-bit D0 */
     addq.l  #4,%sp
     rts
 
@@ -437,6 +465,7 @@ fig_SetGrowZone:
 fig_MoveHHi:
     move.l  %a0,-(%sp)              /* put handle on stack */
     jsr     c_MoveHHi
+    ext.l   %d0                     /* OSErr is 16 bits in GCC's ABI; callers need a 32-bit D0 */
     addq.l  #4,%sp
     rts
 
@@ -450,6 +479,7 @@ fig_MoveHHi:
 fig_MoveHLow:
     move.l  %a0,-(%sp)              /* put handle on stack */
     jsr     c_MoveHLow
+    ext.l   %d0                     /* OSErr is 16 bits in GCC's ABI; callers need a 32-bit D0 */
     addq.l  #4,%sp
     rts
 
@@ -509,6 +539,7 @@ fig_StackSpace:
 fig_HSetRBit:
     move.l  %a0,-(%sp)              /* put handle on stack */
     jsr     c_HSetRBit
+    ext.l   %d0                     /* OSErr is 16 bits in GCC's ABI; callers need a 32-bit D0 */
     addq.l  #4,%sp
     rts
 
@@ -522,6 +553,7 @@ fig_HSetRBit:
 fig_HClrRBit:
     move.l  %a0,-(%sp)              /* put handle on stack */
     jsr     c_HClrRBit
+    ext.l   %d0                     /* OSErr is 16 bits in GCC's ABI; callers need a 32-bit D0 */
     addq.l  #4,%sp
     rts
 
@@ -549,6 +581,7 @@ fig_HSetState:
     move.l  %d0,-(%sp)              /* put flags on stack (longword, not byte) */
     move.l  %a0,-(%sp)              /* put handle on stack */
     jsr     c_HSetState
+    ext.l   %d0                     /* OSErr is 16 bits in GCC's ABI; callers need a 32-bit D0 */
     addq.l  #8,%sp
     rts
 
