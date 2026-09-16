@@ -88,7 +88,12 @@
 .equ MinFree,       0       /* minimum free memory */
 .equ IntlSpec,      0x0BA0
 .equ LastFOND,      0x0BC2
-.equ LastSPExtra,   0x0BC6
+/* LastSPExtra is $0B4C, NOT $0BC6.  Verified against the stock SE ROM and Apple's
+ * compiled System patches in RAM, which both invalidate the font cache with
+ * `move.l $0A06.w,$0B4C.w` (ROM $40800A3DE, $4080DDF0, $4080E1E0, $4080EA3E ...).
+ * $0BC6 sits inside a System dispatch-table of handles at $0BC8/$0BCC/$0BD4, so the
+ * long store smeared over the high word of the handle at $0BC8 -- see MinusOne. */
+.equ LastSPExtra,   0x0B4C
 .equ RMgrPerm,      0x0BA4
 .equ fondCache,     0       /* font cache pointer — stub */
 
@@ -127,7 +132,12 @@
 
 /* Misc constants */
 .equ OneOne,         0x0A02     /* low-mem global containing $00010001, was literal */
-.equ MinusOne,       -1
+/* MinusOne is the ADDRESS of the low-memory long holding $FFFFFFFF, like OneOne above --
+ * not the value.  As -1 the assembler turned `move.l MinusOne,LastSPExtra` into
+ * `move.l $FFFF.w,...`, which read a long from $FFFFFFFF and stored the garbage.
+ * Confirmed by the stock ROM's own `move.l $0A06.w,$0B4C.w`, and $0A06 does hold
+ * $FFFFFFFF in every RAM dump. */
+.equ MinusOne,       0x0A06
 .equ Resource, 5
 
 /* External function stubs — these won't be called in our minimal RM */
