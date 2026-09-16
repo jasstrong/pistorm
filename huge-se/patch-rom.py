@@ -738,7 +738,14 @@ def patch_rom(infile, outfile):
               f"$26F0->REINSTATED-ramtest(clamp@${ramtest_stub_vaddr:08X}), "
               f"PMMU-enable off last RAM-test call ($200000) ===")
     else:
-        print(f"=== WARNING: boot32.bin not found ({boot32_path}) ===")
+        # Hard error, not a warning.  Without boot32 the ROM still LOOKS fine and even
+        # reaches "Starting up...", because the emulator supplies MemTop at the $48 seam
+        # -- but $70000 keeps the raw mirror bytes instead of boot32's trampolines, so
+        # memsize/ramtest/PMMU-setup are garbage and the boot hangs in the Device
+        # Manager's ioResult wait.  Cost an hour on 2026-09-16 after a helper script
+        # cleaned boot32.bin and left it unbuilt.
+        raise SystemExit(f"ERROR: boot32.bin not found ({boot32_path}) -- "
+                         f"run `gmake -C boot32` first (gmake, not make: see the Makefile notes)")
 
     # === Born-32 32-bit-clean: Lo3Bytes ($031A) = $FFFFFFFF ===
     # ROM $07CA does `move.l #$00FFFFFF, $031A` (Lo3Bytes, the 24-bit address
@@ -761,6 +768,52 @@ def patch_rom(infile, outfile):
     rom[0x783E:0x7840] = b'\xD6\x80'
     patches += 1
     print("=== FXM MapFBlock add.w->add.l patched (32-bit clean) ===")
+
+    # === CallWindow: decode windowDefProc instead of dereferencing it whole ===
+    # windowDefProc (WindowRecord+$7E) is not a pointer, it is a packed field:
+    # the window's VARIANT in the low 4 bits of the high byte, the WDEF handle in
+    # the low 24.  System 7.5's GetWVariant patch reads it that way
+    # (`moveq #$F,d0; and.b $7e(a1),d0`), so the packing is the System's contract
+    # and cannot be moved elsewhere.  A 68000 never noticed, having no A24-A31, and
+    # born-32 papered over it too: unknown high bytes alias to a dirty-alias L1
+    # entry at physical $0, so the variant byte fell off on the way to RAM.
+    #
+    # At 32MB that stops being true for variant 1: L1 slot $01 is real memory now,
+    # so $010B6CE4 no longer folds to $000B6CE4 and CallWindow dereferences 16MB
+    # up, into RAM-test fill -> `jsr (a0)` into nowhere.  Every modal dialog
+    # (dBoxProc = variant 1) takes the machine down.  $02-$FF still alias, so only
+    # variant 1 is affected.
+    #
+    # The ROM already decodes the field correctly five instructions later, when it
+    # hands the handle to _LoadResource (`move.l a0,-(a7); clr.b (a7)`); it just
+    # forgot to do so for its own two loads.  Route both through a stub that strips
+    # the variant byte the same way.  Fixing A0 at the load covers the whole
+    # routine: the reload after _LoadResource, the `bset #7,(a0)` lock and the
+    # `jsr (a0)` all use it.
+    WDEF_STUB_OFF = 0x6F100      # free mirror space (RAM-test stub sits at $6F000)
+    wdef_stub1 = 0x40800000 + WDEF_STUB_OFF
+    wdef_stub2 = wdef_stub1 + 16
+    assert rom[0xC0A2:0xC0A8] == bytes.fromhex('206b007e2010'), "CallWindow deref site mismatch"
+    assert rom[0xC0C2:0xC0CA] == bytes.fromhex('206b007e08900007'), "CallWindow unlock site mismatch"
+    rom[0xC0A2:0xC0A8] = struct.pack('>HI', 0x4EB9, wdef_stub1)          # jsr stub1.l
+    rom[0xC0C2:0xC0CA] = struct.pack('>HIH', 0x4EB9, wdef_stub2, 0x4E71)  # jsr stub2.l ; nop
+    patches += 2
+    print(f"=== CallWindow windowDefProc decoded via stubs ${wdef_stub1:08X}/${wdef_stub2:08X} (32-bit clean) ===")
+
+    # === CallControl: same field, same fix ===
+    # contrlDefProc (ControlRecord+$18) packs the control's variant the same way, and
+    # System 7.5's GetCVariant patch reads it the same way (`moveq #$F,d0;
+    # and.b $18(a0),d0`).  CallControl at $4080D426 is CallWindow's twin, down to the
+    # `move.l a0,-(a7); clr.b (a7)` before its own _LoadResource.  Speedometer launched
+    # once the window side was fixed, then died here on the benchmark's controls.
+    cdef_stub1 = wdef_stub1 + 32
+    cdef_stub2 = wdef_stub1 + 48
+    assert rom[0xD448:0xD44E] == bytes.fromhex('206800184a90'), "CallControl deref site mismatch"
+    assert rom[0xD468:0xD470] == bytes.fromhex('2068001808900007'), "CallControl unlock site mismatch"
+    rom[0xD448:0xD44E] = struct.pack('>HI', 0x4EB9, cdef_stub1)           # jsr stub3.l
+    rom[0xD468:0xD470] = struct.pack('>HIH', 0x4EB9, cdef_stub2, 0x4E71)   # jsr stub4.l ; nop
+    patches += 2
+    print(f"=== CallControl contrlDefProc decoded via stubs ${cdef_stub1:08X}/${cdef_stub2:08X} (32-bit clean) ===")
 
     # === Route the ROM's system-heap-grow ($AE20) into figment ===
     # When the system heap fills, this ROM routine (entry: A0=new heap end,
@@ -814,6 +867,52 @@ def patch_rom(infile, outfile):
     serd_stub = struct.pack('>HHHHH', 0x2040, 0xA029, 0x2050, 0x4E90, 0x4E75)
     out[SERD_STUB_OFF:SERD_STUB_OFF + len(serd_stub)] = serd_stub
     print(f"=== SERD HLock stub embedded at ROM+${SERD_STUB_OFF:05X} ({len(serd_stub)} bytes) ===")
+
+    # CallWindow windowDefProc stubs (mirror half; see the $C0A2/$C0C2 patches above).
+    # `clr.b (a7)` on the pushed copy clears the high byte -- the ROM's own idiom for
+    # this field.  stub1 also re-does the `move.l (a0),d0` it replaced, and the caller's
+    # following `bne.b` reads the Z flag from it (jsr and rts leave the CCR alone).
+    wdef_stub_code = struct.pack('>HHHHHHH',
+        0x206B, 0x007E,   # movea.l $7e(a3),a0   -- variant byte still in the high byte
+        0x2F08,           # move.l  a0,-(a7)
+        0x4217,           # clr.b   (a7)         -- strip it
+        0x205F,           # movea.l (a7)+,a0     -- A0 = the real 32-bit handle
+        0x2010,           # move.l  (a0),d0      -- the load the patch displaced
+        0x4E75)           # rts
+    assert len(wdef_stub_code) == 14
+    wdef_stub2_code = struct.pack('>HHHHHHHH',
+        0x206B, 0x007E,   # movea.l $7e(a3),a0
+        0x2F08,           # move.l  a0,-(a7)
+        0x4217,           # clr.b   (a7)
+        0x205F,           # movea.l (a7)+,a0
+        0x0890, 0x0007,   # bclr.b  #7,(a0)      -- unlock, now at the right address
+        0x4E75)           # rts
+    assert len(wdef_stub2_code) == 16
+    out[WDEF_STUB_OFF:WDEF_STUB_OFF + 14] = wdef_stub_code
+    out[WDEF_STUB_OFF + 16:WDEF_STUB_OFF + 32] = wdef_stub2_code
+    print(f"=== CallWindow windowDefProc stubs embedded at ROM+${WDEF_STUB_OFF:05X} (14+16 bytes) ===")
+
+    # CallControl stubs.  Here the ControlRecord pointer is already in A0 and the load
+    # overwrites it, so the stub reloads from $18(a0) exactly as the original did.
+    cdef_stub_code = struct.pack('>HHHHHHH',
+        0x2068, 0x0018,   # movea.l $18(a0),a0
+        0x2F08,           # move.l  a0,-(a7)
+        0x4217,           # clr.b   (a7)        -- strip the variant
+        0x205F,           # movea.l (a7)+,a0
+        0x4A90,           # tst.l   (a0)        -- the test the patch displaced
+        0x4E75)           # rts                 -- the caller's bne.b reads its Z flag
+    assert len(cdef_stub_code) == 14
+    cdef_stub2_code = struct.pack('>HHHHHHHH',
+        0x2068, 0x0018,   # movea.l $18(a0),a0
+        0x2F08,           # move.l  a0,-(a7)
+        0x4217,           # clr.b   (a7)
+        0x205F,           # movea.l (a7)+,a0
+        0x0890, 0x0007,   # bclr.b  #7,(a0)     -- unlock at the right address
+        0x4E75)           # rts
+    assert len(cdef_stub2_code) == 16
+    out[WDEF_STUB_OFF + 32:WDEF_STUB_OFF + 46] = cdef_stub_code
+    out[WDEF_STUB_OFF + 48:WDEF_STUB_OFF + 64] = cdef_stub2_code
+    print(f"=== CallControl contrlDefProc stubs embedded at ROM+${WDEF_STUB_OFF + 32:05X} (14+16 bytes) ===")
 
     # Reinstated RAM-test clamp stub (mirror half; see the $26F0 redirect above).
     # The $26F0 redirect is a 6-byte jmp that overwrites THREE original instructions:
