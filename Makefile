@@ -32,6 +32,13 @@ CC        = gcc
 CXX       = g++
 WARNINGS  = -Wall -Wextra -pedantic
 
+# `make PROBES=1` compiles in the print-only diagnostic probes (PROBING() in m68kcpu.h).
+# They sit in the per-instruction and per-memory-access paths, so the default build leaves
+# them out entirely; in a PROBES=1 build, turn them on with `setvar probes 1`.
+ifdef PROBES
+ACFLAGS  += -DPISTORM_PROBES
+endif
+
 ifeq ($(PLATFORM),PI3_BULLSEYE)
 	LFLAGS    = $(WARNINGS) -L/usr/local/lib -ldl -lstdc++ -lasound -lvncserver -lm
 	CFLAGS    = $(WARNINGS) -I. -march=armv8-a -mfloat-abi=hard -mfpu=neon-fp-armv8 -O3 -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE -D_LARGEFILE64_SOURCE -lstdc++ $(ACFLAGS)

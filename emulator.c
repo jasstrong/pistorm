@@ -230,7 +230,7 @@ double   g_memsize_t0 = 0;      /* [MEMSIZE] wall-clock µs at memsize entry, fo
 unsigned long g_poll_ok = 0, g_poll_timeout = 0;  /* [POLL-STATS] SCSI handshake poll outcomes */
 int g_rmtrace_state = 0;  /* [RM-TRACE] 0=idle 1=armed@KCHR 2=saw KMAP 3=done */
 int g_happymac_seen = 0;  /* [GIVEUP] set at Happy Mac ($1176); gates the post-boot re-scan probe */
-int probes_enabled = 0;  /* print-only probes in m68k_execute_bef; `setvar probes 1` */
+int probes_enabled = 0;  /* print-only probes; only consulted in a `make PROBES=1` build */
 int pmmu_stlb_mode = 1;  /* PMMU soft TLB: 0 off, 1 on, N>1 on + re-check every Nth hit; `setvar stlb N` */
 int menutrace_enabled = 0;  /* [MENU-CB]/[MENU-QDX] screen CopyBits + offscreen-buffer trace; `setvar menutrace 1` */
 uint32_t g_scsi_blk = 0;       /* [BLKCK] SCSI transfer FMblk @ $1A774 */
@@ -1300,7 +1300,7 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 
 			/* Statistical profiler ring — dump hottest PCs on SIGUSR2 */
 			pc_ring[pc_ring_pos++ & (PCRING_SIZE - 1)] = REG_PC;
-			if (probes_enabled) {  /* print-only probes: wild-jump detector, [MOUNT-POLL] hot-spin */
+			if (PROBING()) {  /* print-only probes: wild-jump detector, [MOUNT-POLL] hot-spin */
 			{ /* wild-jump detector: catch valid->wild PC transition (bad JMP/RTS target) */
 			  static uint32_t prev_valid = 0;
 			  int valid = (REG_PC < 0x02000000) || (REG_PC >= 0x40800000 && REG_PC < 0x40880000);
@@ -1328,7 +1328,7 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			             REG_PC, REG_IR, REG_DA[8],REG_DA[9],REG_DA[10],REG_DA[11],REG_DA[12],REG_DA[13],REG_DA[0],REG_DA[1]);
 			      printf("[MOUNT-POLL]  words@pc: %04X %04X %04X %04X\n", m68ki_read_16(state,REG_PC), m68ki_read_16(state,REG_PC+2), m68ki_read_16(state,REG_PC+4), m68ki_read_16(state,REG_PC+6)); } }
 			  else { cpc[mn]=REG_PC; cc[mn]=1; } }
-			  } /* probes_enabled */
+			  } /* PROBING() */
 
 			/* Debug: trace T2 load and disk subroutines */
 			{
@@ -1369,7 +1369,7 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			       * test-pattern residue so the System's `cmpi.l #-1,($8B0)` guard skips the CQD
 			       * init instead of calling unimplemented $AA18 -> dsCoreErr(12). */
 			      /* [NO-CQD-RE DISABLED 2026-09-02] see above -- was overwriting live memory. */ } } }
-			  if (probes_enabled) {  /* print-only probes: [MEMSIZE] .. [ROVRMP-WR] */
+			  if (PROBING()) {  /* print-only probes: [MEMSIZE] .. [ROVRMP-WR] */
 			  /* ADB deferred-queue integrity at $3A32 (after $3A16 reads the 14-byte
 			   * ADBCmdQEntry): is a4 (queue ptr) in-bounds, or is ABusVars/the queue
 			   * corrupt? Filter to the garbage transaction (fQComp top byte set). */
@@ -1518,7 +1518,7 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			             (ob>0x2000&&ob<0x1F00000)?m68ki_read_16(state,ob):0xEEEE, (ob>0x2000&&ob<0x1F00000)?m68ki_read_16(state,ob+2):0xEEEE,
 			             (ob>0x2000&&ob<0x1F00000)?m68ki_read_16(state,ob+4):0xEEEE, (ob>0x2000&&ob<0x1F00000)?m68ki_read_16(state,ob+6):0xEEEE,
 			             (nb>0x2000&&nb<0x1F00000)?m68ki_read_8(state,nb-16+4):0xEE); } p=v; } }
-			             } /* probes_enabled */
+			             } /* PROBING() */
 			  /* [GUSD-RAM] hugeSE 'gusd' override (the volume-independent sibling of bigSE's
 			   * fake_gusd stream revert): the boot volume's stock gusd carries the 24-bit
 			   * methods -> the System runs 24-bit-dirty pointers on flat-32 hugeSE (jas's
@@ -1532,7 +1532,7 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			      if (rom_off == 0x490DE || rom_off == 0x490D6) {
 			        uint32_t sp=REG_DA[15]; uint32_t rtype=m68ki_read_32(state,sp+6);
 			        g_last_getres_type = rtype; g_last_getres_id = (uint16_t)m68ki_read_16(state,sp+4);  /* [RSRC-RESULT] pair with the exit handle */
-			        if (probes_enabled) {  /* print-only probes: [RM-TRACE] [RM-CHAIN] [RSRC-SEQ] [PTCH5-PROBE] */
+			        if (PROBING()) {  /* print-only probes: [RM-TRACE] [RM-CHAIN] [RSRC-SEQ] [PTCH5-PROBE] */
 			        /* [RM-TRACE] surgical: arm the instruction trace at the KCHR request (which
 			         * SUCCEEDS), run through the KMAP request (which FAILS), disarm at KMAP's RM
 			         * exit — one trace holding both lookups so the divergence is visible. Off the
@@ -1598,7 +1598,7 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			            mh=m68ki_read_32(state,mp+16)&0x1FFFFFF;
 			          }
 			        } }
-			        } /* probes_enabled */
+			        } /* PROBING() */
 			        /* [RESLOAD-FIX] Our SuperMario RM returns NIL (not a non-nil EMPTY handle) for
 			         * GetResource when ResLoad=false and the resource isn't yet in memory. PTCH 630's
 			         * RamSysInit does SetResLoad(false)+GetResource('ptch',N) as an existence check, so it
@@ -1618,7 +1618,7 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			         * exists in this form after decompression. */
 			        uint32_t sp=REG_DA[15]; uint32_t hv=m68ki_read_32(state,sp+4); uint32_t h=hv&0x1FFFFFF; gr_armed=0;
 			        if (g_last_getres_type) {  /* [RSRC-RESULT] pair the request with its returned handle (NIL = load FAILED) */
-			          static int rr=0; if (probes_enabled && rr++ < 60)
+			          static int rr=0; if (PROBING() && rr++ < 60)
 			            printf("[RSRC-RESULT] type='%c%c%c%c' id=%d -> handle=$%08X %s\n",
 			                   (char)(g_last_getres_type>>24),(char)(g_last_getres_type>>16),(char)(g_last_getres_type>>8),(char)g_last_getres_type,
 			                   (int16_t)g_last_getres_id, hv, (hv & 0x1FFFFFF) ? "OK" : "*** NIL (FAILED) ***");
@@ -1674,7 +1674,7 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			                nrel++; o+=2; } }
 			            if (nrel) printf("[PATCH-RELOC] '%c%c%c%c' %d: relocated %d ROM refs (+$40000000)\n",
 			              (char)(g_last_getres_type>>24),(char)(g_last_getres_type>>16),(char)(g_last_getres_type>>8),(char)g_last_getres_type,(int16_t)g_last_getres_id,nrel); }
-			          if (probes_enabled) {  /* print-only probes: [GPCH-DUMP] [PTCH-EXTRACT] [HEAP-CHECK] */
+			          if (PROBING()) {  /* print-only probes: [GPCH-DUMP] [PTCH-EXTRACT] [HEAP-CHECK] */
 			          /* [GPCH-DUMP] the essential global patch is allowed through — dump its data so we can
 			           * see the patch header / OK-flag format (for a future trivial no-op gpch). */
 			          if (g_block_patches && (hv & 0x1FFFFFF) && g_last_getres_type==0x67706368u) {
@@ -1741,7 +1741,7 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
                            _wb, _wsz, _wb+_wsz, (_wtg==0?"FREE":"used"), _wtg, _wfl, _wbk, _wrl,
                            (_wb==_bad)?"  <== BAD(sub-min free)":"", _haspp?"  <== PTCH id=0 data":"");
                   _wb+=_wsz; } } } }
-                  } /* probes_enabled */
+                  } /* PROBING() */
 			          g_last_getres_type = 0; }
 			        if (g_rmtrace_state==2) { g_rmtrace_state=3; extern void trace_disarm(void); extern void trace_flush(void);
 			          trace_disarm(); trace_all_enabled=0; trace_flush();
@@ -1767,7 +1767,7 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			            printf("[GUSD-RAM] toolbox tbl: $A80C(rGetResource)->$%08X $A9A0(GetResource)->$%08X\n",
 			                   m68ki_read_32(state,0xE00+0x0C*4), m68ki_read_32(state,0xE00+0x1A0*4)); } } }
 			    } }
-			  if (probes_enabled) {  /* print-only probes: [HEAP-CLOBBER] .. [TIMING-REAL] */
+			  if (PROBING()) {  /* print-only probes: [HEAP-CLOBBER] .. [TIMING-REAL] */
 			  /* [HEAP-CLOBBER] One-shot at the clobbering write ($49650 `move.l a1,(a0)`):
 			   * A0=$2794 = KCHR's master pointer, being written INSIDE the System-file resource
 			   * map's type list ($2740+), corrupting the KMAP type entry at $2796. Walk the
@@ -2127,7 +2127,7 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 				        printf("[TIMING-REAL] calibrated TimeDBRA=$%04X TimeSCCDB=$%04X TimeSCSIDB=$%04X (force disabled) PC=$%08X\n",
 				               (dbra_scc>>16)&0xFFFF, dbra_scc&0xFFFF, (scsidb>>16)&0xFFFF, REG_PC);
 				      } } }
-				      } /* probes_enabled */
+				      } /* PROBING() */
 					  /* born-32: repair a stripped ROM driver pointer at the .DRVR dispatcher.
 					   * ROM-based drivers (.Sony etc.) live in the ROM mirror at $408xxxxx, but
 					   * the DCE dCtlDriver gets stored 24-bit-masked ($008xxxxx), so the dispatch
@@ -2143,7 +2143,7 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 					   * OR in the $40 prefix so $405FFxxx hits the CI I/O page (L2
 					   * entry 5) and routes via custom_read to the real 5380, exactly
 					   * like VIA ($40EFxxxx) and IWM ($40DFxxxx). */
-					  if (probes_enabled) {  /* print-only probes: [CAL-IN] [CAL-OUT] */
+					  if (PROBING()) {  /* print-only probes: [CAL-IN] [CAL-OUT] */
 					  /* PROBE: TimeDBRA calibration — answer: is VIA mapped right? is PMMU on yet?
 				   * does the VIA access actually land? a1 should be the VIA base. */
 				  if (rom_off == 0x44C) { static int c=0; if (c++<2)
@@ -2152,7 +2152,7 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 				  if (rom_off == 0x466) { static int c=0; if (c++<2)
 				    printf("[CAL-OUT] a1=$%08X TimeDBRA(d0)=$%04X pmmu_en=%d\n",
 				      REG_DA[9], REG_DA[0] & 0xFFFF, m68ki_cpu.pmmu_enabled); }
-				      } /* probes_enabled */
+				      } /* PROBING() */
 				  if (ovl_sysrom_pos >= 0x40000000 && rom_off == 0x1A410 && (REG_DA[11] & 0x00F80000) == 0x00580000) {
 					    REG_DA[11] |= 0x40000000;
 					  }
@@ -2170,7 +2170,7 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 					      if (tf++ < 2) printf("[TIMESCSI-FIX] $D04 $FFFF -> $%04X (from TimeSCCDB)\n", scc);
 					    }
 					  }
-					  if (probes_enabled) {  /* print-only probes: [DACK-DECISION] .. [WTC-JUMP] */
+					  if (PROBING()) {  /* print-only probes: [DACK-DECISION] .. [WTC-JUMP] */
 					  /* [DACK-DECISION] hugeSE enters the pseudo-DMA/DACK transfer setup
 					   * ($1A774 Mode=DMA); bigSE never gets here (it does PIO). Dump the call
 					   * chain (branch ring + stack ret-addrs) + regs to find WHERE the SCSI
@@ -2482,7 +2482,7 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			      printf("[WTC-JUMP] PC=$%08X from PPC=$%08X  A0=$%08X A1=$%08X SP=$%08X\n",
 			             REG_PC, REG_PPC, REG_DA[8], REG_DA[9], REG_DA[15]);
 			  }
-			  } /* probes_enabled */
+			  } /* PROBING() */
 			  /* Keyboard SR callback: ROM+$368A is JMP (A0) where A0 was
 			   * loaded from the driver's completion routine pointer. If the
 			   * keyboard driver hasn't initialized yet, A0 is NULL → crash.
@@ -2494,7 +2494,7 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			    /* ROM+$3680 is an RTS right before this code block */
 			    REG_DA[8+0] = ovl_sysrom_pos + 0x3680;
 			  }
-			  if (probes_enabled) {  /* print-only probes: [SND-POLL] [IFR-XLAT] [LOWMEM] */
+			  if (PROBING()) {  /* print-only probes: [SND-POLL] [IFR-XLAT] [LOWMEM] */
 			  if (rom_off == 0x2A0E) {
 			    /* MOVEQ #-1,D0 before BTST #1,$1A00(A5) poll loop — polls VIA IFR for CA1/VBL */
 			    uint32_t a5 = REG_DA[8+5];
@@ -2528,9 +2528,9 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			      dump_done = 1;
 			    }
 			  }
-			  } /* probes_enabled */
+			  } /* PROBING() */
 			}
-			if (probes_enabled) {  /* print-only probes: [DISK] [GESTALT] [GUSD] [MDB-READ] .. [INITZONE] */
+			if (PROBING()) {  /* print-only probes: [DISK] [GESTALT] [GUSD] [MDB-READ] .. [INITZONE] */
 			{ static int iwm_dbg = 0;
 			  uint32_t rom_off = REG_PC - ovl_sysrom_pos;
 			  if (rom_off == 0x3370 && iwm_dbg < 10) {
@@ -2770,7 +2770,7 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			    }
 			  }
 			}
-			} /* probes_enabled */
+			} /* PROBING() */
 
 			/* OVL off: when PC enters ROM range. The slow-path OVL check
 			 * doesn't fire for fast-path ROM reads. On big-se this works
@@ -2789,7 +2789,7 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 				handle_ovl_mappings_mac68k(cfg);
 			}
 
-			if (probes_enabled) {  /* print-only probes: early-boot Sad Mac trace, [CRASH822] */
+			if (PROBING()) {  /* print-only probes: early-boot Sad Mac trace, [CRASH822] */
 			/* Early boot trace — print last 50 instructions before sad mac */
 			{
 				static uint32_t boot_ring[64];
@@ -2858,7 +2858,7 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 					{ extern void branch_ring_dump(const char *); branch_ring_dump("at CRASH822 $800822"); }
 				}
 			}
-			} /* probes_enabled */
+			} /* PROBING() */
 
 			/* Big SE: redirect PC from old ROM space ($4xxxxx) to new ($8xxxxx).
 			 * Code loaded from disk may reference $4xxxxx ROM addresses that
@@ -3125,7 +3125,7 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			   * trap"). born-32 redirects the MM TRAPS to figment, so any EXECUTION of
 			   * the ROM MM routines = a direct call bypassing figment. Log entry+caller. */
 			  { extern uint32_t ovl_sysrom_pos; static uint32_t _mmlast = 0;
-			    if (probes_enabled && ovl_sysrom_pos >= 0x40000000u) {
+			    if (PROBING() && ovl_sysrom_pos >= 0x40000000u) {
 			      int _in  = (_tpc    >= 0x4080AD00u && _tpc    < 0x4080AF00u);
 			      int _pin = (_mmlast >= 0x4080AD00u && _mmlast < 0x4080AF00u);
 			      if (_in && !_pin) { static int _mc = 0;
@@ -3141,7 +3141,7 @@ static inline void m68k_execute_bef(m68ki_cpu_core *state, int num_cycles)
 			 * high byte — the MODE32-seam dirty stack pointer that RTE/RTS-es to garbage and
 			 * drives the post-Welcome recurring-exception crash. Clean SP is always $00xxxxxx. */
 			{ uint32_t _sp = REG_DA[15]; static int _seen_clean = 0;
-			  if (probes_enabled && ovl_sysrom_pos >= 0x40000000u) {
+			  if (PROBING() && ovl_sysrom_pos >= 0x40000000u) {
 			    /* legit stack is RAM up to the (32MB-forced) MemTop, i.e. high byte <= $01;
 			     * a high byte >= $02 is a garbage/dirty SP (the crash SP is $FD/$FExxxxxx). */
 			    if (_sp < 0x02000000u) { _seen_clean = 1; }   /* real stack established */

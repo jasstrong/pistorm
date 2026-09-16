@@ -400,6 +400,17 @@ typedef uint32 uint64;
 #define PMMU_ENABLED     state->pmmu_enabled
 #define RESET_CYCLES     state->reset_cycles
 
+/* Print-only diagnostic probes.  They sit in the per-instruction and per-memory-access
+ * paths, so by default they are COMPILED OUT: PROBING() is a constant 0 and the whole
+ * block is dead code the optimizer deletes.  Build with `make PROBES=1` to include them,
+ * and then turn them on at run time with `setvar probes 1`. */
+#ifdef PISTORM_PROBES
+extern int probes_enabled;
+#define PROBING()        (probes_enabled)
+#else
+#define PROBING()        0
+#endif
+
 
 #define CALLBACK_INT_ACK      m68ki_cpu.int_ack_callback
 #define CALLBACK_BKPT_ACK     m68ki_cpu.bkpt_ack_callback
@@ -1289,7 +1300,7 @@ static __attribute__((noinline)) uint m68ki_read_8_fc(m68ki_cpu_core *state, uin
 	    /* Trace VIA reads: catch any address whose 24-bit portion is VIA */
 	    {
 	        uint32_t pre24 = pre_pmmu & 0x00FFFFFF;
-	        if (pre24 >= 0xEFE000 && pre24 <= 0xEFFFFF) {
+	        if (PROBING() && pre24 >= 0xEFE000 && pre24 <= 0xEFFFFF) {
 	            static int pmmu_via_dbg = 0;
 	            if (pmmu_via_dbg++ < 10)
 	                printf("[PMMU-VIA] pre=$%08X post=$%08X PC=$%08X\n",
@@ -1307,7 +1318,7 @@ static __attribute__((noinline)) uint m68ki_read_8_fc(m68ki_cpu_core *state, uin
 	 * status poll reading stale RAM never sees the real bit -> timeout. Early boot
 	 * never uses 13-15MB RAM as data, so any hit here is a 32-bit-dirty I/O access. */
 	{ extern uint32_t ovl_sysrom_pos;
-	  if (ovl_sysrom_pos >= 0x40000000 &&
+	  if (PROBING() && ovl_sysrom_pos >= 0x40000000 &&
 	      ((address >= 0x00580000 && address < 0x00600000) ||   /* SCSI */
 	       (address >= 0x00900000 && address < 0x00C00000) ||   /* SCC  */
 	       (address >= 0x00D00000 && address < 0x00E00000) ||   /* IWM  */
@@ -1320,7 +1331,7 @@ static __attribute__((noinline)) uint m68ki_read_8_fc(m68ki_cpu_core *state, uin
 	 * ($EFF1FE-$EFF3FE), ACR reg11 ($EFF7FE). SCSI-timing calibration reads T2;
 	 * .Sony reads/programs T1 for disk PWM. Catches remapped ($40EFxxxx) + bare. */
 	{ extern uint32_t ovl_sysrom_pos; uint32_t _a24r = address & 0x00FFFFFF;
-	  if (ovl_sysrom_pos >= 0x40000000 && _a24r >= 0xEFE800 && _a24r < 0xEFF800) {
+	  if (PROBING() && ovl_sysrom_pos >= 0x40000000 && _a24r >= 0xEFE800 && _a24r < 0xEFF800) {
 	    static int vtr = 0;
 	    if (vtr++ < 60) printf("[VIATMR-RD] reg$%06X PC=$%08X%s\n", _a24r, ADDRESS_68K(REG_PC),
 	                           (address>>24)==0x40?"":"  <<BARE-hits-RAM");
@@ -1330,7 +1341,7 @@ static __attribute__((noinline)) uint m68ki_read_8_fc(m68ki_cpu_core *state, uin
 	if(cache->offset && address >= cache->lower && address < cache->upper)
 	{
 		{ extern uint32_t ovl_sysrom_pos; uint32_t _a = address & 0x00FFFFFF;
-		  if (ovl_sysrom_pos >= 0x40000000 && _a >= 0x5FF000 && _a < 0x600000) {
+		  if (PROBING() && ovl_sysrom_pos >= 0x40000000 && _a >= 0x5FF000 && _a < 0x600000) {
 		    static int _c = 0;
 		    if (_c++ < 20) printf("[SCSI-RD-CACHED] addr=$%08X served from RAM cache [$%08X-$%08X) val=$%02X PC=$%08X *** STALE I/O READ (PMMU CI not honored) ***\n",
 		       address, cache->lower, cache->upper, cache->offset[address - cache->lower], ADDRESS_68K(REG_PC)); } }
@@ -1340,7 +1351,7 @@ static __attribute__((noinline)) uint m68ki_read_8_fc(m68ki_cpu_core *state, uin
 	for (int i = 0; i < state->read_ranges; i++) {
 		if(address >= state->read_addr[i] && address < state->read_upper[i]) {
 			{ extern uint32_t ovl_sysrom_pos; uint32_t _a = address & 0x00FFFFFF;
-			  if (ovl_sysrom_pos >= 0x40000000 && _a >= 0x5FF000 && _a < 0x600000) {
+			  if (PROBING() && ovl_sysrom_pos >= 0x40000000 && _a >= 0x5FF000 && _a < 0x600000) {
 			    static int _m = 0;
 			    if (_m++ < 20) printf("[SCSI-RD-RAMRANGE] addr=$%08X in map range [$%08X-$%08X) val=$%02X PC=$%08X *** I/O READ HITTING RAM MAP ***\n",
 			       address, state->read_addr[i], state->read_upper[i], state->read_data[i][address - state->read_addr[i]], ADDRESS_68K(REG_PC)); } }
@@ -1358,7 +1369,7 @@ static __attribute__((noinline)) uint m68ki_read_8_fc(m68ki_cpu_core *state, uin
 	{
 		uint val = m68k_read_memory_8(ADDRESS_68K(address));
 		/* Debug: VIA reads during dispatch */
-		if (address >= 0x40EF0000 && address <= 0x40EFFFFF &&
+		if (PROBING() && address >= 0x40EF0000 && address <= 0x40EFFFFF &&
 		    REG_PC >= 0x40802B30 && REG_PC <= 0x40802B50) {
 			static volatile int dv = 0;
 			if (dv++ < 10)
@@ -1376,7 +1387,7 @@ static inline uint m68ki_read_16_fc(m68ki_cpu_core *state, uint address, uint fc
 	state->mmu_tmp_rw = 1;
 	state->mmu_tmp_sz = M68K_SZ_WORD;
 	{ extern uint32_t ovl_sysrom_pos;  /* [DIRTY-DEREF] wild-address catch (see read_32) */
-	  if (ovl_sysrom_pos >= 0x40000000u && ((address >= 0x02000000u && address < 0x40000000u) || address >= 0x41000000u)) {
+	  if (PROBING() && ovl_sysrom_pos >= 0x40000000u && ((address >= 0x02000000u && address < 0x40000000u) || address >= 0x41000000u)) {
 	    static int wp16 = 0; if (wp16++ < 30) printf("[DIRTY-DEREF] R16 wild=$%08X PC=$%08X\n", address, REG_PPC); } }
 	m68ki_check_address_error_010_less(state, address, MODE_READ, fc); /* auto-disable (see m68kcpu.h) */
 
@@ -1391,7 +1402,7 @@ static inline uint m68ki_read_16_fc(m68ki_cpu_core *state, uint address, uint fc
 	/* version-read SITE hunt: log EVERY distinct PC that reads RomBase+8
 	 * ($40800008) so we can find where 7.5.5 classifies the machine (and which
 	 * read to selectively feed $0178) vs the ROM's own boot reads. */
-	if (address == 0x40800008 || address == 0x00800008) {
+	if (PROBING() && (address == 0x40800008 || address == 0x00800008)) {
 		static uint32_t seen[256]; static int nseen=0; int dup=0;
 		for (int i=0;i<nseen;i++) if (seen[i]==REG_PC) { dup=1; break; }
 		if (!dup && nseen<256) { seen[nseen++]=REG_PC; printf("[VER-READ] $%08X read by PC=$%08X ovl=%d\n", address, REG_PC, state->ovl); }
@@ -1433,7 +1444,7 @@ static inline uint m68ki_read_32_fc(m68ki_cpu_core *state, uint address, uint fc
 	 * Master Pointer (flag bits in the high byte) deref'd flat = a WILD address above
 	 * RAM ($02000000..) that isn't ROM/iomap ($40800000/$40xxxxxx). Catch it. */
 	{ extern uint32_t ovl_sysrom_pos;
-	  if (ovl_sysrom_pos >= 0x40000000u && ((address >= 0x02000000u && address < 0x40000000u) || address >= 0x41000000u)) {
+	  if (PROBING() && ovl_sysrom_pos >= 0x40000000u && ((address >= 0x02000000u && address < 0x40000000u) || address >= 0x41000000u)) {
 	    extern void branch_ring_dump(const char*); static int wp32 = 0;
 	    if (wp32++ < 30) { printf("[DIRTY-DEREF] R32 wild=$%08X PC=$%08X\n", address, REG_PPC);
 	      if (wp32==1) branch_ring_dump("[DIRTY-DEREF] first wild R32"); } } }

@@ -159,9 +159,13 @@ void setvar_mac68k(struct emulator_config *cfg, char *var, char *val) {
     }
 
     if (CHKVAR("probes")) {
+#ifdef PISTORM_PROBES
         extern int probes_enabled;
         probes_enabled = 1;
         printf("[MAC68K] Print-only boot probes enabled (per-instruction diagnostics; slow)\n");
+#else
+        printf("[MAC68K] 'probes' ignored: this binary was built without them (rebuild with `make PROBES=1`)\n");
+#endif
     }
 
     if (CHKVAR("stlb")) {
