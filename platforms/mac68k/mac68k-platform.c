@@ -164,6 +164,18 @@ void setvar_mac68k(struct emulator_config *cfg, char *var, char *val) {
         printf("[MAC68K] Print-only boot probes enabled (per-instruction diagnostics; slow)\n");
     }
 
+    if (CHKVAR("stlb")) {
+        extern int pmmu_stlb_mode;
+        pmmu_stlb_mode = val ? atoi(val) : 1;
+        printf("[MAC68K] PMMU soft TLB mode %d (0 off, 1 on, N>1 on + re-check every Nth hit)\n", pmmu_stlb_mode);
+    }
+
+    if (CHKVAR("menutrace")) {
+        extern int menutrace_enabled;
+        menutrace_enabled = 1;
+        printf("[MAC68K] Screen CopyBits / offscreen-buffer trace enabled ([MENU-CB] [MENU-QDX])\n");
+    }
+
     if (CHKVAR("figment")) {
         extern int figment_enabled;
         extern int figment_verbose;

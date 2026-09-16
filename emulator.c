@@ -231,7 +231,88 @@ unsigned long g_poll_ok = 0, g_poll_timeout = 0;  /* [POLL-STATS] SCSI handshake
 int g_rmtrace_state = 0;  /* [RM-TRACE] 0=idle 1=armed@KCHR 2=saw KMAP 3=done */
 int g_happymac_seen = 0;  /* [GIVEUP] set at Happy Mac ($1176); gates the post-boot re-scan probe */
 int probes_enabled = 0;  /* print-only probes in m68k_execute_bef; `setvar probes 1` */
+int pmmu_stlb_mode = 1;  /* PMMU soft TLB: 0 off, 1 on, N>1 on + re-check every Nth hit; `setvar stlb N` */
+int menutrace_enabled = 0;  /* [MENU-CB]/[MENU-QDX] screen CopyBits + offscreen-buffer trace; `setvar menutrace 1` */
 uint32_t g_scsi_blk = 0;       /* [BLKCK] SCSI transfer FMblk @ $1A774 */
+
+/* One BitMap (or PixMap: same first fields) for [MENU-CB]: baseAddr, rowBytes, bounds and
+ * 16 bytes from the middle row. On born-32 a $40-flagged base above 8MB lands in the ROM
+ * or I/O window, so bytes are never read from the I/O part ($409xxxxx-$40Fxxxxx). */
+static void menutrace_bitmap(m68ki_cpu_core *state, const char *tag, uint32_t bm)
+{
+	uint32_t base = m68ki_read_32(state, bm);
+	uint16_t rb = m68ki_read_16(state, bm + 4);
+	int16_t t = m68ki_read_16(state, bm + 6), l = m68ki_read_16(state, bm + 8);
+	int16_t b = m68ki_read_16(state, bm + 10), r = m68ki_read_16(state, bm + 12);
+	printf(" %s{base=$%08X rb=$%04X (%d,%d,%d,%d)", tag, base, rb, t, l, b, r);
+	if ((base >> 24) == 0x40 && ((base >> 20) & 0xF) >= 9) {
+		printf(" I/O}");
+		return;
+	}
+	uint32_t row = base + (uint32_t)(rb & 0x3FFF) * (uint32_t)(b > t ? (b - t) / 2 : 0);
+	printf(" mid[");
+	for (int k = 0; k < 16; k++) printf("%02X", m68ki_read_8(state, row + k));
+	printf("]}");
+}
+
+/* From m68ki_exception_1010 for _CopyBits ($A8EC) and _QDExtensions ($AB1D) when menutrace
+ * is on: CopyBits calls that read or write the screen (ScrnBase) or pass a flagged base,
+ * and the QDOffscreen buffer calls the Menu Manager's SaveRestoreBits makes. Print-only. */
+void menutrace_trap(m68ki_cpu_core *state)
+{
+	static int lines = 0;
+	if (lines >= 6000) return;
+	uint32_t sp = REG_DA[15];
+	if ((REG_IR & 0xFBFF) == 0xA8EC) {
+		/* CopyBits(srcBits, dstBits: BitMap; srcRect, dstRect: Rect; mode: INTEGER; maskRgn) */
+		uint32_t mask = m68ki_read_32(state, sp), dstr = m68ki_read_32(state, sp + 6);
+		uint32_t srcr = m68ki_read_32(state, sp + 10), dstb = m68ki_read_32(state, sp + 14);
+		uint32_t srcb = m68ki_read_32(state, sp + 18), scrn = m68ki_read_32(state, 0x0824);
+		uint32_t sbase = m68ki_read_32(state, srcb), dbase = m68ki_read_32(state, dstb);
+		if (sbase != scrn && dbase != scrn && !((sbase | dbase) & 0xFF000000u)) return;
+		lines++;
+		printf("[MENU-CB] #%d PC=$%08X mode=%d mask=$%08X %s", lines, REG_PPC,
+		       (int16_t)m68ki_read_16(state, sp + 4), mask,
+		       sbase == scrn ? "SCREEN->" : (dbase == scrn ? "->SCREEN" : "FLAGGED"));
+		menutrace_bitmap(state, "src", srcb);
+		menutrace_bitmap(state, "dst", dstb);
+		printf(" srcRect(%d,%d,%d,%d) dstRect(%d,%d,%d,%d)\n",
+		       (int16_t)m68ki_read_16(state, srcr), (int16_t)m68ki_read_16(state, srcr + 2),
+		       (int16_t)m68ki_read_16(state, srcr + 4), (int16_t)m68ki_read_16(state, srcr + 6),
+		       (int16_t)m68ki_read_16(state, dstr), (int16_t)m68ki_read_16(state, dstr + 2),
+		       (int16_t)m68ki_read_16(state, dstr + 4), (int16_t)m68ki_read_16(state, dstr + 6));
+		return;
+	}
+	/* _QDExtensions: D0 = parameter bytes << 16 | selector */
+	uint16_t sel = REG_DA[0] & 0xFFFF;
+	uint32_t pm;
+	switch (sel) {
+	case 1: case 2: case 11: case 12: case 13: case 15: case 17:  /* (pm) */
+		pm = m68ki_read_32(state, sp);
+		break;
+	case 14:                                                      /* SetPixelsState(pm, state) */
+		pm = m68ki_read_32(state, sp + 4);
+		break;
+	case 16: case 21: {  /* New[Temp]ScreenBuffer(globalRect, purgeable, VAR gdh, VAR offscreenPixMap) */
+		uint32_t gr = m68ki_read_32(state, sp + 10);
+		lines++;
+		printf("[MENU-QDX] #%d PC=$%08X %s rect(%d,%d,%d,%d) purgeable=%d\n", lines, REG_PPC,
+		       sel == 16 ? "NewScreenBuffer" : "NewTempScreenBuffer",
+		       (int16_t)m68ki_read_16(state, gr), (int16_t)m68ki_read_16(state, gr + 2),
+		       (int16_t)m68ki_read_16(state, gr + 4), (int16_t)m68ki_read_16(state, gr + 6),
+		       m68ki_read_8(state, sp + 8));
+		return; }
+	default:
+		return;
+	}
+	static const char *names[18] = { 0, "LockPixels", "UnlockPixels", 0, 0, 0, 0, 0, 0, 0, 0,
+		"AllowPurgePixels", "NoPurgePixels", "GetPixelsState", "SetPixelsState", "GetPixBaseAddr", 0,
+		"DisposeScreenBuffer" };
+	uint32_t mp = (pm && pm < 0x01000000u) ? m68ki_read_32(state, pm) : 0;
+	uint32_t base = (mp & 0x00FFFFFFu) ? m68ki_read_32(state, mp & 0x00FFFFFFu) : 0;
+	lines++;
+	printf("[MENU-QDX] #%d PC=$%08X %s pm=$%08X mp=$%08X base=$%08X\n", lines, REG_PPC, names[sel], pm, mp, base);
+}
 
 /* ─── [PROFILE] shotgun / statistical profiler ─────────────────────────────
  * A separate thread samples the live emulated PC (m68ki_cpu.pc) at ~15-20kHz.

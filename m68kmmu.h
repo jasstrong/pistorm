@@ -962,6 +962,30 @@ uint32 pmmu_translate_addr_with_fc_040(m68ki_cpu_core *state, uint32 addr_in, ui
 	return addr_out;
 }
 
+/* setvar stlb N: 0 = soft TLB off, 1 = on (default), N > 1 = on and every Nth hit is
+ * re-checked by pmmu_stlb_check */
+extern int pmmu_stlb_mode;
+
+/* Translate a soft TLB hit again through the ATC and table walk and log any difference.
+ * Observe-only: the soft TLB entry is put back and the caller still uses the cached
+ * answer, so a run with N > 1 behaves exactly like mode 1. */
+static void pmmu_stlb_check(m68ki_cpu_core *state, uint32 addr_in, uint16 rw, int r, unsigned int i, uint32 fast)
+{
+	static unsigned int ctr;
+	static int logged;
+
+	if (++ctr < (unsigned int)pmmu_stlb_mode)
+		return;
+	ctr = 0;
+	uint32 tag = state->mmu_stlb_tag[r][i], phys = state->mmu_stlb_phys[r][i];
+	uint32 slow = pmmu_translate_addr_with_fc(state, addr_in, state->mmu_tmp_fc, rw, 7, 0, 0);
+	state->mmu_stlb_tag[r][i] = tag;
+	state->mmu_stlb_phys[r][i] = phys;
+	if (slow != fast && logged++ < 200)
+		printf("[STLB-MISMATCH] #%d addr=%08X fc=%u %s cached=%08X walk=%08X PC=%08X\n",
+		       logged, addr_in, state->mmu_tmp_fc & 7, rw ? "R" : "W", fast, slow, state->ppc);
+}
+
 // pmmu_translate_addr: perform 68851/68030-style PMMU address translation
 uint32 pmmu_translate_addr(m68ki_cpu_core *state, uint32 addr_in, uint16 rw)
 {
@@ -980,9 +1004,12 @@ uint32 pmmu_translate_addr(m68ki_cpu_core *state, uint32 addr_in, uint16 rw)
 		unsigned int i = pmmu_stlb_index(addr_in, fc, ps);
 		int r = rw ? 1 : 0;
 
-		if (state->mmu_stlb_tag[r][i] == ((addr_in & page_mask) | (fc << 1) | 1))
+		if (pmmu_stlb_mode && state->mmu_stlb_tag[r][i] == ((addr_in & page_mask) | (fc << 1) | 1))
 		{
-			return state->mmu_stlb_phys[r][i] | (addr_in & ~page_mask);
+			uint32 fast = state->mmu_stlb_phys[r][i] | (addr_in & ~page_mask);
+			if (pmmu_stlb_mode > 1)
+				pmmu_stlb_check(state, addr_in, rw, r, i, fast);
+			return fast;
 		}
 
 		addr_out = pmmu_translate_addr_with_fc(state, addr_in, state->mmu_tmp_fc, rw, 7, 0, 0);

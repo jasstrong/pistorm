@@ -2959,6 +2959,11 @@ static inline void m68ki_exception_1010(m68ki_cpu_core *state)
 	{ extern uint16_t g_trap_ring_w[8]; extern uint32_t g_trap_ring_pc[8]; extern int g_trap_ring_i;
 	  g_trap_ring_w[g_trap_ring_i & 7] = REG_IR; g_trap_ring_pc[g_trap_ring_i & 7] = REG_PPC; g_trap_ring_i++; }
 
+	/* [MENU-CB] setvar menutrace: screen CopyBits + QDOffscreen buffer calls (print-only) */
+	{ extern int menutrace_enabled; extern void menutrace_trap(m68ki_cpu_core *state);
+	  if (menutrace_enabled && ((REG_IR & 0xFBFF) == 0xA8EC || (REG_IR & 0xFBFF) == 0xAB1D))
+	    menutrace_trap(state); }
+
 	/* [STRIP055] StripAddress ($A055) input logger. StripAddress is `and.l Lo3Bytes,d0; rts`
 	 * (unconditional 24-bit strip on D0). The post-Welcome dirty jump comes from a pointer that
 	 * is ALREADY SE-base ($400000)-based before the strip. Catch the input D0/A0 + the memory it
