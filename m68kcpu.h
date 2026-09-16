@@ -1137,6 +1137,29 @@ inline void m68ki_ic_clear(m68ki_cpu_core *state)
 }
 
 extern uint32 pmmu_translate_addr(m68ki_cpu_core *state, uint32 addr_in, uint16 rw);
+extern int pmmu_stlb_mode;
+
+/* Soft TLB hit, inline at the call site (the table itself is filled in m68kmmu.h).
+ * pmmu_translate_addr is a large function, so calling it costs a full prologue and
+ * epilogue even when the very first thing it does is hit this cache -- that showed as
+ * about a quarter of its profile.  Try the lookup here and call only on a miss.
+ * Deliberately skipped when the soft TLB is off or in re-check mode (setvar stlb), so
+ * those still go through the out-of-line path and behave exactly as before. */
+static inline uint32 m68ki_translate_addr(m68ki_cpu_core *state, uint32 addr_in, uint16 rw)
+{
+	if (pmmu_stlb_mode == 1 && !CPU_TYPE_IS_040_PLUS(state->cpu_type))
+	{
+		unsigned int fc = state->mmu_tmp_fc & 7;
+		unsigned int ps = (state->mmu_tc >> 20) & 0xf;
+		uint32 page_mask = ~(uint32)0 << ps;
+		unsigned int i = ((addr_in >> ps) ^ (fc << 5)) & (MMU_STLB_SIZE - 1);
+		int r = rw ? 1 : 0;
+
+		if (state->mmu_stlb_tag[r][i] == ((addr_in & page_mask) | (fc << 1) | 1))
+			return state->mmu_stlb_phys[r][i] | (addr_in & ~page_mask);
+	}
+	return pmmu_translate_addr(state, addr_in, rw);
+}
 
 // read immediate word using the instruction cache
 
@@ -1296,7 +1319,7 @@ static __attribute__((noinline)) uint m68ki_read_8_fc(m68ki_cpu_core *state, uin
 #if M68K_EMULATE_PMMU
 	if (PMMU_ENABLED) {
 	    uint pre_pmmu = address;
-	    address = pmmu_translate_addr(state,address,1);
+	    address = m68ki_translate_addr(state,address,1);
 	    /* Trace VIA reads: catch any address whose 24-bit portion is VIA */
 	    {
 	        uint32_t pre24 = pre_pmmu & 0x00FFFFFF;
@@ -1393,7 +1416,7 @@ static inline uint m68ki_read_16_fc(m68ki_cpu_core *state, uint address, uint fc
 
 #if M68K_EMULATE_PMMU
 	if (PMMU_ENABLED)
-	    address = pmmu_translate_addr(state,address,1);
+	    address = m68ki_translate_addr(state,address,1);
 #endif
 
 	/* 68000/010/EC020: mask to 24-bit before fast-path range checks */
@@ -1453,7 +1476,7 @@ static inline uint m68ki_read_32_fc(m68ki_cpu_core *state, uint address, uint fc
 	uint orig_addr = address;
 #if M68K_EMULATE_PMMU
 	if (PMMU_ENABLED)
-	    address = pmmu_translate_addr(state,address,1);
+	    address = m68ki_translate_addr(state,address,1);
 #endif
 
 	(void)orig_addr;
@@ -1512,10 +1535,15 @@ extern uint16_t wwatch_sr[WWATCH_SIZE];
 extern uint8_t wwatch_sz[WWATCH_SIZE];
 extern unsigned int wwatch_idx;
 extern void wwatch_dump(void);
+/* Diagnostic only, and it tests every write, so it goes with the probes (see PROBING()). */
+#ifdef PISTORM_PROBES
 #define WWATCH_REC(a, v, s) do { uint32_t _wa = (a) & 0x00FFFFFFu; \
 	if (_wa >= WWATCH_LO && _wa < WWATCH_HI) { unsigned int _wi = wwatch_idx++ & (WWATCH_SIZE - 1); \
 	  wwatch_addr[_wi] = (a); wwatch_val[_wi] = (v); wwatch_pc[_wi] = REG_PPC; wwatch_sp[_wi] = REG_SP; \
 	  wwatch_sr[_wi] = (uint16_t)((FLAG_S ? 0x2000 : 0) | FLAG_INT_MASK); wwatch_sz[_wi] = (s); } } while (0)
+#else
+#define WWATCH_REC(a, v, s) do { (void)(a); (void)(v); (void)(s); } while (0)
+#endif
 
 static inline void m68ki_write_8_fc(m68ki_cpu_core *state, uint address, uint fc, uint value)
 {
@@ -1525,14 +1553,14 @@ static inline void m68ki_write_8_fc(m68ki_cpu_core *state, uint address, uint fc
 	 * write path, BEFORE CHIP_FASTPATH (addr<$200000 bypasses the tail), so it sees fastpath
 	 * writes. Finds who forms the malformed 28-byte free block (a bad figment split). */
 	{ uint32_t _a = address & 0x1FFFFFF;
-	  if (_a >= 0x015C00u && _a <= 0x015C2Fu) { static int _bw8=0;
+	  if (PROBING() && _a >= 0x015C00u && _a <= 0x015C2Fu) { static int _bw8=0;
 	    if (_bw8++ < 40) printf("[BADBLK-W8]  $%06X <- $%02X PC=$%08X\n", _a, value&0xFF, ADDRESS_68K(REG_PPC)); } }
 	/* [PURGE-WR] byte write via a purge-flagged (bit30) handle master-ptr to
 	 * high-8MB RAM lands in ROM space ($40800000-$40880000) and VANISHES — the
 	 * likely cont14 "$13(a2) completion flag never set". See write_32 for the
 	 * full rationale. Byte path is where bset #7,$13(a2) would land. */
 	{ extern uint32_t ovl_sysrom_pos;
-	  if (ovl_sysrom_pos >= 0x40000000u && address >= 0x40800000u && address < 0x40880000u) {
+	  if (PROBING() && ovl_sysrom_pos >= 0x40000000u && address >= 0x40800000u && address < 0x40880000u) {
 		static int pw8 = 0;
 		if (pw8++ < 40) printf("[PURGE-WR] W8  ->ROM $%08X (intended RAM $%08X?) val=$%02X PC=$%08X\n",
 			address, address & ~0x40000000u, value & 0xFF, ADDRESS_68K(REG_PPC)); } }
@@ -1541,7 +1569,7 @@ static inline void m68ki_write_8_fc(m68ki_cpu_core *state, uint address, uint fc
 	 * driver register poke through a bare $005FFxxx addr lands here (would explain
 	 * cont14: a completion/status register write that never reaches the chip). */
 	{ extern uint32_t ovl_sysrom_pos; uint32_t _pc8 = ADDRESS_68K(REG_PC);
-	  if (ovl_sysrom_pos >= 0x40000000 && !(_pc8 >= 0x40870000 && _pc8 < 0x40880000) && !(_pc8 >= 0x408026F0 && _pc8 < 0x40802780) &&
+	  if (PROBING() && ovl_sysrom_pos >= 0x40000000 && !(_pc8 >= 0x40870000 && _pc8 < 0x40880000) && !(_pc8 >= 0x408026F0 && _pc8 < 0x40802780) &&
 	      ((address >= 0x00580000 && address < 0x00600000) ||    /* SCSI */
 	       (address >= 0x00900000 && address < 0x00C00000) ||    /* SCC  */
 	       (address >= 0x00D00000 && address < 0x00E00000) ||    /* IWM  */
@@ -1556,7 +1584,7 @@ static inline void m68ki_write_8_fc(m68ki_cpu_core *state, uint address, uint fc
 
 #if M68K_EMULATE_PMMU
 	if (PMMU_ENABLED)
-	    address = pmmu_translate_addr(state,address,0);
+	    address = m68ki_translate_addr(state,address,0);
 #endif
 
 	/* 68000/010/EC020: mask to 24-bit before fast-path range checks */
@@ -1570,7 +1598,7 @@ static inline void m68ki_write_8_fc(m68ki_cpu_core *state, uint address, uint fc
 	 * PMMU maps into low RAM (swallowed, never reaches the 5380)? PC names the
 	 * issuer (ROM driver $1A4xx vs RAM copy $434xxx). */
 	{ extern uint32_t ovl_sysrom_pos;
-	  if (ovl_sysrom_pos >= 0x800000) {
+	  if (PROBING() && ovl_sysrom_pos >= 0x800000) {
 	    uint32_t _a24 = address & 0x00FFFFFF;
 	    /* both configs' 5380 register windows: hugeSE $5FFxxx (from $405FFxxx),
 	     * bigSE $8FFxxx — both map to SE-bus $5FFxxx. Log reg#+val for a diff. */
@@ -1619,17 +1647,17 @@ static inline void m68ki_write_16_fc(m68ki_cpu_core *state, uint address, uint f
 {
 	WWATCH_REC(address, value, 2);
 	{ uint32_t _a = address & 0x1FFFFFF;   /* [BADBLK-W16] see write_8 */
-	  if (_a >= 0x015C00u && _a <= 0x015C2Fu) { static int _bw16=0;
+	  if (PROBING() && _a >= 0x015C00u && _a <= 0x015C2Fu) { static int _bw16=0;
 	    if (_bw16++ < 40) printf("[BADBLK-W16] $%06X <- $%04X PC=$%08X\n", _a, value&0xFFFF, ADDRESS_68K(REG_PPC)); } }
 	/* [PURGE-WR] word write via a purge-flagged handle to high-8MB RAM lands in
 	 * ROM space and vanishes. See write_32 for rationale. */
 	{ extern uint32_t ovl_sysrom_pos;
-	  if (ovl_sysrom_pos >= 0x40000000u && address >= 0x40800000u && address < 0x40880000u) {
+	  if (PROBING() && ovl_sysrom_pos >= 0x40000000u && address >= 0x40800000u && address < 0x40880000u) {
 		static int pw16 = 0;
 		if (pw16++ < 40) printf("[PURGE-WR] W16 ->ROM $%08X (intended RAM $%08X?) val=$%04X PC=$%08X\n",
 			address, address & ~0x40000000u, value & 0xFFFF, ADDRESS_68K(REG_PPC)); } }
 	/* DSErrCode watchpoint (16-bit) */
-	if ((address & 0x00FFFFFF) == 0x0AF0 && value != 0) {
+	if (PROBING() && (address & 0x00FFFFFF) == 0x0AF0 && value != 0) {
 		printf("[DSERR16-WR] $%04X ← $%04X  PC=$%08X  SP=$%08X\n",
 			address & 0xFFFF, value & 0xFFFF, REG_PPC, REG_DA[15]);
 		if ((value & 0xFFFF) == 0x000C) {   /* dsCoreErr: WHICH trap was unimplemented? */
@@ -1694,7 +1722,7 @@ static inline void m68ki_write_16_fc(m68ki_cpu_core *state, uint address, uint f
 
 #if M68K_EMULATE_PMMU
 	if (PMMU_ENABLED)
-	    address = pmmu_translate_addr(state,address,0);
+	    address = m68ki_translate_addr(state,address,0);
 #endif
 
 	/* 68000/010/EC020: mask to 24-bit before fast-path range checks */
@@ -1706,7 +1734,7 @@ static inline void m68ki_write_16_fc(m68ki_cpu_core *state, uint address, uint f
 	/* [DIRTY-IO-WR] born-32: a WRITE to a BARE 24-bit SE I/O address (no $40 iomap
 	 * prefix) hits RAM not hardware — e.g. the ROM's `bclr #7,$EFE1FE.L`. */
 	{ extern uint32_t ovl_sysrom_pos; uint32_t _pc = ADDRESS_68K(REG_PC);
-	  if (ovl_sysrom_pos >= 0x40000000 && !(_pc >= 0x40870000 && _pc < 0x40880000) && !(_pc >= 0x408026F0 && _pc < 0x40802780) &&   /* skip boot32 RAM-fill + ROM RAM-test */
+	  if (PROBING() && ovl_sysrom_pos >= 0x40000000 && !(_pc >= 0x40870000 && _pc < 0x40880000) && !(_pc >= 0x408026F0 && _pc < 0x40802780) &&   /* skip boot32 RAM-fill + ROM RAM-test */
 	      ((address >= 0x00580000 && address < 0x00600000) ||    /* SCSI */
 	       (address >= 0x00900000 && address < 0x00C00000) ||    /* SCC  */
 	       (address >= 0x00D00000 && address < 0x00E00000) ||    /* IWM  */
@@ -1718,13 +1746,13 @@ static inline void m68ki_write_16_fc(m68ki_cpu_core *state, uint address, uint f
 	/* [VIATMR-WR] VIA timer/ACR writes — who PROGRAMS the timers (.Sony T1 for
 	 * disk PWM sets ACR reg11 free-run; SCSI calibration loads T2). */
 	{ extern uint32_t ovl_sysrom_pos; uint32_t _a24w = address & 0x00FFFFFF;
-	  if (ovl_sysrom_pos >= 0x40000000 && _a24w >= 0xEFE800 && _a24w < 0xEFF800) {
+	  if (PROBING() && ovl_sysrom_pos >= 0x40000000 && _a24w >= 0xEFE800 && _a24w < 0xEFF800) {
 	    static int vtw = 0;
 	    if (vtw++ < 60) printf("[VIATMR-WR] reg$%06X <- $%X PC=$%08X%s\n", _a24w, (unsigned)value,
 	                           ADDRESS_68K(REG_PC), (address>>24)==0x40?"":"  <<BARE");
 	  } }
 
-	if (address >= 0x17600 && address < 0x17E00) {
+	if (PROBING() && address >= 0x17600 && address < 0x17E00) {
 		extern int dbg_codewin; extern unsigned int dbg_codewin_n;
 		if (dbg_codewin && dbg_codewin_n < 8000) {
 			printf("[CODEWR16] $%06X <- $%04X  PC=$%08X\n",
@@ -1828,7 +1856,7 @@ static inline void m68ki_write_32_fc(m68ki_cpu_core *state, uint address, uint f
 	 * are computed at runtime from a $400000 base instead of ROMBase ($40800000). Log every
 	 * write of a value in the SE-ROM window, with the writing PC, to find that computation. */
 	{ uint32_t _v = value; extern uint32_t ovl_sysrom_pos;
-	  if (ovl_sysrom_pos >= 0x40000000u && (_v & 0xFFF80000u) == 0x00400000u && (_v & 0x7FFFFu) >= 0x1000u) {
+	  if (PROBING() && ovl_sysrom_pos >= 0x40000000u && (_v & 0xFFF80000u) == 0x00400000u && (_v & 0x7FFFFu) >= 0x1000u) {
 	    static int _sb = 0;
 	    if (_sb++ < 30) { printf("[SEBASE-W32] $%08X -> mem $%08X  PC=$%08X (want $%08X)\n",
 	                             _v, ADDRESS_68K(address), ADDRESS_68K(REG_PPC), 0x40800000u | (_v & 0x7FFFFu));
@@ -1838,7 +1866,7 @@ static inline void m68ki_write_32_fc(m68ki_cpu_core *state, uint address, uint f
 	 * a sub-$20 value there is THE smoking gun (the split writing a 28-byte free size). Dump
 	 * PC + the branch ring (call path) on that write. See write_8 for placement rationale. */
 	{ uint32_t _a = address & 0x1FFFFFF;
-	  if (_a >= 0x015C00u && _a <= 0x015C2Fu) { static int _bw32=0;
+	  if (PROBING() && _a >= 0x015C00u && _a <= 0x015C2Fu) { static int _bw32=0;
 	    if (_bw32++ < 40) {
 	      printf("[BADBLK-W32] $%06X <- $%08X PC=$%08X%s\n", _a, value, ADDRESS_68K(REG_PPC),
 	        (_a==0x015C10u && value<0x20u)?"  <== SUB-MIN SIZE!":"");
@@ -1848,7 +1876,7 @@ static inline void m68ki_write_32_fc(m68ki_cpu_core *state, uint address, uint f
 		uint32_t _wa = ADDRESS_68K(address), _pp = ADDRESS_68K(REG_PPC);
 		/* Flag any ROM (non-figment) write into the SysZone stdHeap header — the
 		 * ROM MM directly poking figment's zone with 24-bit logic (the "antics"). */
-		if (_wa >= 0x2000 && _wa <= 0x2074 &&
+		if (PROBING() && _wa >= 0x2000 && _wa <= 0x2074 &&
 		    _pp >= 0x40800000 && _pp < 0x40840000) {
 			static int ant = 0;
 			if (ant < 30) { printf("[ROM-ZONE-WR] *$%08X = $%08X  by ROM PPC=$%08X\n",
@@ -1862,7 +1890,7 @@ static inline void m68ki_write_32_fc(m68ki_cpu_core *state, uint address, uint f
 		 * cont14: the driver's completion flag never gets set). Escapes [DIRTY-DEREF]
 		 * (which excludes $40xxxxxx as "legit ROM"). Strip bit30 to show intended RAM. */
 		{ extern uint32_t ovl_sysrom_pos;
-		  if (ovl_sysrom_pos >= 0x40000000u && _wa >= 0x40000000u && _wa < 0x41000000u
+		  if (PROBING() && ovl_sysrom_pos >= 0x40000000u && _wa >= 0x40000000u && _wa < 0x41000000u
 		      && !(_wa >= 0x405FF000u && _wa < 0x40600000u) /* exclude SCSI iomap */) {
 			static int pw = 0;
 			if (pw++ < 60) printf("[PURGE-WR] W32 $%08X (strip40=RAM $%08X) val=$%08X PC=$%08X  %s\n",
@@ -1877,7 +1905,7 @@ static inline void m68ki_write_32_fc(m68ki_cpu_core *state, uint address, uint f
 
 #if M68K_EMULATE_PMMU
 	if (PMMU_ENABLED)
-	    address = pmmu_translate_addr(state,address,0);
+	    address = m68ki_translate_addr(state,address,0);
 #endif
 
 	/* 68000/010/EC020: mask to 24-bit before fast-path range checks */
@@ -1889,7 +1917,7 @@ static inline void m68ki_write_32_fc(m68ki_cpu_core *state, uint address, uint f
 	/* [DIRTY-IO-WR] born-32: a WRITE to a BARE 24-bit SE I/O address (no $40 iomap
 	 * prefix) hits RAM not hardware — e.g. the ROM's `bclr #7,$EFE1FE.L`. */
 	{ extern uint32_t ovl_sysrom_pos; uint32_t _pc = ADDRESS_68K(REG_PC);
-	  if (ovl_sysrom_pos >= 0x40000000 && !(_pc >= 0x40870000 && _pc < 0x40880000) && !(_pc >= 0x408026F0 && _pc < 0x40802780) &&   /* skip boot32 RAM-fill + ROM RAM-test */
+	  if (PROBING() && ovl_sysrom_pos >= 0x40000000 && !(_pc >= 0x40870000 && _pc < 0x40880000) && !(_pc >= 0x408026F0 && _pc < 0x40802780) &&   /* skip boot32 RAM-fill + ROM RAM-test */
 	      ((address >= 0x00580000 && address < 0x00600000) ||    /* SCSI */
 	       (address >= 0x00900000 && address < 0x00C00000) ||    /* SCC  */
 	       (address >= 0x00D00000 && address < 0x00E00000) ||    /* IWM  */
@@ -1901,7 +1929,7 @@ static inline void m68ki_write_32_fc(m68ki_cpu_core *state, uint address, uint f
 	/* [VIATMR-WR] VIA timer/ACR writes — who PROGRAMS the timers (.Sony T1 for
 	 * disk PWM sets ACR reg11 free-run; SCSI calibration loads T2). */
 	{ extern uint32_t ovl_sysrom_pos; uint32_t _a24w = address & 0x00FFFFFF;
-	  if (ovl_sysrom_pos >= 0x40000000 && _a24w >= 0xEFE800 && _a24w < 0xEFF800) {
+	  if (PROBING() && ovl_sysrom_pos >= 0x40000000 && _a24w >= 0xEFE800 && _a24w < 0xEFF800) {
 	    static int vtw = 0;
 	    if (vtw++ < 60) printf("[VIATMR-WR] reg$%06X <- $%X PC=$%08X%s\n", _a24w, (unsigned)value,
 	                           ADDRESS_68K(REG_PC), (address>>24)==0x40?"":"  <<BARE");
@@ -1910,14 +1938,14 @@ static inline void m68ki_write_32_fc(m68ki_cpu_core *state, uint address, uint f
 	/* ADB queue-init watch: catch any write to the deferred-queue control block
 	 * (ABusVars $2B68 +316/320/324/328 = $2CA4/$2CA8/$2CAC/$2CB0) — does the ADB
 	 * init ever set it up, with what value (NULL? a real buffer?), from what PC? */
-	if ((address & 0x00FFFFFF) >= 0x2CA4 && (address & 0x00FFFFFF) <= 0x2CB0) {
+	if (PROBING() && (address & 0x00FFFFFF) >= 0x2CA4 && (address & 0x00FFFFFF) <= 0x2CB0) {
 		printf("[ADBQ-INIT] $%06X <- $%08X PC=$%08X\n", address & 0x00FFFFFF, value, REG_PC);
 	}
 
 	/* CODE-segment load watch: log writes into the deterministic crash
 	 * window $17600-$17E00 to find where the fill stops (truncation) and
 	 * which routine is the loader (PC). */
-	if (address >= 0x17600 && address < 0x17E00) {
+	if (PROBING() && address >= 0x17600 && address < 0x17E00) {
 		extern int dbg_codewin; extern unsigned int dbg_codewin_n;
 		if (dbg_codewin && dbg_codewin_n < 8000) {
 			printf("[CODEWR32] $%06X <- $%08X  PC=$%08X\n",
@@ -1930,11 +1958,11 @@ static inline void m68ki_write_32_fc(m68ki_cpu_core *state, uint address, uint f
 	 * $008xxxxx value (a $40400000 delta masked to $400000) into the loaded-patch code region.
 	 * The PC is the relocation loop → disassemble it to find the mask/and.l to neutralize. */
 	{ uint32_t _a = address & 0x1FFFFFF, _v = value;
-	  if (_a>=0x10000 && _a<0x30000 && (_v & 0xFFF80000u)==0x00800000u) {
+	  if (PROBING() && _a>=0x10000 && _a<0x30000 && (_v & 0xFFF80000u)==0x00800000u) {
 	    static int _rw=0; if (_rw++<24) printf("[RELOC-WATCH] $%06X <- $%08X pc=$%08X\n", _a, _v, ADDRESS_68K(REG_PC)); } }
 
 	/* Watch for writes to A-line vector ($028) */
-	if ((address & 0x00FFFFFF) == 0x0028) {
+	if (PROBING() && (address & 0x00FFFFFF) == 0x0028) {
 		extern int figment_enabled;
 		if (figment_enabled) {
 			printf("[ALINE-VEC-WR] $028 ← $%08X  PC=$%08X\n", value, REG_PPC);
@@ -2001,7 +2029,7 @@ static inline void m68ki_write_32_pd_fc(uint address, uint fc, uint value)
 
 #if M68K_EMULATE_PMMU
 	if (PMMU_ENABLED)
-	    address = pmmu_translate_addr(state,address,0);
+	    address = m68ki_translate_addr(state,address,0);
 #endif
 
 	m68k_write_memory_32_pd(ADDRESS_68K(address), value);
