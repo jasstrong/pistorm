@@ -4130,6 +4130,18 @@ static inline void scsi_byte_observe(uint32_t bus_addr, unsigned int val, int wi
   }
 }
 
+/* Where a `size`-byte access at `address` lives in a fast-path RAM/ROM buffer, or NULL.
+ * The whole access must fit inside one range: an m68k address near $FFFFFFFF (the RM's
+ * `move.l $FFFF.w,...`) would otherwise wrap and index gigabytes past a buffer. */
+static inline unsigned char *read_buffer_addr(unsigned int address, unsigned int size) {
+  for (int i = 0; i < m68ki_cpu.read_ranges; i++) {
+    if (address >= m68ki_cpu.read_addr[i] && address < m68ki_cpu.read_upper[i] &&
+        m68ki_cpu.read_upper[i] - address >= size)
+      return m68ki_cpu.read_data[i] + (address - m68ki_cpu.read_addr[i]);
+  }
+  return NULL;
+}
+
 unsigned int m68k_read_memory_8(unsigned int address) {
   nodeprobe(address, 8);
 #ifdef DEBUG_DIAG
@@ -4165,6 +4177,17 @@ unsigned int m68k_read_memory_8(unsigned int address) {
    * SCSI) return a 0 delay, so only the VIA slowio region is affected — and
    * bigSE (VIA not iomap-remapped) is unchanged, since it fell through anyway. */
   { int _sd = slowio_get_delay(bus_addr); if (_sd) slowio_delay(_sd); }
+
+  /* RAM/ROM from the buffers before the platform check, as in m68k_read_memory_32.  The
+   * iomap window ($40000000-$41000000) also covers born-32's ROM at $40800000, so a byte
+   * read of ROM from emulator code went to the SE bus at $8xxxxx instead.  The $A0FE
+   * handler reads figment's FIG_DBG strings this way on every NewHandle; when those bus
+   * cycles started timing out, each unterminated string cost 127 x 3 timed-out reads and
+   * the Mac stalled. */
+  if (!ovl) {
+    unsigned char *p = read_buffer_addr(address, 1);
+    if (p) return p[0];
+  }
 
   if (platform_read_check(OP_TYPE_BYTE, address, &platform_res)) {
     return platform_res;
@@ -4322,6 +4345,12 @@ unsigned int m68k_read_memory_16(unsigned int address) {
   /* Settle delay before the custom I/O handler — see m68k_read_memory_8. */
   { int _sd = slowio_get_delay(bus_addr); if (_sd) slowio_delay(_sd); }
 
+  /* RAM/ROM from the buffers before the platform check — see m68k_read_memory_8. */
+  if (!ovl) {
+    unsigned char *p = read_buffer_addr(address, 2);
+    if (p) return (p[0] << 8) | p[1];
+  }
+
   if (platform_read_check(OP_TYPE_WORD, address, &platform_res)) {
     return platform_res;
   }
@@ -4360,12 +4389,8 @@ unsigned int m68k_read_memory_32(unsigned int address) {
    * ($40870080) to the SE bus at $870080, so the walk built translations from bus garbage.
    * custom_read_mac68k assumes RAM and ROM never reach it; this makes that true here too. */
   if (!ovl) {
-    for (int i = 0; i < m68ki_cpu.read_ranges; i++) {
-      if (address >= m68ki_cpu.read_addr[i] && address < m68ki_cpu.read_upper[i]) {
-        unsigned char *p = m68ki_cpu.read_data[i] + (address - m68ki_cpu.read_addr[i]);
-        return (p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
-      }
-    }
+    unsigned char *p = read_buffer_addr(address, 4);
+    if (p) return (p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
   }
 
   if (platform_read_check(OP_TYPE_LONGWORD, address, &platform_res)) {
@@ -4375,11 +4400,9 @@ unsigned int m68k_read_memory_32(unsigned int address) {
   /* Check fast-path RAM/ROM buffers before hitting SE bus.
    * Needed for PMMU table walks which call this slow-path function
    * but need to read from the local RAM buffer. */
-  for (int i = 0; i < m68ki_cpu.read_ranges; i++) {
-    if (address >= m68ki_cpu.read_addr[i] && address < m68ki_cpu.read_upper[i]) {
-      unsigned char *p = m68ki_cpu.read_data[i] + (address - m68ki_cpu.read_addr[i]);
-      return (p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
-    }
+  {
+    unsigned char *p = read_buffer_addr(address, 4);
+    if (p) return (p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
   }
 
   uint32_t result32;
