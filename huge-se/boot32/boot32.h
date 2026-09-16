@@ -15,7 +15,7 @@
  * caps detection at 2MB, so we report the real size here.  Everything else in
  * the RAM layout derives from this: */
 /* No UL suffix: this header is #included by boot32_glue.S (gas) too. */
-#define BOOT32_MEMTOP 0x01000000
+#define BOOT32_MEMTOP 0x02000000
 /* Derived layout (all relative to the top of RAM):
  *   video (WTC) buffer : MEMTOP - 64KB  (mirrors to SE-bus $3F0000)
  *   RAM fill cap       : MEMTOP - 128KB (formerly the PMMU tables; those are
