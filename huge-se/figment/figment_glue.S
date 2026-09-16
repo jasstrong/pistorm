@@ -641,28 +641,89 @@ fig_InitApplZone:
     rts
 
 /* -----------------------------------------------------------------------
- * b32_FindHeap — FindHeap for the patchedIn build (no heap tree).
+ * b32_FindHeap — FindHeap for the patchedIn build.
  *
- * Mirrors the classic MM's MMRHPrologue (MemoryMgrInternal.a, "patch from Mac+"):
- * when TheZone is SysZone or ApplZone, use ApplZone if the address lies above
- * ApplZone, else SysZone; otherwise TheZone.  Plain patchedIn FindHeap returned
- * TheZone, so RecoverHandle(p) on a system-heap block while TheZone == ApplZone
- * gave ApplZone + relHandle (Assistant Toolbox's "LaterLaser INIT" then copied
- * 0 bytes and jumped into an empty block -> error type 10).  Kept at the end of
- * the last object so no other figment routine moves.
+ * figment's own FindHeap walks the heap tree from SysZone (nextUp, nextIn).  The
+ * patchedIn build links only the Process Manager heap into that tree (SysZone's
+ * nextUp); application zones are not in it.  So, in order:
+ *   1. TheZone, ApplZone or SysZone, if the address lies inside the heap
+ *      (heapStart <= address <= backLimit, FindHeap's test);
+ *   2. FindHeap's tree walk, which finds the Process Manager heap and so its
+ *      temp memory;
+ *   3. the classic MM's MMRHPrologue choice (MemoryMgrInternal.a, "patch from
+ *      Mac+"): when TheZone is SysZone or ApplZone, ApplZone if the address lies
+ *      above ApplZone, else SysZone; otherwise TheZone.
+ * Plain patchedIn FindHeap returned TheZone, so RecoverHandle(p) on a system-heap
+ * block while TheZone == ApplZone gave ApplZone + relHandle (Assistant Toolbox's
+ * "LaterLaser INIT" then copied 0 bytes and jumped into an empty block -> error
+ * type 10).  Step 3 alone sent the Process Manager's temp memory below the
+ * Finder's zone to SysZone: RecoverHandle returned SysZone + relHandle, a
+ * low-memory address, which UnlockPixels stored as a menu buffer's pixel handle.
+ * The menu's restore then took the long at that address as the pixel address and
+ * copied code onto the screen, and DisposeScreenBuffer put low-memory addresses
+ * on SysZone's free master-pointer list.
+ * A heap pointer is followed only if it is non-nil, even and below ROMBase: the
+ * Process Manager heap's fake header has text in nextUp and nextIn.  (Not MemTop:
+ * the Process Manager lowers it to about $455414, below the heaps it manages.)
+ * Kept at the end of the last object so no other figment routine moves.
  *
  * In:  4(SP) = address     Out: D0 = heap
  */
     .globl b32_FindHeap
 b32_FindHeap:
-    move.l  (0x118).w,%d0           /* TheZone */
-    cmp.l   (0x2A6).w,%d0           /* SysZone? */
-    beq.s   1f
-    cmp.l   (0x2AA).w,%d0           /* ApplZone? */
-    bne.s   2f
-1:  move.l  (0x2A6).w,%d0           /* presume SysZone */
-    move.l  4(%sp),%d1              /* address */
+    movem.l %d2-%d3,-(%sp)
+    move.l  12(%sp),%d1             /* address */
+    move.l  (0x118).w,%a0           /* 1. TheZone, */
+    bsr.s   9f
+    bne.s   8f
+    move.l  (0x2AA).w,%a0           /*    ApplZone, */
+    bsr.s   9f
+    bne.s   8f
+    move.l  (0x2A6).w,%a0           /*    SysZone */
+    bsr.s   9f
+    bne.s   8f
+    moveq   #0,%d2                  /* 2. walk from SysZone; D2 = parentHeap */
+    moveq   #31,%d3                 /*    at most 32 heaps */
+    move.l  (0x2A6).w,%a0
+3:  bsr.s   9f                      /*    does testHeap hold the address? */
+    beq.s   4f
+    move.l  %d0,%d2                 /*    yes: parentHeap = testHeap, */
+    move.l  36(%a0),%a0             /*    testHeap = nextIn */
+    bra.s   5f
+4:  move.l  %a0,%d0                 /*    no: stop at nil or a bad pointer, */
+    beq.s   6f
+    btst    #0,%d0
+    bne.s   6f
+    cmp.l   (0x2AE).w,%d0           /*    ROMBase */
+    bcc.s   6f
+    move.l  32(%a0),%a0             /*    else testHeap = nextUp */
+5:  dbra    %d3,3b
+6:  move.l  %d2,%d0
+    bne.s   8f
+    move.l  (0x118).w,%d0           /* 3. MMRHPrologue: TheZone */
+    cmp.l   (0x2A6).w,%d0           /*    SysZone? */
+    beq.s   7f
+    cmp.l   (0x2AA).w,%d0           /*    ApplZone? */
+    bne.s   8f
+7:  move.l  (0x2A6).w,%d0           /*    presume SysZone */
     cmp.l   (0x2AA).w,%d1
-    bls.s   2f                      /* address <= ApplZone -> SysZone */
-    move.l  (0x2AA).w,%d0           /* above ApplZone -> ApplZone */
-2:  rts
+    bls.s   8f                      /*    address <= ApplZone -> SysZone */
+    move.l  (0x2AA).w,%d0           /*    above ApplZone -> ApplZone */
+8:  movem.l (%sp)+,%d2-%d3
+    rts
+
+/* D0 = A0 if A0 is a usable heap (non-nil, even, below ROMBase) whose
+ * heapStart (+24) <= D1 <= backLimit (+64), else 0; flags set from D0 */
+9:  move.l  %a0,%d0
+    beq.s   98f
+    btst    #0,%d0
+    bne.s   97f
+    cmp.l   (0x2AE).w,%d0           /* ROMBase */
+    bcc.s   97f
+    cmp.l   24(%a0),%d1             /* heapStart */
+    bcs.s   97f
+    cmp.l   64(%a0),%d1             /* backLimit */
+    bls.s   98f
+97: moveq   #0,%d0
+98: tst.l   %d0
+    rts

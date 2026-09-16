@@ -112,9 +112,10 @@ stdHeap* b32_FindHeap(const void* address);	/* figment_glue.S */
 stdHeap* FindHeap(const void* address)
 {
 #ifdef patchedIn
-	/* born-32 runs figment patchedIn: there is no heap tree, and FindHeap was just
-	 * GetCurrentHeap() (TheZone).  b32_FindHeap applies the classic MM's MMRHPrologue
-	 * zone choice instead (SysZone vs ApplZone by address). */
+	/* born-32 runs figment patchedIn: only the Process Manager heap is linked into
+	 * the heap tree (SysZone's nextUp), not application zones.  b32_FindHeap checks
+	 * TheZone, ApplZone and SysZone by address, then walks the tree like the code
+	 * below, then falls back to the classic MM's MMRHPrologue zone choice. */
 	return b32_FindHeap(address);
 #else
 	stdHeap*	testHeap = LMGetSysZone();
